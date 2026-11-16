@@ -1,0 +1,13 @@
+[package]
+name = "mamre"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+description = "A sum tree: a B+ tree that keeps running totals, and can be a Merkle tree too"
+repository = "https://github.com/dismalnitch/mamre"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1.12"
