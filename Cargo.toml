@@ -7,7 +7,8 @@ description = "A sum tree: a B+ tree that keeps running totals, and can be a Mer
 repository = "https://github.com/dismalnitch/mamre"
 publish = false
 
-[dependencies]
-
 [dev-dependencies]
 proptest = "1.12"
+
+[dependencies]
+arrayvec = "0.7.8"
