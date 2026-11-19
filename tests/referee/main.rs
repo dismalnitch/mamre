@@ -30,9 +30,22 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "wire mamre's tree up in tests/referee/mamre.rs"]
+    #[ignore = "needs SumTree::append and Cursor; see tests/referee/mamre.rs"]
     fn mamre_matches_the_model(start in ops::lines(80), ops in ops::ops()) {
         ops::run::<mamre::Tree>(start, &ops).map_err(TestCaseError::fail)?;
+    }
+}
+
+proptest! {
+    /// What runs before `append` and `Cursor` exist: build by pushing, then
+    /// check the shape, items and summary. No seeks, so no `verify`.
+    #[test]
+    fn mamre_builds_like_the_model(start in ops::lines(5000)) {
+        use subject::Subject;
+        let tree = mamre::Tree::from_items(start.clone());
+        tree.check().map_err(TestCaseError::fail)?;
+        prop_assert_eq!(tree.items(), start.clone());
+        prop_assert_eq!(tree.summary(), model::summarize(&start));
     }
 }
 
@@ -41,7 +54,7 @@ proptest! {
 
     /// Fewer cases, but trees deep enough for several levels of nodes.
     #[test]
-    #[ignore = "wire mamre's tree up in tests/referee/mamre.rs"]
+    #[ignore = "needs SumTree::append and Cursor; see tests/referee/mamre.rs"]
     fn mamre_matches_the_model_when_deep(start in ops::lines(5000), ops in ops::ops()) {
         ops::run::<mamre::Tree>(start, &ops).map_err(TestCaseError::fail)?;
     }

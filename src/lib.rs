@@ -4,14 +4,14 @@ pub mod tree;
 pub mod units;
 use arrayvec::ArrayVec;
 use std::{error::Error, sync::Arc};
-use units::TREE_BASE;
+use units::CAP_SZ;
 
 pub trait Item: Clone {
     type Summary: Summary;
     fn summary(&self) -> Self::Summary;
 }
 
-pub trait Summary {
+pub trait Summary: Clone {
     fn empty() -> Self;
     fn concat(&mut self, other: &Self);
 }
@@ -21,18 +21,22 @@ pub trait Dimension<S: Summary>: Ord + Clone {
     fn add_summary(&mut self, summary: &S);
 }
 
-struct SumTree<T: Item>(pub Arc<Node<T>>);
+#[derive(Clone)]
+pub struct SumTree<T: Item, const CAP: usize = CAP_SZ> {
+    root: Arc<Node<T, CAP>>,
+}
 
-enum Node<T: Item> {
+#[derive(Clone)]
+enum Node<T: Item, const CAP: usize = CAP_SZ> {
     Internal {
         summary: T::Summary,
-        children: ArrayVec<SumTree<T>, { 2 * TREE_BASE }>,
-        child_summaries: ArrayVec<T::Summary, { 2 * TREE_BASE }>,
+        children: ArrayVec<SumTree<T, CAP>, CAP>,
+        child_summaries: ArrayVec<T::Summary, CAP>,
     },
     Leaf {
         summary: T::Summary,
-        items: ArrayVec<T, { 2 * TREE_BASE }>,
-        item_summaries: ArrayVec<T::Summary, { 2 * TREE_BASE }>,
+        items: ArrayVec<T, CAP>,
+        item_summaries: ArrayVec<T::Summary, CAP>,
     },
 }
 
