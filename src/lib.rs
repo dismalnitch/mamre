@@ -29,6 +29,9 @@ pub struct SumTree<T: Item, const CAP: usize = CAP_SZ> {
 #[derive(Clone)]
 enum Node<T: Item, const CAP: usize = CAP_SZ> {
     Internal {
+        /// Levels above the leaves: 1 for a node whose children are leaves.
+        /// Fixed at creation; a node never moves to another level.
+        height: u8,
         summary: T::Summary,
         children: ArrayVec<SumTree<T, CAP>, CAP>,
         child_summaries: ArrayVec<T::Summary, CAP>,

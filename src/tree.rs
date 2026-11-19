@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use std::{iter, sync::Arc};
 
-use crate::{ArrayVec, Item, Node, SumTree, Summary, TreeError, TreeResult};
+use crate::{ArrayVec, Item, Node, SumTree, Summary};
 
 impl<T: Item, const CAP: usize> SumTree<T, CAP> {
     /// An empty tree: the root is an empty leaf, so every tree has a root.
@@ -22,7 +22,17 @@ impl<T: Item, const CAP: usize> SumTree<T, CAP> {
         self.root.summary()
     }
 
-    pub fn append(&self, other: SumTree<T, CAP>) {
+    /// Levels above the leaves: 0 for a tree that's a single leaf.
+    pub fn height(&self) -> u8 {
+        self.root.height()
+    }
+
+    /// True if the tree holds no items. Only the root can be empty.
+    pub fn is_empty(&self) -> bool {
+        matches!(&*self.root, Node::Leaf { items, .. } if items.is_empty())
+    }
+
+    pub fn append(&mut self, other: SumTree<T, CAP>) {
         /* append doesn't go item by item. It attaches
          * other's nodes as whole subtrees:
          *   1. Same height: if the right edge of self and the
@@ -44,7 +54,29 @@ impl<T: Item, const CAP: usize> SumTree<T, CAP> {
          *   for pushing m items one by one.
          * No items get copied either: other's nodes are shared through Arc::clone.
          * */
-        todo!("Append a whole tree");
+
+        if other.is_empty() {
+            // Nothing to add.
+        } else if self.is_empty() {
+            // Nothing to keep: the result is just `other`.
+            self.root = other.root;
+        } else if self.height() >= other.height() {
+            // Find other's level on our right edge.
+            self.push_tree(other, Side::Back);
+        } else {
+            // `other` is taller, so mirror it: find our level on other's left
+            // edge. Swap first, so `self` ends up holding the result.
+            let front = std::mem::replace(self, other);
+            self.push_tree(front, Side::Front);
+        }
+    }
+
+    /// Merges `other` onto this tree's `side` edge, at the level matching its
+    /// height (which must not be more than ours).
+    fn push_tree(&mut self, other: SumTree<T, CAP>, side: Side) {
+        if let Some(split_off) = Arc::make_mut(&mut self.root).push_tree(other, side) {
+            self.grow_root(split_off, side);
+        }
     }
 
     pub fn slice(&self) {}
@@ -69,34 +101,76 @@ impl<T: Item, const CAP: usize> SumTree<T, CAP> {
     }
 
     pub fn push(&mut self, item: T) {
-        // If the root split, the tree grows a level: a new root holding [old root, right].
         if let Some(right) = Arc::make_mut(&mut self.root).push(item) {
-            let left = SumTree {
-                root: Arc::clone(&self.root),
-            };
-            let child_summaries: ArrayVec<T::Summary, CAP> =
-                [left.summary().clone(), right.summary().clone()]
-                    .into_iter()
-                    .collect();
-            let summary = sum_all(&child_summaries);
-
-            self.root = Arc::new(Node::Internal {
-                summary,
-                children: [left, right].into_iter().collect(),
-                child_summaries,
-            });
+            self.grow_root(right, Side::Back);
         }
+    }
+
+    /// The root split off a sibling on its `side`: the tree grows a level,
+    /// with a new root holding both, in order.
+    fn grow_root(&mut self, split_off: SumTree<T, CAP>, side: Side) {
+        let old = SumTree {
+            root: Arc::clone(&self.root),
+        };
+        let height = old.height() + 1;
+        let [left, right] = match side {
+            Side::Back => [old, split_off],
+            Side::Front => [split_off, old],
+        };
+        let child_summaries: ArrayVec<T::Summary, CAP> =
+            [left.summary().clone(), right.summary().clone()]
+                .into_iter()
+                .collect();
+
+        self.root = Arc::new(Node::Internal {
+            height,
+            summary: sum_all(&child_summaries),
+            children: [left, right].into_iter().collect(),
+            child_summaries,
+        });
     }
 }
 
-/// Moves the back half of `v` into a new vec and returns it; `v` keeps the
-/// front half. The returned half gets the extra element when the length is odd.
-fn split<T, const CAP: usize>(v: &mut ArrayVec<T, CAP>) -> TreeResult<ArrayVec<T, CAP>> {
-    if v.len() <= 1 {
-        return Err(TreeError::NoEffectError);
-    }
-    let mid = v.len() / 2;
-    Ok(v.drain(mid..).collect())
+/// Which end of a node or tree to work at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Front,
+    Back,
+}
+
+/// Adds `incoming` to `v` at its `side`, keeping order. If they don't all
+/// fit, splits them evenly instead: `v` keeps the half away from `side`, and
+/// the half at `side` (the larger one when odd) is returned. Never overfills
+/// `v`, so the total can be anything up to `2 * CAP`.
+fn extend_or_split<E, const CAP: usize>(
+    v: &mut ArrayVec<E, CAP>,
+    incoming: impl ExactSizeIterator<Item = E>,
+    side: Side,
+) -> Option<ArrayVec<E, CAP>> {
+    let total = v.len() + incoming.len();
+    debug_assert!(total <= 2 * CAP, "{total} entries can't fill two nodes");
+    let keep = if total <= CAP { total } else { total / 2 };
+
+    // Lay everything out in order, then deal `keep` to `v` and the rest to
+    // the split-off half, from whichever end `side` says.
+    let old: ArrayVec<E, CAP> = v.drain(..).collect();
+    let split_off = match side {
+        Side::Back => {
+            let mut all = old.into_iter().chain(incoming);
+            v.extend(all.by_ref().take(keep));
+            all.collect::<ArrayVec<E, CAP>>()
+        }
+        Side::Front => {
+            let mut all = incoming.chain(old);
+            let split_off = all
+                .by_ref()
+                .take(total - keep)
+                .collect::<ArrayVec<E, CAP>>();
+            v.extend(all);
+            split_off
+        }
+    };
+    (total > CAP).then_some(split_off)
 }
 
 fn sum_all<S: Summary, const CAP: usize>(children: &ArrayVec<S, CAP>) -> S {
@@ -111,6 +185,13 @@ impl<T: Item, const CAP: usize> Node<T, CAP> {
     pub fn summary(&self) -> &T::Summary {
         match self {
             Node::Internal { summary, .. } | Node::Leaf { summary, .. } => summary,
+        }
+    }
+
+    pub fn height(&self) -> u8 {
+        match self {
+            Node::Internal { height, .. } => *height,
+            Node::Leaf { .. } => 0,
         }
     }
 
@@ -137,6 +218,7 @@ impl<T: Item, const CAP: usize> Node<T, CAP> {
         let min = if is_root { 0 } else { CAP / 2 };
         match self {
             Node::Internal {
+                height,
                 summary,
                 children,
                 child_summaries,
@@ -156,6 +238,12 @@ impl<T: Item, const CAP: usize> Node<T, CAP> {
                     ));
                 }
                 for (i, (child, s)) in children.iter().zip(child_summaries).enumerate() {
+                    if child.height() + 1 != *height {
+                        return Err(format!(
+                            "child {i} at depth {depth} has height {}, its parent has height {height}",
+                            child.height()
+                        ));
+                    }
                     if child.summary() != s {
                         return Err(format!(
                             "child {i} at depth {depth} has summary {:?}, its parent cached {s:?}",
@@ -214,80 +302,146 @@ impl<T: Item, const CAP: usize> Node<T, CAP> {
         Ok(())
     }
 
-    pub fn push(&mut self, in_item: T) -> Option<SumTree<T, CAP>> {
-        match self {
-            Node::Internal {
-                summary,
-                children,
-                child_summaries,
-            } => {
-                let child = children
-                    .last_mut()
-                    .expect("An empty internal node? It's unthinkable. It's unheard of!");
-                let right = Arc::make_mut(&mut child.root).push(in_item);
-                *child_summaries.last_mut().unwrap() = child.summary().clone();
+    /// Merges `other` onto this node's `side` edge, at the level matching its
+    /// height. Returns a new sibling, for our `side`, if this node overflowed.
+    fn push_tree(&mut self, other: SumTree<T, CAP>, side: Side) -> Option<SumTree<T, CAP>> {
+        debug_assert!(other.height() <= self.height());
 
-                let Some(right) = right else {
-                    *summary = sum_all(child_summaries);
-                    return None;
-                };
-                let right_summary = right.summary().clone();
+        if self.height() > other.height() {
+            // We're taller: `other` belongs further down the `side` edge.
+            return self.update_edge_child(side, |child| child.push_tree(other, side));
+        }
 
-                if children.is_full() {
-                    // NOTE: It's not you, it's me
-                    let mut rightems = split(children).expect("full children should have >1 item");
-                    let mut summarightems =
-                        split(child_summaries).expect("full child summaries should have >1 item");
-                    rightems.push(right);
-                    summarightems.push(right_summary);
-
-                    *summary = sum_all(child_summaries);
-                    Some(SumTree::from_node(Node::Internal {
-                        summary: sum_all(&summarightems),
-                        children: rightems,
-                        child_summaries: summarightems,
-                    }))
-                } else {
-                    children.push(right);
-                    child_summaries.push(right_summary);
-                    *summary = sum_all(child_summaries);
-                    None
-                }
-            }
+        // Same height: `other` is our sibling, so its entries join ours. Moves
+        // them if nothing else shares `other`'s root, clones them if something does.
+        match Arc::unwrap_or_clone(other.root) {
             Node::Leaf {
-                summary,
                 items,
                 item_summaries,
-            } => {
-                if items.is_full() {
-                    // Keep the left half in place; move the right half to a new sibling.
-                    let mut right_items = split(items).expect("full leaf has >1 item");
-                    let mut right_sums = split(item_summaries).expect("full leaf has >1 item");
-                    right_sums.push(in_item.summary());
-                    right_items.push(in_item);
+                ..
+            } => self.extend_leaf(items.into_iter(), item_summaries.into_iter(), side),
+            Node::Internal {
+                children,
+                child_summaries,
+                ..
+            } => self.extend_internal(children.into_iter(), child_summaries.into_iter(), side),
+        }
+    }
 
-                    *summary = T::Summary::empty();
-                    for s in item_summaries.iter() {
-                        summary.concat(s);
-                    }
-                    let mut right_summary = T::Summary::empty();
-                    for s in right_sums.iter() {
-                        right_summary.concat(s);
-                    }
-
-                    Some(SumTree::from_node(Node::Leaf {
-                        summary: right_summary,
-                        items: right_items,
-                        item_summaries: right_sums,
-                    }))
-                } else {
-                    let s = in_item.summary();
-                    summary.concat(&s);
-                    item_summaries.push(s);
-                    items.push(in_item);
-                    None
-                }
+    pub fn push(&mut self, in_item: T) -> Option<SumTree<T, CAP>> {
+        match self {
+            Node::Internal { .. } => {
+                self.update_edge_child(Side::Back, |child| child.push(in_item))
             }
+            Node::Leaf { .. } => {
+                let s = in_item.summary();
+                self.extend_leaf(iter::once(in_item), iter::once(s), Side::Back)
+            }
+        }
+    }
+
+    /// Runs `f` on the child at our `side` edge, then takes in whatever it
+    /// split off as a new child beside it. Returns a new sibling, for our
+    /// `side`, if that overflowed us.
+    fn update_edge_child(
+        &mut self,
+        side: Side,
+        f: impl FnOnce(&mut Node<T, CAP>) -> Option<SumTree<T, CAP>>,
+    ) -> Option<SumTree<T, CAP>> {
+        let Node::Internal {
+            summary,
+            children,
+            child_summaries,
+            ..
+        } = self
+        else {
+            unreachable!("leaves have no children");
+        };
+        let i = match side {
+            Side::Front => 0,
+            Side::Back => children.len() - 1,
+        };
+        let child = children
+            .get_mut(i)
+            .expect("An empty internal node? It's unthinkable. It's unheard of!");
+        let split_off = f(Arc::make_mut(&mut child.root));
+        child_summaries[i] = child.summary().clone();
+
+        match split_off {
+            None => {
+                *summary = sum_all(child_summaries);
+                None
+            }
+            Some(split_off) => {
+                let s = split_off.summary().clone();
+                self.extend_internal(iter::once(split_off), iter::once(s), side)
+            }
+        }
+    }
+
+    /// Adds items, with their summaries, at this leaf's `side`. Returns the
+    /// new sibling, for that side, if they didn't all fit.
+    fn extend_leaf(
+        &mut self,
+        new_items: impl ExactSizeIterator<Item = T>,
+        new_summaries: impl ExactSizeIterator<Item = T::Summary>,
+        side: Side,
+    ) -> Option<SumTree<T, CAP>> {
+        let Node::Leaf {
+            summary,
+            items,
+            item_summaries,
+        } = self
+        else {
+            unreachable!("extend_leaf on an internal node");
+        };
+        // Same lengths in, so both split at the same place.
+        let split_items = extend_or_split(items, new_items, side);
+        let split_summaries = extend_or_split(item_summaries, new_summaries, side);
+        *summary = sum_all(item_summaries);
+
+        match (split_items, split_summaries) {
+            (None, None) => None,
+            (Some(items), Some(item_summaries)) => Some(SumTree::from_node(Node::Leaf {
+                summary: sum_all(&item_summaries),
+                items,
+                item_summaries,
+            })),
+            _ => unreachable!("items and their summaries split differently"),
+        }
+    }
+
+    /// Adds children, with their summaries, at this internal node's `side`.
+    /// Returns the new sibling, for that side, if they didn't all fit.
+    fn extend_internal(
+        &mut self,
+        new_children: impl ExactSizeIterator<Item = SumTree<T, CAP>>,
+        new_summaries: impl ExactSizeIterator<Item = T::Summary>,
+        side: Side,
+    ) -> Option<SumTree<T, CAP>> {
+        let Node::Internal {
+            height,
+            summary,
+            children,
+            child_summaries,
+        } = self
+        else {
+            unreachable!("extend_internal on a leaf");
+        };
+        // NOTE: It's not you, it's me
+        let split_children = extend_or_split(children, new_children, side);
+        let split_summaries = extend_or_split(child_summaries, new_summaries, side);
+        *summary = sum_all(child_summaries);
+
+        match (split_children, split_summaries) {
+            (None, None) => None,
+            (Some(children), Some(child_summaries)) => Some(SumTree::from_node(Node::Internal {
+                height: *height,
+                summary: sum_all(&child_summaries),
+                children,
+                child_summaries,
+            })),
+            _ => unreachable!("children and their summaries split differently"),
         }
     }
 }
@@ -299,27 +453,61 @@ mod tests {
 
     proptest! {
         #[test]
-        fn split_preserves_order_and_balance(v in prop::collection::vec(any::<u8>(), 2..=12)) {
-            let mut l: ArrayVec<u8, 12> = v.iter().copied().collect();
-            let r = split(&mut l).unwrap();
-            prop_assert_eq!([&l[..], &r[..]].concat(), v);
-            prop_assert!(l.len().abs_diff(r.len()) <= 1);
+        fn extend_or_split_preserves_order_and_balance(
+            v in prop::collection::vec(any::<u8>(), 0..=12),
+            more in prop::collection::vec(any::<u8>(), 0..=12),
+            front in any::<bool>(),
+        ) {
+            let side = if front { Side::Front } else { Side::Back };
+            let mut kept: ArrayVec<u8, 12> = v.iter().copied().collect();
+            let split_off = extend_or_split(&mut kept, more.iter().copied(), side);
+            let all = match side {
+                Side::Back => [&v[..], &more[..]].concat(),
+                Side::Front => [&more[..], &v[..]].concat(),
+            };
+            match split_off {
+                None => {
+                    prop_assert!(all.len() <= 12);
+                    prop_assert_eq!(kept.as_slice(), &all[..]);
+                }
+                Some(split_off) => {
+                    prop_assert!(all.len() > 12);
+                    let joined = match side {
+                        Side::Back => [&kept[..], &split_off[..]].concat(),
+                        Side::Front => [&split_off[..], &kept[..]].concat(),
+                    };
+                    prop_assert_eq!(joined, all);
+                    prop_assert!(kept.len() <= split_off.len() && split_off.len() - kept.len() <= 1);
+                }
+            }
         }
     }
 
+    /// Order-sensitive on purpose: `first` and `last` come out wrong if
+    /// summaries are ever combined in the wrong order, which a plain count or
+    /// sum can't show.
     #[derive(Clone, Debug, PartialEq)]
     pub struct CountSum {
         count: usize,
         sum: u64,
+        first: Option<u64>,
+        last: Option<u64>,
     }
 
     impl Summary for CountSum {
         fn empty() -> Self {
-            CountSum { count: 0, sum: 0 }
+            CountSum {
+                count: 0,
+                sum: 0,
+                first: None,
+                last: None,
+            }
         }
         fn concat(&mut self, other: &Self) {
             self.count += other.count;
             self.sum += other.sum;
+            self.first = self.first.or(other.first);
+            self.last = other.last.or(self.last);
         }
     }
 
@@ -329,62 +517,52 @@ mod tests {
             CountSum {
                 count: 1,
                 sum: *self,
+                first: Some(*self),
+                last: Some(*self),
             }
         }
     }
 
-    /// Checks every stored summary matches its contents and all leaves sit at the same depth.
-    fn check<const CAP: usize>(
-        tree: &SumTree<u64, CAP>,
-        depth: usize,
-        leaf_depth: &mut Option<usize>,
-    ) -> Vec<u64> {
-        match &*tree.root {
-            Node::Leaf {
-                summary,
-                items,
-                item_summaries,
-            } => {
-                assert_eq!(*leaf_depth.get_or_insert(depth), depth, "unbalanced");
-                assert_eq!(summary, &sum_all(item_summaries));
-                items.to_vec()
-            }
-            Node::Internal {
-                summary,
-                children,
-                child_summaries,
-            } => {
-                assert!(!children.is_empty());
-                assert_eq!(summary, &sum_all(child_summaries));
-                let mut out = Vec::new();
-                for (child, s) in children.iter().zip(child_summaries) {
-                    assert_eq!(child.summary(), s);
-                    out.extend(check(child, depth + 1, leaf_depth));
-                }
-                out
-            }
+    fn tree_of<const CAP: usize>(items: std::ops::Range<u64>) -> SumTree<u64, CAP> {
+        let mut tree = SumTree::new();
+        for i in items {
+            tree.push(i);
         }
+        tree
+    }
+
+    fn summary_of(items: std::ops::Range<u64>) -> CountSum {
+        let mut s = CountSum::empty();
+        for i in items {
+            s.concat(&i.summary());
+        }
+        s
     }
 
     proptest! {
         #[test]
         fn push_keeps_order_summaries_and_balance(n in 0u64..2000) {
-            let mut tree: SumTree<u64> = SumTree::new();
-            for i in 0..n {
-                tree.push(i);
-            }
-            let items = check(&tree, 0, &mut None);
-            prop_assert_eq!(items, (0..n).collect::<Vec<_>>());
-            prop_assert_eq!(tree.summary(), &CountSum { count: n as usize, sum: (0..n).sum() });
+            let tree: SumTree<u64> = tree_of(0..n);
+            tree.check().map_err(TestCaseError::fail)?;
+            prop_assert_eq!(tree.items(), (0..n).collect::<Vec<_>>());
+            prop_assert_eq!(tree.summary(), &summary_of(0..n));
         }
-    }
 
-    #[test]
-    fn split_too_small_is_no_effect() {
-        let mut empty: ArrayVec<u8, 12> = ArrayVec::new();
-        assert_eq!(split(&mut empty), Err(TreeError::NoEffectError));
-        let mut one: ArrayVec<u8, 12> = [7].into_iter().collect();
-        assert_eq!(split(&mut one), Err(TreeError::NoEffectError));
-        assert_eq!(one.as_slice(), &[7]); // untouched on error
+        /// Tiny nodes, so a few hundred items make trees several levels tall,
+        /// and random sizes put the taller tree on either side.
+        #[test]
+        fn append_keeps_order_summaries_and_balance(a in 0u64..600, b in 0u64..600) {
+            let left: SumTree<u64, 4> = tree_of(0..a);
+            let right: SumTree<u64, 4> = tree_of(a..a + b);
+            let mut tree = left.clone();
+            tree.append(right.clone());
+
+            tree.check().map_err(TestCaseError::fail)?;
+            prop_assert_eq!(tree.items(), (0..a + b).collect::<Vec<_>>());
+            prop_assert_eq!(tree.summary(), &summary_of(0..a + b));
+            // The inputs are untouched.
+            prop_assert_eq!(left.items(), (0..a).collect::<Vec<_>>());
+            prop_assert_eq!(right.items(), (a..a + b).collect::<Vec<_>>());
+        }
     }
 }

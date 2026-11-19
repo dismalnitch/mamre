@@ -30,7 +30,7 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "needs SumTree::append and Cursor; see tests/referee/mamre.rs"]
+    #[ignore = "needs Cursor; see tests/referee/mamre.rs"]
     fn mamre_matches_the_model(start in ops::lines(80), ops in ops::ops()) {
         ops::run::<mamre::Tree>(start, &ops).map_err(TestCaseError::fail)?;
     }
@@ -50,11 +50,49 @@ proptest! {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// What runs before `Cursor` exists: build trees by pushing, then join
+    /// them by appending on either side. Appending a small tree onto a big one
+    /// and a big one onto a small one take different paths, so do both. After
+    /// each join, check shape, items and summary, and that a copy made before
+    /// it is untouched. No seeks, so no `verify`.
+    #[test]
+    fn mamre_appends_like_the_model(
+        start in ops::lines(3000),
+        joins in prop::collection::vec((ops::lines(3000), any::<bool>()), 1..6),
+    ) {
+        use subject::Subject;
+        let mut tree = mamre::Tree::from_items(start.clone());
+        let mut model = start;
+        for (lines, after) in joins {
+            let copy = tree.clone();
+            let copy_model = model.clone();
+            let other = mamre::Tree::from_items(lines.clone());
+            if after {
+                tree.append(other);
+                model.extend(lines);
+            } else {
+                let mut front = other;
+                front.append(tree);
+                tree = front;
+                model.splice(0..0, lines);
+            }
+            for (t, m) in [(&tree, &model), (&copy, &copy_model)] {
+                t.check().map_err(TestCaseError::fail)?;
+                prop_assert_eq!(&t.items(), m);
+                prop_assert_eq!(t.summary(), model::summarize(m));
+            }
+        }
+    }
+}
+
+proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 
     /// Fewer cases, but trees deep enough for several levels of nodes.
     #[test]
-    #[ignore = "needs SumTree::append and Cursor; see tests/referee/mamre.rs"]
+    #[ignore = "needs Cursor; see tests/referee/mamre.rs"]
     fn mamre_matches_the_model_when_deep(start in ops::lines(5000), ops in ops::ops()) {
         ops::run::<mamre::Tree>(start, &ops).map_err(TestCaseError::fail)?;
     }

@@ -4,7 +4,6 @@
 //! `Count`, `Len` and `Height` as dimensions to seek by.
 //!
 //! Still to wire, as the tree grows them:
-//! - `append`: needs `SumTree::append`.
 //! - `seek`, `prefix`, `split`: need `Cursor` (`seek`, `slice`, `suffix`).
 //!
 //! The referee seeks after every operation, even the first build, so the
@@ -96,8 +95,8 @@ impl Subject for Mamre {
         self.0.push(line);
     }
 
-    fn append(&mut self, _other: Self) {
-        todo!("needs SumTree::append")
+    fn append(&mut self, other: Self) {
+        self.0.append(other.0);
     }
 
     fn split(&self, _target: Target, _bias: Bias) -> (Self, Self) {
