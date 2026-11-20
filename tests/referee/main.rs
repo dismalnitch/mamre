@@ -50,6 +50,50 @@ proptest! {
 }
 
 proptest! {
+    /// What runs before `slice` and `suffix` exist: seek to every boundary,
+    /// the middle of every item and past the end, by every dimension, both
+    /// ways, and check where it lands and the summary before it.
+    #[test]
+    fn mamre_seeks_like_the_model(start in ops::lines(200)) {
+        use subject::Subject;
+        let tree = mamre::Tree::from_items(start.clone());
+        let mut before = model::Lines::default();
+        for i in 0..=start.len() {
+            let line = start.get(i);
+            for (target, width) in [
+                (model::Target::Count(before.count), 1),
+                (model::Target::Len(before.len), line.map_or(3, |l| l.len as u64)),
+                (model::Target::Height(before.height), line.map_or(3, |l| l.height as u64)),
+            ] {
+                let v = target.value();
+                for value in [v, v + width / 2, v + width] {
+                    let target = match target {
+                        model::Target::Count(_) => model::Target::Count(value as usize),
+                        model::Target::Len(_) => model::Target::Len(value),
+                        model::Target::Height(_) => model::Target::Height(value),
+                    };
+                    for bias in [model::Bias::Left, model::Bias::Right] {
+                        prop_assert_eq!(
+                            tree.seek(target, bias),
+                            model::seek(&start, target, bias),
+                            "seek({:?}, {:?})", target, bias
+                        );
+                        prop_assert_eq!(
+                            tree.prefix(target, bias),
+                            model::prefix(&start, target, bias),
+                            "prefix({:?}, {:?})", target, bias
+                        );
+                    }
+                }
+            }
+            if let Some(line) = line {
+                before = before.add(&model::Lines::of(line));
+            }
+        }
+    }
+}
+
+proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
     /// What runs before `Cursor` exists: build trees by pushing, then join

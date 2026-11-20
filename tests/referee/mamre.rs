@@ -1,17 +1,18 @@
 //! Where mamre's tree meets the referee.
 //!
-//! `Mamre` holds a `SumTree` of [`Line`]s, with [`Lines`] as its summary and
-//! `Count`, `Len` and `Height` as dimensions to seek by.
+//! `Mamre` holds a `SumTree` of [`Line`]s, with [`Lines`] as its summary.
+//! Its cursors track the whole `Lines` before them, and seek by `Count`,
+//! `Len` or `Height`: targets that each compare against one field of it.
 //!
 //! Still to wire, as the tree grows them:
-//! - `seek`, `prefix`, `split`: need `Cursor` (`seek`, `slice`, `suffix`).
+//! - `split`: needs `Cursor::slice` and `Cursor::suffix`.
 //!
 //! The referee seeks after every operation, even the first build, so the
 //! tests in `main.rs` stay `#[ignore]`d until all of these are in.
 
-use std::fmt;
+use std::{cmp::Ordering, fmt};
 
-use mamre::{Dimension, Item, SumTree, Summary};
+use mamre::{SeekTarget, SumTree, Summary, cursor, Item};
 
 use crate::model::{Bias, Line, Lines, Target};
 use crate::subject::Subject;
@@ -35,44 +36,29 @@ impl Summary for Lines {
 }
 
 /// Seek by number of items.
-#[allow(dead_code)] // until seek is wired
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Count(pub usize);
 
 /// Seek by total text length.
-#[allow(dead_code)] // until seek is wired
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Len(pub u64);
 
 /// Seek by total height.
-#[allow(dead_code)] // until seek is wired
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Height(pub u64);
 
-impl Dimension<Lines> for Count {
-    fn zero() -> Self {
-        Count(0)
-    }
-    fn add_summary(&mut self, summary: &Lines) {
-        self.0 += summary.count;
+impl SeekTarget<Lines, Lines> for Count {
+    fn cmp_position(&self, position: &Lines) -> Ordering {
+        self.0.cmp(&position.count)
     }
 }
 
-impl Dimension<Lines> for Len {
-    fn zero() -> Self {
-        Len(0)
-    }
-    fn add_summary(&mut self, summary: &Lines) {
-        self.0 += summary.len;
+impl SeekTarget<Lines, Lines> for Len {
+    fn cmp_position(&self, position: &Lines) -> Ordering {
+        self.0.cmp(&position.len)
     }
 }
 
-impl Dimension<Lines> for Height {
-    fn zero() -> Self {
-        Height(0)
-    }
-    fn add_summary(&mut self, summary: &Lines) {
-        self.0 += summary.height;
+impl SeekTarget<Lines, Lines> for Height {
+    fn cmp_position(&self, position: &Lines) -> Ordering {
+        self.0.cmp(&position.height)
     }
 }
 
@@ -103,12 +89,22 @@ impl Subject for Mamre {
         todo!("needs Cursor::slice and Cursor::suffix")
     }
 
-    fn seek(&self, _target: Target, _bias: Bias) -> usize {
-        todo!("needs Cursor::seek")
+    fn seek(&self, target: Target, bias: Bias) -> usize {
+        self.prefix(target, bias).count
     }
 
-    fn prefix(&self, _target: Target, _bias: Bias) -> Lines {
-        todo!("needs Cursor::seek")
+    fn prefix(&self, target: Target, bias: Bias) -> Lines {
+        let bias = match bias {
+            Bias::Left => cursor::Bias::Left,
+            Bias::Right => cursor::Bias::Right,
+        };
+        let mut cursor = self.0.cursor::<Lines>();
+        match target {
+            Target::Count(n) => cursor.seek(&Count(n), bias),
+            Target::Len(n) => cursor.seek(&Len(n), bias),
+            Target::Height(n) => cursor.seek(&Height(n), bias),
+        };
+        *cursor.start()
     }
 
     fn summary(&self) -> Lines {
