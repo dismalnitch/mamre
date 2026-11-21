@@ -1,6 +1,7 @@
 use std::{iter, sync::Arc};
 
-use crate::{ArrayVec, Item, Node, SumTree, Summary};
+use crate::cursor::{Bias, passes};
+use crate::{ArrayVec, Dimension, Item, Node, SeekTarget, SumTree, Summary};
 
 impl<T: Item, const CAP: usize> Default for SumTree<T, CAP> {
     fn default() -> Self {
@@ -132,16 +133,38 @@ impl<T: Item, const CAP: usize> SumTree<T, CAP> {
         self.root.edge_item(Side::Back)
     }
 
-    /// Changes the first item in place, and every summary above it. Does
-    /// nothing to an empty tree. Copies only the path down to it, if shared.
-    pub fn update_first(&mut self, f: impl FnOnce(&mut T)) {
-        Arc::make_mut(&mut self.root).update_edge_item(Side::Front, f);
+    /// Changes the item a seek for `target` lands on (see
+    /// [`Cursor::seek_forward`](crate::cursor::Cursor::seek_forward) for
+    /// `bias`), in place, and refreshes every summary above it. Returns what
+    /// `f` returns, or `None` without calling it if the target is past the
+    /// last item.
+    ///
+    /// This is how a tree of trees stays current: an item that holds a tree
+    /// (a section holding its text, say) is changed through here, and its
+    /// new summary rolls up. O(log n); a shared tree copies only the path
+    /// down to the item.
+    pub fn update_at<D: Dimension<T::Summary>, R>(
+        &mut self,
+        target: &impl SeekTarget<T::Summary, D>,
+        bias: Bias,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Option<R> {
+        let path = self.root.path_to::<D>(target, bias)?;
+        Some(Arc::make_mut(&mut self.root).update_path(&path, f))
     }
 
-    /// Changes the last item in place, and every summary above it. Does
-    /// nothing to an empty tree. Copies only the path down to it, if shared.
-    pub fn update_last(&mut self, f: impl FnOnce(&mut T)) {
-        Arc::make_mut(&mut self.root).update_edge_item(Side::Back, f);
+    /// Changes the first item in place, and every summary above it. `None`,
+    /// without calling `f`, for an empty tree.
+    pub fn update_first<R>(&mut self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let path = self.root.edge_path(Side::Front)?;
+        Some(Arc::make_mut(&mut self.root).update_path(&path, f))
+    }
+
+    /// Changes the last item in place, and every summary above it. `None`,
+    /// without calling `f`, for an empty tree.
+    pub fn update_last<R>(&mut self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let path = self.root.edge_path(Side::Back)?;
+        Some(Arc::make_mut(&mut self.root).update_path(&path, f))
     }
 
     /// The root split off a sibling on its `side`: the tree grows a level,
@@ -250,9 +273,73 @@ impl<T: Item, const CAP: usize> Node<T, CAP> {
         }
     }
 
-    /// Runs `f` on the item at this node's `side` edge, then refreshes the
-    /// cached summaries on the way back up.
-    fn update_edge_item(&mut self, side: Side, f: impl FnOnce(&mut T)) {
+    /// The child (or item) index at each level, from here down to the item a
+    /// seek for `target` lands on; `None` if it's past the last item. The
+    /// same choice at each level as a cursor's seek: skip whole entries that
+    /// end before the target, and go into the first one that doesn't.
+    fn path_to<D: Dimension<T::Summary>>(
+        &self,
+        target: &impl SeekTarget<T::Summary, D>,
+        bias: Bias,
+    ) -> Option<Vec<usize>> {
+        let mut path = Vec::new();
+        let mut position = D::zero();
+        let mut node = self;
+        loop {
+            let summaries: &[T::Summary] = match node {
+                Node::Internal {
+                    child_summaries, ..
+                } => child_summaries,
+                Node::Leaf { item_summaries, .. } => item_summaries,
+            };
+            // An entry the target doesn't pass holds it. Below the root
+            // there always is one: the parent chose this node because its
+            // end, which is its last entry's end, wasn't passed.
+            let i = summaries.iter().position(|s| {
+                let mut end = position.clone();
+                end.add_summary(s);
+                if passes(target.cmp_position(&end), bias) {
+                    position = end;
+                    false
+                } else {
+                    true
+                }
+            })?;
+            path.push(i);
+            match node {
+                Node::Internal { children, .. } => node = &children[i].root,
+                Node::Leaf { .. } => return Some(path),
+            }
+        }
+    }
+
+    /// The path to the item at this node's `side` edge; `None` if empty.
+    fn edge_path(&self, side: Side) -> Option<Vec<usize>> {
+        let mut path = Vec::new();
+        let mut node = self;
+        loop {
+            let len = match node {
+                Node::Internal { children, .. } => children.len(),
+                Node::Leaf { items, .. } => items.len(),
+            };
+            let i = match side {
+                Side::Front if len > 0 => 0,
+                Side::Back => len.checked_sub(1)?,
+                Side::Front => return None,
+            };
+            path.push(i);
+            match node {
+                Node::Internal { children, .. } => node = &children[i].root,
+                Node::Leaf { .. } => return Some(path),
+            }
+        }
+    }
+
+    /// Runs `f` on the item at the end of `path`, then refreshes the cached
+    /// summaries on the way back up. Copies any node along the path that's
+    /// shared.
+    fn update_path<R>(&mut self, path: &[usize], f: impl FnOnce(&mut T) -> R) -> R {
+        let i = path[0];
         match self {
             Node::Internal {
                 summary,
@@ -260,31 +347,21 @@ impl<T: Item, const CAP: usize> Node<T, CAP> {
                 child_summaries,
                 ..
             } => {
-                let i = match side {
-                    Side::Front => 0,
-                    Side::Back => children.len() - 1,
-                };
                 let child = &mut children[i];
-                Arc::make_mut(&mut child.root).update_edge_item(side, f);
+                let out = Arc::make_mut(&mut child.root).update_path(&path[1..], f);
                 child_summaries[i] = child.summary().clone();
                 *summary = sum_all(child_summaries);
+                out
             }
             Node::Leaf {
                 summary,
                 items,
                 item_summaries,
             } => {
-                let i = match side {
-                    Side::Front => 0,
-                    Side::Back if items.is_empty() => return,
-                    Side::Back => items.len() - 1,
-                };
-                let Some(item) = items.get_mut(i) else {
-                    return;
-                };
-                f(item);
-                item_summaries[i] = item.summary();
+                let out = f(&mut items[i]);
+                item_summaries[i] = items[i].summary();
                 *summary = sum_all(item_summaries);
+                out
             }
         }
     }
@@ -686,5 +763,141 @@ mod tests {
             prop_assert_eq!(changed.summary(), &s);
             prop_assert_eq!(tree.items(), (0..n).collect::<Vec<_>>());
         }
+
+        /// Change the item a seek lands on, by count, either bias, including
+        /// past the end: only that item changes, summaries roll up, shape
+        /// holds, and a copy taken before is untouched.
+        #[test]
+        fn update_at_changes_the_item_a_seek_lands_on(
+            n in 0u64..600,
+            at in 0usize..610,
+            left in any::<bool>(),
+        ) {
+            let bias = if left { Bias::Left } else { Bias::Right };
+            let tree: SumTree<u64, 4> = tree_of(0..n);
+            let mut changed = tree.clone();
+            let got = changed.update_at::<Count, _>(&Count(at), bias, |x| {
+                let was = *x;
+                *x += 1000;
+                was
+            });
+
+            // `Count(k)` with `Right` lands on item k; with `Left`, on the
+            // item ending at k, which is k - 1 (or item 0 for k = 0).
+            let lands = match bias {
+                Bias::Right => at,
+                Bias::Left => at.saturating_sub(1),
+            };
+            let mut want: Vec<u64> = (0..n).collect();
+            match want.get_mut(lands) {
+                Some(x) => {
+                    prop_assert_eq!(got, Some(*x));
+                    *x += 1000;
+                }
+                None => prop_assert_eq!(got, None),
+            }
+            changed.check().map_err(TestCaseError::fail)?;
+            prop_assert_eq!(changed.items(), want.clone());
+            let mut s = CountSum::empty();
+            for x in &want {
+                s.concat(&x.summary());
+            }
+            prop_assert_eq!(changed.summary(), &s);
+            prop_assert_eq!(tree.items(), (0..n).collect::<Vec<_>>());
+        }
+    }
+
+    /// Item count, as a dimension: ordered, so it's its own seek target.
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct Count(usize);
+
+    impl Dimension<CountSum> for Count {
+        fn zero() -> Self {
+            Count(0)
+        }
+        fn add_summary(&mut self, s: &CountSum) {
+            self.0 += s.count;
+        }
+    }
+
+    /// The point of `update_at`: a tree of trees. Each section holds its own
+    /// tree of words; changing one section's words rolls its new total up
+    /// into the outline, and leaves the others shared.
+    #[test]
+    fn a_tree_of_trees_stays_current() {
+        /// A section's words, as a tree of their own.
+        #[derive(Clone)]
+        struct Section(SumTree<u64, 4>);
+
+        /// The outline counts sections, and rolls up their words.
+        #[derive(Clone, Debug, PartialEq)]
+        struct Outline {
+            sections: usize,
+            words: CountSum,
+        }
+
+        impl Summary for Outline {
+            fn empty() -> Self {
+                Outline {
+                    sections: 0,
+                    words: CountSum::empty(),
+                }
+            }
+            fn concat(&mut self, other: &Self) {
+                self.sections += other.sections;
+                self.words.concat(&other.words);
+            }
+        }
+
+        impl Item for Section {
+            type Summary = Outline;
+            fn summary(&self) -> Outline {
+                // O(1): a tree's summary is cached at its root.
+                Outline {
+                    sections: 1,
+                    words: self.0.summary().clone(),
+                }
+            }
+        }
+
+        /// Seek sections by how many come before.
+        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+        struct SectionNumber(usize);
+
+        impl Dimension<Outline> for SectionNumber {
+            fn zero() -> Self {
+                SectionNumber(0)
+            }
+            fn add_summary(&mut self, s: &Outline) {
+                self.0 += s.sections;
+            }
+        }
+
+        let mut outline: SumTree<Section, 4> = SumTree::new();
+        for s in 0..20u64 {
+            outline.push(Section(tree_of(s * 10..s * 10 + 10)));
+        }
+        let before = outline.clone();
+
+        // Add a word to section 7: its own tree grows, and the outline's
+        // totals follow.
+        let words =
+            outline.update_at::<SectionNumber, _>(&SectionNumber(7), Bias::Right, |section| {
+                section.0.push(9999);
+                section.0.summary().count
+            });
+        assert_eq!(words, Some(11));
+        assert_eq!(outline.summary().words.count, 201);
+        assert_eq!(
+            outline.summary().words.sum,
+            before.summary().words.sum + 9999
+        );
+        outline.check().unwrap();
+        assert_eq!(before.summary().words.count, 200, "the copy is untouched");
+        assert_eq!(
+            outline.update_at::<SectionNumber, _>(&SectionNumber(20), Bias::Right, |_| ()),
+            None,
+            "past the last section"
+        );
     }
 }

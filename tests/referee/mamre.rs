@@ -111,6 +111,12 @@ impl Subject for Mamre {
         self.0.remove(&To(from), &To(to), cursor_bias(bias));
     }
 
+    fn update(&mut self, target: Target, bias: Bias, line: Line) -> bool {
+        self.0
+            .update_at(&To(target), cursor_bias(bias), |l| *l = line)
+            .is_some()
+    }
+
     fn walk(&self, start: Option<(Target, Bias)>, steps: &[Step]) -> Vec<(Option<Line>, Lines)> {
         let mut cursor = self.0.cursor::<Lines>();
         if let Some((target, bias)) = start {

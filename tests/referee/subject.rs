@@ -57,6 +57,23 @@ pub trait Subject: Clone + std::fmt::Debug {
         self.replace(from, to, bias, Vec::new());
     }
 
+    /// Changes the item a seek lands on to `line`; says whether there was
+    /// one (a seek past the end lands on none).
+    ///
+    /// The default splits around it and joins; a tree that can change an
+    /// item in place should, so the referee checks that.
+    fn update(&mut self, target: Target, bias: Bias, line: Line) -> bool {
+        let (mut left, rest) = self.split(target, bias);
+        if rest.items().is_empty() {
+            return false;
+        }
+        let (_, right) = rest.split(Target::Count(1), Bias::Right);
+        left.push(line);
+        left.append(right);
+        *self = left;
+        true
+    }
+
     /// See [`model::walk`]. The default asks the model; a tree with a cursor
     /// should walk one.
     fn walk(&self, start: Option<(Target, Bias)>, steps: &[Step]) -> Vec<(Option<Line>, Lines)> {

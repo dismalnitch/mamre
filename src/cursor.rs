@@ -478,7 +478,7 @@ fn entries<T: Item, const CAP: usize>(tree: &SumTree<T, CAP>) -> &[T::Summary] {
 
 /// Whether a seek goes past an entry, given how the target compares with
 /// the position at the entry's end.
-fn passes(target_vs_end: Ordering, bias: Bias) -> bool {
+pub(crate) fn passes(target_vs_end: Ordering, bias: Bias) -> bool {
     match bias {
         // Stop at the first entry whose end reaches the target.
         Bias::Left => target_vs_end == Ordering::Greater,

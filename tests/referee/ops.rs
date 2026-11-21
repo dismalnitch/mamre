@@ -76,6 +76,8 @@ pub enum Op {
     Insert { at: Aim, insert: Vec<Line> },
     /// Remove the items between two seeks. Both ends use `from`'s bias.
     Remove { from: Aim, to: Aim },
+    /// Change the item a seek lands on, in place.
+    Update { at: Aim, line: Line },
     /// Seek, and check where it lands and the summary before it.
     Seek(Aim),
     /// Seek (or start fresh, before the first item), then step, checking
@@ -150,6 +152,20 @@ fn apply<S: Subject>(tree: &mut S, model: &mut Vec<Line>, op: &Op) -> Result<(),
             let range = model::range(model, a, b, bias);
             tree.remove(a, b, bias);
             model.drain(range);
+        }
+        Op::Update { at, line } => {
+            let (target, bias) = at.resolve(model);
+            let i = model::seek(model, target, bias);
+            let want = i < model.len();
+            if want {
+                model[i] = *line;
+            }
+            let got = tree.update(target, bias, *line);
+            if got != want {
+                return Err(format!(
+                    "update({target:?}, {bias:?}) found an item: {got}, want {want}"
+                ));
+            }
         }
         Op::Seek(aim) => {
             let (target, bias) = aim.resolve(model);
@@ -277,6 +293,7 @@ fn op() -> impl Strategy<Value = Op> {
         3 => (aim(), aim(), lines(20)).prop_map(|(from, to, insert)| Op::Replace { from, to, insert }),
         2 => (aim(), lines(20)).prop_map(|(at, insert)| Op::Insert { at, insert }),
         2 => (aim(), aim()).prop_map(|(from, to)| Op::Remove { from, to }),
+        3 => (aim(), line()).prop_map(|(at, line)| Op::Update { at, line }),
         4 => aim().prop_map(Op::Seek),
         3 => (prop::option::weighted(0.75, aim()), steps()).prop_map(|(start, steps)| Op::Walk { start, steps }),
     ]
