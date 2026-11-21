@@ -3,11 +3,18 @@
 //! The text is cut into chunks of up to `N` bytes (never inside a `char`),
 //! held as items of a `SumTree`. Every node knows its subtree's
 //! [`TextSummary`]: bytes, chars and lines, plus whatever the rope's
-//! [`Measure`] counts. `Rope<Plain>` counts nothing more, `Rope<Prose>` adds
-//! words, sentences and paragraphs (each in the variants vim and prose
-//! disagree on), and `Rope<Markdown>` adds sections. Every [`Unit`] a rope
-//! counts is also one it can seek by, in O(log n): see [`Rope::unit_start`]
-//! and friends.
+//! [`Measure`] counts: `Rope<Plain>` nothing more, `Rope<Prose>` words and
+//! paragraphs, `Rope<Sections>` markdown headings, and measures combine as
+//! tuples (`Markdown` is `(Prose, Sections)`).
+//!
+//! Units ([`Unit`]: words, sentences, paragraphs, sections, in the variants
+//! vim and prose disagree on) can be found two ways:
+//!
+//! - by number, far away, in O(log n), if the measure counts them:
+//!   [`Rope::unit_start`] and friends;
+//! - by neighbour, near a position, whatever the measure:
+//!   [`Rope::next_boundary`] and [`Rope::prev_boundary`], which is what
+//!   motions want.
 //!
 //! Positions are byte offsets, as for `str`, and must fall on `char`
 //! boundaries. Lines are split on `\n` only; a `\r` is ordinary text, so
@@ -18,6 +25,7 @@
 //! it that way, so a rope of `n` bytes has fewer than `2n / N + 1` chunks.
 
 mod measure;
+mod scan;
 mod seek;
 mod summary;
 mod units;
@@ -29,7 +37,8 @@ use std::ops::Range;
 use arrayvec::ArrayString;
 use mamre::{Item, SumTree, cursor::Bias};
 
-pub use measure::{Markdown, Measure, Plain, Prose};
+pub use measure::{Markdown, Measure, Plain, Prose, Sections};
+pub use scan::Edge;
 pub use summary::{ByteOffset, CharOffset, Point, TextSummary};
 pub use units::{Scan, Step, Unit, UnitState};
 

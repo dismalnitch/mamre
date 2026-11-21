@@ -120,6 +120,57 @@ impl Unit {
         self == Unit::Section && state == section::HASHES
     }
 
+    /// Whether the machine is inside a unit in this state, so one is open
+    /// if the text ends here. (Sections end at the next start instead.)
+    pub(crate) fn inside(self, state: u8) -> bool {
+        match self {
+            Unit::Word | Unit::VimWord | Unit::Sentence => state != self.start_state(),
+            Unit::Paragraph | Unit::VimParagraph => state != self.start_state(),
+            Unit::Section => true,
+        }
+    }
+
+    /// A point at or before `pos` where this unit's machine state is known
+    /// without reading further back, and that state. `before` gives the
+    /// `char`s before `pos`, nearest first.
+    ///
+    /// - Words: just after the previous whitespace.
+    /// - Sentences: just after the previous `.`, `!` or `?` (and closers)
+    ///   followed by whitespace, or the previous empty line.
+    /// - Paragraphs and sections: the start of the line, with the line
+    ///   above it read to see if it's blank.
+    ///
+    /// Each falls back to the start of the text.
+    pub(crate) fn sync(self, mut before: impl Iterator<Item = (usize, char)>) -> (usize, u8) {
+        let start = (0, self.start_state());
+        match self {
+            Unit::Word | Unit::VimWord => before
+                .find(|&(_, c)| c.is_whitespace())
+                .map_or(start, |(i, c)| (i + c.len_utf8(), self.start_state())),
+            Unit::Sentence => sentence::sync(before).unwrap_or(start),
+            Unit::Paragraph | Unit::VimParagraph | Unit::Section => {
+                let Some((newline, _)) = before.find(|&(_, c)| c == '\n') else {
+                    return start;
+                };
+                let line_start = newline + 1;
+                let state = match self {
+                    Unit::Paragraph => {
+                        let blank = before
+                            .take_while(|&(_, c)| c != '\n')
+                            .all(|(_, c)| c.is_whitespace());
+                        paragraph::at_line_start(blank)
+                    }
+                    Unit::VimParagraph => {
+                        let empty = before.next().is_none_or(|(_, c)| c == '\n');
+                        vim_paragraph::at_line_start(empty)
+                    }
+                    _ => section::START,
+                };
+                (line_start, state)
+            }
+        }
+    }
+
     /// Every unit of this kind in `text`, the slow way: one pass, no tree.
     /// For short strings, and as the reference the rope is tested against.
     pub fn ranges(self, text: &str) -> Vec<Range<usize>> {
@@ -302,6 +353,39 @@ mod sentence {
             _ => (IN, false, false),
         }
     }
+
+    /// Reading back (nearest first), the nearest point where the state is
+    /// certainly `GAP`: just after whitespace that follows a `.`, `!` or
+    /// `?` (and any closers), since every state goes to `TERM` on those and
+    /// `TERM` goes to `GAP` on whitespace; or just after two newlines in a
+    /// row, which take every state to `GAP`.
+    pub fn sync(before: impl Iterator<Item = (usize, char)>) -> Option<(usize, u8)> {
+        // The latest whitespace seen, and whether only closers follow it
+        // back to here.
+        let mut space: Option<(usize, char)> = None;
+        let mut closers = false;
+        for (i, c) in before {
+            if let Some((j, w)) = space {
+                if ends_sentence(c) {
+                    return Some((j + w.len_utf8(), GAP));
+                }
+                if closes(c) {
+                    closers = true;
+                    continue;
+                }
+                if c == '\n' && w == '\n' && !closers {
+                    return Some((j + 1, GAP));
+                }
+            }
+            if c.is_whitespace() {
+                space = Some((i, c));
+                closers = false;
+            } else {
+                space = None;
+            }
+        }
+        None
+    }
 }
 
 /// Paragraphs, where a blank line holds only whitespace.
@@ -332,6 +416,12 @@ mod paragraph {
             (state & PREV_BLANK, prev_blank, false)
         }
     }
+
+    /// The state at the start of a line, given whether the line above it
+    /// was blank.
+    pub fn at_line_start(above_blank: bool) -> u8 {
+        if above_blank { START } else { CUR_BLANK }
+    }
 }
 
 /// Vim's paragraphs, where only an empty line is a boundary.
@@ -357,6 +447,12 @@ mod vim_paragraph {
         } else {
             (state & PREV_EMPTY, prev_empty, false)
         }
+    }
+
+    /// The state at the start of a line, given whether the line above it
+    /// was empty.
+    pub fn at_line_start(above_empty: bool) -> u8 {
+        if above_empty { START } else { CUR_EMPTY }
     }
 }
 

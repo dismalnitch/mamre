@@ -3,7 +3,7 @@
 //! every edit cuts and joins chunks and trees are several levels tall, and
 //! with the default chunk size.
 
-use mamre_rope::{Markdown, Plain, Point, Prose, Rope, TextSummary, Unit};
+use mamre_rope::{Edge, Markdown, Measure, Plain, Point, Prose, Rope, Sections, TextSummary, Unit};
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -106,10 +106,14 @@ fn verify<const N: usize>(rope: &Rope<Markdown, N>, text: &str) -> Result<(), St
             }
         }
     }
-    verify_units(rope, text)
+    verify_units(rope, text)?;
+    verify_neighbours(rope, text)
 }
 
-const UNITS: [Unit; 6] = [
+/// The units a `Markdown` rope counts, and so can find by number.
+const COUNTED: [Unit; 3] = [Unit::Word, Unit::Paragraph, Unit::Section];
+
+const ALL_UNITS: [Unit; 6] = [
     Unit::Word,
     Unit::VimWord,
     Unit::Sentence,
@@ -118,11 +122,11 @@ const UNITS: [Unit; 6] = [
     Unit::Section,
 ];
 
-/// Every unit, against the slow one-pass `Unit::ranges`: the count and
-/// every unit's range, and for a small text, which units come before and
-/// hold every char boundary.
+/// Every counted unit, against the slow one-pass `Unit::ranges`: the count
+/// and every unit's range, and for a small text, which units come before
+/// and hold every char boundary.
 fn verify_units<const N: usize>(rope: &Rope<Markdown, N>, text: &str) -> Result<(), String> {
-    for unit in UNITS {
+    for unit in COUNTED {
         let want = unit.ranges(text);
         if rope.count(unit) != want.len() {
             return Err(format!(
@@ -169,6 +173,44 @@ fn verify_units<const N: usize>(rope: &Rope<Markdown, N>, text: &str) -> Result<
                 if got != at {
                     return Err(format!(
                         "{unit:?}: unit_at({offset}) is {got:?}, want {at:?}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every unit, counted or not, found by neighbour: the next and previous
+/// start and end from a stride of char boundaries, against the slow ranges.
+fn verify_neighbours<M: Measure, const N: usize>(
+    rope: &Rope<M, N>,
+    text: &str,
+) -> Result<(), String> {
+    let stride = (text.len() / 60).max(1);
+    for unit in ALL_UNITS {
+        let ranges = unit.ranges(text);
+        for (edge, at) in [
+            (
+                Edge::Start,
+                ranges.iter().map(|r| r.start).collect::<Vec<_>>(),
+            ),
+            (Edge::End, ranges.iter().map(|r| r.end).collect()),
+        ] {
+            let offsets = text.char_indices().map(|(i, _)| i).chain([text.len()]);
+            for offset in offsets.step_by(stride) {
+                let next = at.iter().copied().find(|&b| b > offset);
+                let got = rope.next_boundary(offset, unit, edge);
+                if got != next {
+                    return Err(format!(
+                        "{unit:?}: next_boundary({offset}, {edge:?}) is {got:?}, want {next:?}"
+                    ));
+                }
+                let prev = at.iter().copied().rfind(|&b| b < offset);
+                let got = rope.prev_boundary(offset, unit, edge);
+                if got != prev {
+                    return Err(format!(
+                        "{unit:?}: prev_boundary({offset}, {edge:?}) is {got:?}, want {prev:?}"
                     ));
                 }
             }
@@ -273,12 +315,20 @@ fn a_plain_rope_counts_only_the_basics() {
 #[test]
 fn a_markdown_rope_counts_units() {
     let rope: Rope<Markdown> = Rope::from("# Title\n\nSome words here.\n\n## Part\nMore.");
-    let units = rope.summary().units;
+    let (prose, sections) = rope.summary().units;
     // Words and paragraphs are prose rules, blind to markup: `#` and `##`
     // are words, and a heading with a line under it is one paragraph.
-    assert_eq!(units.words(), 8);
-    assert_eq!(units.paragraphs(), 3);
-    assert_eq!(units.sections(), 2);
+    assert_eq!(prose.words(), 8);
+    assert_eq!(prose.paragraphs(), 3);
+    assert_eq!(sections.sections(), 2);
+    assert_eq!(rope.count(Unit::Word), 8);
+    assert_eq!(rope.count(Unit::Section), 2);
+}
+
+#[test]
+fn a_sections_rope_counts_only_headings() {
+    let rope: Rope<Sections> = Rope::from("# A\nwords\n## B\n");
+    assert_eq!(rope.count(Unit::Section), 2);
 }
 
 #[test]
@@ -299,21 +349,38 @@ fn seeking_by_unit() {
         piece(rope.unit_range(1, Unit::Section)),
         Some("## Two\nfoo.bar baz\n")
     );
-    // Vim's rule: a heading has no full stop, so it runs into the sentence
-    // after it.
+    assert_eq!(rope.units_before(text.len(), Unit::Section), 2);
     assert_eq!(
-        piece(rope.unit_range(0, Unit::Sentence)),
-        Some("# One\nHi there.")
+        piece(rope.unit_range(1, Unit::Paragraph)),
+        Some("## Two\nfoo.bar baz\n")
     );
-    assert_eq!(piece(rope.unit_range(1, Unit::Sentence)), Some("Bye!"));
-    assert_eq!(piece(rope.unit_range(4, Unit::VimWord)), Some("."));
+}
 
-    // The word under the cursor, and where `w` goes from there.
-    let cursor = text.find("bar").unwrap() + 1;
-    let n = rope.unit_at(cursor, Unit::VimWord).unwrap();
-    assert_eq!(piece(rope.unit_range(n, Unit::VimWord)), Some("bar"));
-    assert_eq!(piece(rope.unit_range(n + 1, Unit::VimWord)), Some("baz"));
-    assert_eq!(rope.units_before(cursor, Unit::Section), 2);
+#[test]
+fn motions_by_neighbour() {
+    let text = "# One\nHi there. Bye!\n\n## Two\nfoo.bar baz\n";
+    // Plain: nothing counted, and neighbours still work.
+    let rope: Rope<Plain, 4> = Rope::from(text);
+    let at = |s: &str| text.find(s).unwrap();
+    let next = |from, unit, edge| rope.next_boundary(from, unit, edge);
+    let prev = |from, unit, edge| rope.prev_boundary(from, unit, edge);
+
+    // `w` from inside `foo`: the `.`; `W`: past the whole `foo.bar`.
+    let cursor = at("foo") + 1;
+    assert_eq!(next(cursor, Unit::VimWord, Edge::Start), Some(at(".bar")));
+    assert_eq!(next(cursor, Unit::Word, Edge::Start), Some(at("baz")));
+    // `b` from `baz`: back to `bar`.
+    assert_eq!(prev(at("baz"), Unit::VimWord, Edge::Start), Some(at("bar")));
+    // `)` from inside the first sentence. Vim's rule: a heading has no full
+    // stop, so it runs into the sentence after it.
+    assert_eq!(next(2, Unit::Sentence, Edge::Start), Some(at("Bye")));
+    // `}` from the first line: the empty line.
+    assert_eq!(next(0, Unit::VimParagraph, Edge::End), Some(at("\n\n") + 1));
+    // `[[` from the end: the second heading.
+    assert_eq!(
+        prev(text.len(), Unit::Section, Edge::Start),
+        Some(at("## Two"))
+    );
 }
 
 #[test]
@@ -321,4 +388,14 @@ fn seeking_by_unit() {
 fn a_prose_rope_has_no_sections() {
     let rope: Rope<Prose> = Rope::from("# Heading");
     rope.count(Unit::Section);
+}
+
+proptest! {
+    /// Neighbours never use the summary, so a `Plain` rope finds every unit
+    /// the same way.
+    #[test]
+    fn a_plain_rope_finds_neighbours(text in text(300)) {
+        let rope = Rope::<Plain, 4>::from(text.as_str());
+        verify_neighbours(&rope, &text).map_err(TestCaseError::fail)?;
+    }
 }
