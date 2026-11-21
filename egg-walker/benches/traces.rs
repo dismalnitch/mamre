@@ -86,60 +86,24 @@ fn convert(dt: &Diamond) -> OpLog<char> {
     ours
 }
 
-/// The document at the tip, in a rope, as an editor would apply changes:
-/// typing and deleting runs together, each run one edit.
+/// The document at the tip, in a rope: one rope edit per change.
 fn checkout(log: &OpLog<char>) -> Rope {
     let mut rope = Rope::new();
-    let mut typed = String::new();
-    // Where the pending typing starts and ends, in chars.
-    let mut typed_at = 0;
-    let mut typed_end = 0;
-    // The pending deletion, in chars.
-    let mut deleted = 0..0;
-    let flush = |rope: &mut Rope,
-                 typed: &mut String,
-                 typed_at: usize,
-                 deleted: &mut std::ops::Range<usize>| {
-        if !typed.is_empty() {
-            let at = rope.char_to_offset(typed_at);
-            rope.insert(at, typed);
-            typed.clear();
-        }
-        if !(*deleted).is_empty() {
-            let range = rope.char_to_offset(deleted.start)..rope.char_to_offset(deleted.end);
-            rope.remove(range);
-            *deleted = 0..0;
-        }
-    };
+    let mut text = String::new();
     for change in log.changes(&[], log.version()) {
         match change {
-            Change::Insert { pos, item } => {
-                if !deleted.is_empty() || pos != typed_end {
-                    flush(&mut rope, &mut typed, typed_at, &mut deleted);
-                    typed_at = pos;
-                    typed_end = pos;
-                }
-                typed.push(item);
-                typed_end += 1;
+            Change::Insert { pos, items, .. } => {
+                text.clear();
+                text.extend(items);
+                let at = rope.char_to_offset(pos);
+                rope.insert(at, &text);
             }
-            Change::Delete { pos } => {
-                if !typed.is_empty() {
-                    flush(&mut rope, &mut typed, typed_at, &mut deleted);
-                }
-                if deleted.is_empty() {
-                    deleted = pos..pos + 1;
-                } else if pos == deleted.start {
-                    deleted.end += 1;
-                } else if pos + 1 == deleted.start {
-                    deleted.start -= 1;
-                } else {
-                    flush(&mut rope, &mut typed, typed_at, &mut deleted);
-                    deleted = pos..pos + 1;
-                }
+            Change::Delete { range } => {
+                let range = rope.char_to_offset(range.start)..rope.char_to_offset(range.end);
+                rope.remove(range);
             }
         }
     }
-    flush(&mut rope, &mut typed, typed_at, &mut deleted);
     rope
 }
 
@@ -198,27 +162,10 @@ fn main() {
             let start = Instant::now();
             let changes = ours.changes(&[], ours.version());
             let walk = start.elapsed();
-            let mut edits = 0;
-            let mut last: Option<(bool, usize)> = None;
-            for c in &changes {
-                let now = match *c {
-                    Change::Insert { pos, .. } => (true, pos),
-                    Change::Delete { pos } => (false, pos),
-                };
-                let joins = match (last, now) {
-                    (Some((true, p)), (true, q)) => q == p + 1,
-                    (Some((false, p)), (false, q)) => q == p || q + 1 == p,
-                    _ => false,
-                };
-                if !joins {
-                    edits += 1;
-                }
-                last = Some(now);
-            }
             let start = Instant::now();
             std::hint::black_box(checkout(&ours));
             eprintln!(
-                "{name}: walk {walk:.2?}, {} changes, {edits} rope edits, checkout {:.2?}",
+                "{name}: walk {walk:.2?}, {} changes, checkout {:.2?}",
                 changes.len(),
                 start.elapsed()
             );

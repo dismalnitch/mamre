@@ -136,6 +136,17 @@ impl<T: Clone> OpLog<T> {
         }
     }
 
+    /// The items of inserts `first..first + len`, if they're one run here:
+    /// typed one after another, so they lie side by side.
+    pub(crate) fn items(&self, first: Lv, len: usize) -> Option<&[T]> {
+        let run = self.run_of(first);
+        let k = first - run.start;
+        match &run.op {
+            RunOp::Insert { items, .. } => items.get(k..k + len),
+            RunOp::Delete { .. } => None,
+        }
+    }
+
     /// Just the operation of event `lv`.
     pub(crate) fn op(&self, lv: Lv) -> Op<T> {
         let run = self.run_of(lv);

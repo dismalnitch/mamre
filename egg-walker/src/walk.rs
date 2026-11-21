@@ -35,6 +35,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 
 use mamre::cursor::Bias;
 use mamre::{Item, SeekTarget, SumTree, Summary};
@@ -47,21 +48,112 @@ pub(crate) const BASE_ITEM: usize = 1 << 62;
 /// How long the placeholder is: more than any real document.
 pub(crate) const UNDERWATER: usize = 1 << 61;
 
-/// A plain change to a document: what the walk produces.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Change<T> {
-    Insert { pos: usize, item: T },
-    Delete { pos: usize },
+/// A plain change to a document: what the walk produces, in the order to
+/// apply them. A run of typing, or of deleting, comes out as one change.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Change<'a, T> {
+    /// `items` go in at `pos`. They're the items of events
+    /// `first..first + items.len()`, borrowed from the log. An item always
+    /// comes back as its own event, so anything keyed to it, an anchor, say,
+    /// finds it again: undoing a delete will revive the old events rather
+    /// than make new ones.
+    Insert {
+        pos: usize,
+        items: &'a [T],
+        first: Lv,
+    },
+    /// The items in `range` go.
+    Delete { range: Range<usize> },
 }
 
-impl<T> Change<T> {
-    pub fn apply(self, doc: &mut Vec<T>) {
+impl<T> Clone for Change<'_, T> {
+    fn clone(&self) -> Self {
         match self {
-            Change::Insert { pos, item } => doc.insert(pos, item),
-            Change::Delete { pos } => {
-                doc.remove(pos);
+            Change::Insert { pos, items, first } => Change::Insert {
+                pos: *pos,
+                items,
+                first: *first,
+            },
+            Change::Delete { range } => Change::Delete {
+                range: range.clone(),
+            },
+        }
+    }
+}
+
+impl<T: Clone> Change<'_, T> {
+    pub fn apply(&self, doc: &mut Vec<T>) {
+        match self {
+            Change::Insert { pos, items, .. } => {
+                doc.splice(*pos..*pos, items.iter().cloned());
+            }
+            Change::Delete { range } => {
+                doc.drain(range.clone());
             }
         }
+    }
+}
+
+/// The walk's output as it's made: each change joins the one before it
+/// when it carries on its run.
+pub(crate) struct Changes<'a, T> {
+    log: &'a OpLog<T>,
+    pub(crate) out: Vec<Change<'a, T>>,
+}
+
+impl<'a, T: Clone> Changes<'a, T> {
+    pub(crate) fn new(log: &'a OpLog<T>) -> Self {
+        Changes {
+            log,
+            out: Vec::new(),
+        }
+    }
+
+    /// Event `lv`'s item goes in at `pos`.
+    pub(crate) fn insert(&mut self, pos: usize, lv: Lv) {
+        // Typing: the next event of the same run, just after the last.
+        // Today the next event of a run always lands right after: it sticks
+        // to the last, and anything that could come between would include
+        // that and so be replayed before it, and the walk goes in order with
+        // nothing between the two. The position check is defensive, for
+        // when that changes (reviving items, say).
+        if let Some(Change::Insert {
+            pos: at,
+            items,
+            first,
+        }) = self.out.last_mut()
+            && *first + items.len() == lv
+            && *at + items.len() == pos
+            && let Some(more) = self.log.items(*first, items.len() + 1)
+        {
+            *items = more;
+            return;
+        }
+        let items = self.log.items(lv, 1).expect("an insert has an item");
+        self.out.push(Change::Insert {
+            pos,
+            items,
+            first: lv,
+        });
+    }
+
+    /// The item at `pos` goes.
+    pub(crate) fn delete(&mut self, pos: usize) {
+        if let Some(Change::Delete { range }) = self.out.last_mut() {
+            // Deleting forward: the next item has moved up to the start.
+            if pos == range.start {
+                range.end += 1;
+                return;
+            }
+            // Backspacing: the one before.
+            if pos + 1 == range.start {
+                range.start -= 1;
+                return;
+            }
+        }
+        self.out.push(Change::Delete {
+            range: pos..pos + 1,
+        });
     }
 }
 
@@ -218,7 +310,7 @@ struct Walk<'a, T> {
 impl<T: Clone> OpLog<T> {
     /// The changes that bring a document holding version `from` up to
     /// everything in `from` and `to`, in the order to apply them.
-    pub fn changes(&self, from: &[Lv], to: &[Lv]) -> Vec<Change<T>> {
+    pub fn changes(&self, from: &[Lv], to: &[Lv]) -> Vec<Change<'_, T>> {
         self.walk(from, to).0
     }
 
@@ -232,7 +324,7 @@ impl<T: Clone> OpLog<T> {
     }
 
     /// The changes, and what finding them cost.
-    pub(crate) fn walk(&self, from: &[Lv], to: &[Lv]) -> (Vec<Change<T>>, Stats) {
+    pub(crate) fn walk(&self, from: &[Lv], to: &[Lv]) -> (Vec<Change<'_, T>>, Stats) {
         // What to replay, and the base: a version every replayed event
         // includes whole, so none of it is ever retreated.
         let (old, new, base) = self.conflict(from, to);
@@ -249,7 +341,7 @@ impl<T: Clone> OpLog<T> {
             .collect();
         let critical = self.critical_points(&order, &old, &new, &base);
         let mut walk = Walk::new(self, base);
-        let mut out = Vec::new();
+        let mut out = Changes::new(self);
         for (&(lv, output), &critical) in order.iter().zip(&critical) {
             if critical {
                 // It saw everything replayed so far, and everything after
@@ -258,10 +350,10 @@ impl<T: Clone> OpLog<T> {
                 // from it.
                 walk.replayed += 1;
                 if output {
-                    out.push(match self.op(lv) {
-                        Op::Insert { pos, item } => Change::Insert { pos, item },
-                        Op::Delete { pos } => Change::Delete { pos },
-                    });
+                    match self.op(lv) {
+                        Op::Insert { pos, .. } => out.insert(pos, lv),
+                        Op::Delete { pos } => out.delete(pos),
+                    }
                 }
                 if walk.fresh {
                     walk.prepared.clear();
@@ -279,7 +371,7 @@ impl<T: Clone> OpLog<T> {
             replayed: walk.replayed,
             records: walk.records.iter().count(),
         };
-        (out, stats)
+        (out.out, stats)
     }
 
     /// Which events in a replay are critical: each saw everything replayed
@@ -359,8 +451,8 @@ impl<'a, T: Clone> Walk<'a, T> {
     }
 }
 
-impl<T: Clone> Walk<'_, T> {
-    fn step(&mut self, lv: Lv, out: Option<&mut Vec<Change<T>>>) {
+impl<'a, T: Clone> Walk<'a, T> {
+    fn step(&mut self, lv: Lv, out: Option<&mut Changes<'a, T>>) {
         self.replayed += 1;
         self.fresh = false;
         let event = self.log.event(lv);
@@ -379,7 +471,7 @@ impl<T: Clone> Walk<'_, T> {
             self.shift(x, true);
         }
         match event.op {
-            Op::Insert { pos, item } => self.insert(lv, pos, item, out),
+            Op::Insert { pos, .. } => self.insert(lv, pos, out),
             Op::Delete { pos } => self.delete(lv, pos, out),
         }
         self.prepared = vec![lv];
@@ -495,7 +587,7 @@ impl<T: Clone> Walk<'_, T> {
         before.effect + if record.gone { 0 } else { id - record.id }
     }
 
-    fn insert(&mut self, lv: Lv, pos: usize, item: T, out: Option<&mut Vec<Change<T>>>) {
+    fn insert(&mut self, lv: Lv, pos: usize, out: Option<&mut Changes<'a, T>>) {
         // The origins, as the insert's author saw them. An insert sticks to
         // what's before it: its left origin is the visible item just before
         // the position (none at the start), and its right is whatever came
@@ -538,10 +630,7 @@ impl<T: Clone> Walk<'_, T> {
             }
         };
         if let Some(out) = out {
-            out.push(Change::Insert {
-                pos: self.effect_pos(&key, lv),
-                item,
-            });
+            out.insert(self.effect_pos(&key, lv), lv);
         }
     }
 
@@ -667,7 +756,7 @@ impl<T: Clone> Walk<'_, T> {
         (prev, next, right)
     }
 
-    fn delete(&mut self, lv: Lv, pos: usize, out: Option<&mut Vec<Change<T>>>) {
+    fn delete(&mut self, lv: Lv, pos: usize, out: Option<&mut Changes<'a, T>>) {
         let (key, id) = self.prepared_item(pos, true);
         let was_gone = self
             .records
@@ -680,9 +769,7 @@ impl<T: Clone> Walk<'_, T> {
         // Already deleted in the effect version by a concurrent delete:
         // nothing more to do to the document.
         if !was_gone && let Some(out) = out {
-            out.push(Change::Delete {
-                pos: self.effect_pos(&key, id),
-            });
+            out.delete(self.effect_pos(&key, id));
         }
     }
 }
@@ -856,7 +943,16 @@ mod tests {
             len += text.len();
         }
         let (changes, stats) = log.walk(&[], &v);
-        assert_eq!(changes.len(), len);
+        // One change per stretch typed, holding every item.
+        assert_eq!(changes.len(), 4);
+        let items: usize = changes
+            .iter()
+            .map(|c| match c {
+                Change::Insert { items, .. } => items.len(),
+                Change::Delete { .. } => 0,
+            })
+            .sum();
+        assert_eq!(items, len);
         assert_eq!(
             log.checkout(&v).into_iter().collect::<String>(),
             "Oh, hello, dear world!"

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::oplog::{Lv, Op, OpLog};
 use crate::order::{Placed, place};
-use crate::walk::Change;
+use crate::walk::{Change, Changes};
 
 /// Ids at or above this name items of the base document, by position.
 const BASE_ITEM: usize = 1 << 62;
@@ -62,11 +62,11 @@ struct Walk<'a, T> {
 impl<T: Clone> OpLog<T> {
     /// `changes`, by the simple walk: for testing the fast one against.
     #[doc(hidden)]
-    pub fn changes_simple(&self, from: &[Lv], to: &[Lv]) -> Vec<Change<T>> {
+    pub fn changes_simple(&self, from: &[Lv], to: &[Lv]) -> Vec<Change<'_, T>> {
         self.walk_simple(from, to)
     }
 
-    fn walk_simple(&self, from: &[Lv], to: &[Lv]) -> Vec<Change<T>> {
+    fn walk_simple(&self, from: &[Lv], to: &[Lv]) -> Vec<Change<'_, T>> {
         let have = self.closure(from);
         let mut want = self.closure(to);
         for (w, &h) in want.iter_mut().zip(&have) {
@@ -95,11 +95,11 @@ impl<T: Clone> OpLog<T> {
         for lv in (0..self.len()).filter(|&lv| have[lv] && !base[lv]) {
             walk.step(lv, None);
         }
-        let mut out = Vec::new();
+        let mut out = Changes::new(self);
         for lv in (0..self.len()).filter(|&lv| want[lv] && !have[lv]) {
             walk.step(lv, Some(&mut out));
         }
-        out
+        out.out
     }
 
     /// The latest version inside `have` that every event to be replayed
@@ -125,8 +125,8 @@ impl<T: Clone> OpLog<T> {
     }
 }
 
-impl<T: Clone> Walk<'_, T> {
-    fn step(&mut self, lv: Lv, out: Option<&mut Vec<Change<T>>>) {
+impl<'a, T: Clone> Walk<'a, T> {
+    fn step(&mut self, lv: Lv, out: Option<&mut Changes<'a, T>>) {
         let event = self.log.event(lv);
         let parents = self.log.closure(&event.parents);
         // Move the prepare version to this event's parents: take back what
@@ -146,7 +146,7 @@ impl<T: Clone> Walk<'_, T> {
             }
         }
         match &event.op {
-            Op::Insert { pos, item } => self.insert(lv, *pos, item.clone(), out),
+            Op::Insert { pos, .. } => self.insert(lv, *pos, out),
             Op::Delete { pos } => self.delete(lv, *pos, out),
         }
         self.prepared[lv] = true;
@@ -244,7 +244,7 @@ impl<T: Clone> Walk<'_, T> {
             .sum()
     }
 
-    fn insert(&mut self, lv: Lv, pos: usize, item: T, out: Option<&mut Vec<Change<T>>>) {
+    fn insert(&mut self, lv: Lv, pos: usize, out: Option<&mut Changes<'a, T>>) {
         // The origins, as the insert's author saw them. An insert sticks to
         // what's before it: its left origin is the visible item just before
         // the position (none at the start), and its right is whatever came
@@ -293,14 +293,11 @@ impl<T: Clone> Walk<'_, T> {
             },
         );
         if let Some(out) = out {
-            out.push(Change::Insert {
-                pos: self.effect_pos(dest),
-                item,
-            });
+            out.insert(self.effect_pos(dest), lv);
         }
     }
 
-    fn delete(&mut self, lv: Lv, pos: usize, out: Option<&mut Vec<Change<T>>>) {
+    fn delete(&mut self, lv: Lv, pos: usize, out: Option<&mut Changes<'a, T>>) {
         let at = self.prepared_at(pos);
         self.records[at].prepare = Prepare::Deleted(1);
         self.targets.insert(lv, self.records[at].id);
@@ -308,9 +305,7 @@ impl<T: Clone> Walk<'_, T> {
         // nothing more to do to the document.
         if !self.records[at].gone {
             if let Some(out) = out {
-                out.push(Change::Delete {
-                    pos: self.effect_pos(at),
-                });
+                out.delete(self.effect_pos(at));
             }
             self.records[at].gone = true;
         }
