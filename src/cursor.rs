@@ -7,7 +7,7 @@
 
 use std::cmp::Ordering;
 
-use crate::{Dimension, Item, Node, SeekTarget, SumTree, units::CAP_SZ};
+use crate::{Dimension, Item, Node, SeekTarget, SumTree, units::CAPSIZE};
 
 /// Which item a seek lands on when the target falls exactly on the boundary
 /// between two items. `Left` stops at the end of the earlier item; `Right`
@@ -19,17 +19,23 @@ pub enum Bias {
 }
 
 /// One level of the cursor's path from the root down to the current leaf.
-struct StackEntry<'a, T: Item, const CAP: usize> {
+#[derive(Clone)]
+struct StackEntry<'a, T: Item, D, const CAP: usize> {
     /// The node at this level.
     tree: &'a SumTree<T, CAP>,
     /// Which child (internal node) or item (leaf) the cursor is on.
     index: usize,
+    /// The total, in dimension `D`, of everything before `tree`. Going back
+    /// re-adds from here, since a dimension can't subtract.
+    position: D,
 }
 
-pub struct Cursor<'a, T: Item, D: Dimension<T::Summary>, const CAP: usize = CAP_SZ> {
+#[derive(Clone)]
+pub struct Cursor<'a, T: Item, D: Dimension<T::Summary>, const CAP: usize = CAPSIZE> {
     tree: &'a SumTree<T, CAP>,
-    /// Root-to-leaf path. Empty means the cursor hasn't started yet.
-    stack: Vec<StackEntry<'a, T, CAP>>,
+    /// Root-to-leaf path. Empty means the cursor is before the first item
+    /// (if not `at_end`) or past the last (if it is).
+    stack: Vec<StackEntry<'a, T, D, CAP>>,
     /// The total, in dimension `D`, of everything before the current item.
     position: D,
     /// True once the cursor has moved past the last item.
@@ -62,28 +68,101 @@ impl<'a, T: Item, D: Dimension<T::Summary>, const CAP: usize> Cursor<'a, T, D, C
 
     /// The item under the cursor, or `None` before the start or past the end.
     pub fn item(&self) -> Option<&'a T> {
-        // TODO: look at the top of `stack`; if it's a leaf, return items[index].
-
-        // if self.stack.first()?.tree.root.height() == 0 {
-        //     self.stack.first()?.tree.root.items().get()
-        // }
-        todo!()
+        if self.at_end {
+            return None;
+        }
+        let entry = self.stack.last()?;
+        let tree: &'a SumTree<T, CAP> = entry.tree;
+        match &*tree.root {
+            Node::Leaf { items, .. } => items.get(entry.index),
+            Node::Internal { .. } => None,
+        }
     }
 
-    /// Moves to the next item.
+    /// Moves to the next item. Before the start, that's the first item; on
+    /// the last, it's past the end; past the end, it stays there.
     pub fn next(&mut self) {
-        // TODO: advance the leaf index and add the item's summary to `position`.
-        // When a leaf runs out, pop up until a node has another child, then
-        // descend to that child's leftmost leaf. Set `at_end` if the root runs out.
-        todo!()
+        if self.at_end {
+            return;
+        }
+        if self.stack.is_empty() {
+            self.descend_front();
+            if self.item().is_none() {
+                // An empty tree: the first item is already past the end.
+                self.stack.clear();
+                self.at_end = true;
+            }
+            return;
+        }
+
+        // Step over the current item.
+        let leaf = self.stack.last_mut().expect("on an item");
+        self.position.add_summary(&entries(leaf.tree)[leaf.index]);
+        leaf.index += 1;
+
+        // Climb out of every node that's used up, into the next child up.
+        while let Some(entry) = self.stack.last()
+            && entry.index == entries(entry.tree).len()
+        {
+            self.stack.pop();
+            match self.stack.last_mut() {
+                Some(parent) => parent.index += 1,
+                None => {
+                    self.at_end = true;
+                    return;
+                }
+            }
+        }
+
+        // Then down that child's left edge to its first item.
+        self.descend_leftmost();
     }
 
-    /// Moves to the previous item.
+    /// Moves to the previous item. On the first, that's before the start;
+    /// past the end, it's the last item; before the start, it stays there.
+    ///
+    /// `position` is re-added from the nearest stored start, not subtracted.
     pub fn prev(&mut self) {
-        // TODO: mirror of `next`. `position` has to go backwards, which
-        // `Dimension` can't do (no subtraction). Either store each level's start
-        // in `StackEntry` and recompute from there, or add subtraction to the trait.
-        todo!()
+        if self.at_end {
+            // Stand just past the root's last entry, so stepping back lands
+            // on it like any other.
+            self.at_end = false;
+            self.stack.push(StackEntry {
+                tree: self.tree,
+                index: entries(self.tree).len(),
+                position: D::zero(),
+            });
+        } else if self.stack.is_empty() {
+            return;
+        }
+
+        // Climb to the lowest level with an entry before the current one.
+        loop {
+            match self.stack.last_mut() {
+                Some(entry) if entry.index > 0 => {
+                    entry.index -= 1;
+                    break;
+                }
+                Some(_) => {
+                    self.stack.pop();
+                }
+                None => {
+                    // Stepped back off the first item: before the start.
+                    self.position = D::zero();
+                    return;
+                }
+            }
+        }
+
+        // That level's start, plus its entries before the new index.
+        let entry = self.stack.last().expect("just stepped back in it");
+        self.position = entry.position.clone();
+        for s in &entries(entry.tree)[..entry.index] {
+            self.position.add_summary(s);
+        }
+
+        // Then down that child's right edge to its last item.
+        self.descend_rightmost();
     }
 
     /// Moves forward to the item `target` falls in, never back: a target
@@ -100,17 +179,13 @@ impl<'a, T: Item, D: Dimension<T::Summary>, const CAP: usize> Cursor<'a, T, D, C
             self.stack.push(StackEntry {
                 tree: self.tree,
                 index: 0,
+                position: D::zero(),
             });
         }
 
         while let Some(entry) = self.stack.last_mut() {
             let tree: &'a SumTree<T, CAP> = entry.tree;
-            let summaries: &'a [T::Summary] = match &*tree.root {
-                Node::Internal {
-                    child_summaries, ..
-                } => child_summaries,
-                Node::Leaf { item_summaries, .. } => item_summaries,
-            };
+            let summaries = entries(tree);
 
             // Skip whole entries that end before the target. For a child,
             // that's one summary add instead of a walk through it.
@@ -141,6 +216,7 @@ impl<'a, T: Item, D: Dimension<T::Summary>, const CAP: usize> Cursor<'a, T, D, C
                     self.stack.push(StackEntry {
                         tree: &children[index],
                         index: 0,
+                        position: self.position.clone(),
                     });
                 }
                 Node::Leaf { .. } => {
@@ -169,24 +245,191 @@ impl<'a, T: Item, D: Dimension<T::Summary>, const CAP: usize> Cursor<'a, T, D, C
         self.seek_forward(target, bias)
     }
 
-    /// Returns everything from the cursor up to `end` as a new tree, leaving
-    /// the cursor at `end`.
+    /// Returns everything from the cursor up to where a seek for `end` lands
+    /// (see `seek_forward`, including `bias`) as a new tree, and leaves the
+    /// cursor there. A target behind the cursor gives an empty tree.
+    ///
+    /// A second cursor finds `end`, then the cut happens at the node where the
+    /// two paths part: what's right of this cursor in its child, the whole
+    /// children between, and what's left of `end` in its child. Whole subtrees
+    /// are shared, not copied; only the leaves at the two edges are new.
     pub fn slice(&mut self, end: &impl SeekTarget<T::Summary, D>, bias: Bias) -> SumTree<T, CAP> {
-        // TODO: same walk as `seek_forward`, but collect what you pass. Whole
-        // children you skip can be reused as-is (clone the `Arc`, no copying);
-        // only the partial leaf at each edge needs new nodes. Build the result
-        // with `SumTree::append` / `push`.
-        let _ = (end, bias);
-        todo!()
+        if self.at_end {
+            return SumTree::new();
+        }
+        self.descend_front();
+        let mut other = self.clone();
+        other.seek_forward(end, bias);
+        let slice = if other.at_end {
+            self.suffix()
+        } else {
+            self.up_to(&other)
+        };
+        *self = other;
+        slice
     }
 
-    /// Returns everything from the cursor to the end as a new tree.
+    /// Returns everything from the cursor to the end as a new tree, and
+    /// leaves the cursor past the end.
     pub fn suffix(&mut self) -> SumTree<T, CAP> {
-        // TODO: no target to seek to, so walk instead: the rest of the current
-        // leaf, then, going up the stack, every child to the right of the one
-        // the cursor is in at that level. Like `slice`, reuse whole children
-        // (clone the `Arc`) and `append` it all together.
-        todo!()
+        if self.at_end {
+            return SumTree::new();
+        }
+        self.descend_front();
+        let mut out = SumTree::new();
+        append_right_of(&self.stack, &mut out);
+        self.position.add_summary(out.summary());
+        self.stack.clear();
+        self.at_end = true;
+        out
+    }
+
+    /// Fills in a fresh cursor's path, which is only implied by an empty
+    /// stack: down the left edge, before the first item. Seeks carry on from
+    /// it just as they would from the empty stack.
+    fn descend_front(&mut self) {
+        if !self.stack.is_empty() || self.at_end {
+            return;
+        }
+        self.stack.push(StackEntry {
+            tree: self.tree,
+            index: 0,
+            position: D::zero(),
+        });
+        self.descend_leftmost();
+    }
+
+    /// From the child the top of the stack points at, goes down left edges to
+    /// a leaf, onto its first item. `position` is already before that child.
+    fn descend_leftmost(&mut self) {
+        loop {
+            let entry = self.stack.last().expect("descending from a node");
+            let tree: &'a SumTree<T, CAP> = entry.tree;
+            let Node::Internal { children, .. } = &*tree.root else {
+                return;
+            };
+            self.stack.push(StackEntry {
+                tree: &children[entry.index],
+                index: 0,
+                position: self.position.clone(),
+            });
+        }
+    }
+
+    /// From the child the top of the stack points at, goes down right edges to
+    /// a leaf, onto its last item, adding what it passes on the way.
+    /// `position` is already before that child.
+    fn descend_rightmost(&mut self) {
+        loop {
+            let entry = self.stack.last().expect("descending from a node");
+            let tree: &'a SumTree<T, CAP> = entry.tree;
+            let Node::Internal { children, .. } = &*tree.root else {
+                return;
+            };
+            let child = &children[entry.index];
+            let last = entries(child).len() - 1;
+            self.stack.push(StackEntry {
+                tree: child,
+                index: last,
+                position: self.position.clone(),
+            });
+            for s in &entries(child)[..last] {
+                self.position.add_summary(s);
+            }
+        }
+    }
+
+    /// Everything from this cursor's item up to (not including) `other`'s.
+    /// Both must be on an item, with `other` not behind.
+    fn up_to(&self, other: &Self) -> SumTree<T, CAP> {
+        let (a, b) = (&self.stack, &other.stack);
+        debug_assert_eq!(a.len(), b.len(), "every leaf is at the same depth");
+
+        // The paths share a top; the first level where they part is the
+        // lowest node holding both. Same index all the way: same item.
+        let Some(k) = (0..a.len()).find(|&k| a[k].index != b[k].index) else {
+            return SumTree::new();
+        };
+        debug_assert!(std::ptr::eq(a[k].tree, b[k].tree));
+        let (i, j) = (a[k].index, b[k].index);
+        debug_assert!(i < j, "`other` is behind");
+
+        match &*a[k].tree.root {
+            Node::Leaf {
+                items,
+                item_summaries,
+                ..
+            } => SumTree::from_leaf(&items[i..j], &item_summaries[i..j]),
+            Node::Internal { children, .. } => {
+                let mut out = SumTree::new();
+                append_right_of(&a[k + 1..], &mut out);
+                for child in &children[i + 1..j] {
+                    out.append(child.clone());
+                }
+                append_left_of(&b[k + 1..], &mut out);
+                out
+            }
+        }
+    }
+}
+
+/// Appends, in order, everything at or after the item `path` ends on: the
+/// rest of its leaf, then, going up, every child right of the path.
+fn append_right_of<T: Item, D, const CAP: usize>(
+    path: &[StackEntry<'_, T, D, CAP>],
+    out: &mut SumTree<T, CAP>,
+) {
+    for entry in path.iter().rev() {
+        match &*entry.tree.root {
+            Node::Leaf {
+                items,
+                item_summaries,
+                ..
+            } => out.append(SumTree::from_leaf(
+                &items[entry.index..],
+                &item_summaries[entry.index..],
+            )),
+            Node::Internal { children, .. } => {
+                for child in &children[entry.index + 1..] {
+                    out.append(child.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Appends, in order, everything before the item `path` ends on: going down,
+/// every child left of the path, then the start of its leaf.
+fn append_left_of<T: Item, D, const CAP: usize>(
+    path: &[StackEntry<'_, T, D, CAP>],
+    out: &mut SumTree<T, CAP>,
+) {
+    for entry in path {
+        match &*entry.tree.root {
+            Node::Leaf {
+                items,
+                item_summaries,
+                ..
+            } => out.append(SumTree::from_leaf(
+                &items[..entry.index],
+                &item_summaries[..entry.index],
+            )),
+            Node::Internal { children, .. } => {
+                for child in &children[..entry.index] {
+                    out.append(child.clone());
+                }
+            }
+        }
+    }
+}
+
+/// The summaries of a node's entries: its children's, or its items'.
+fn entries<T: Item, const CAP: usize>(tree: &SumTree<T, CAP>) -> &[T::Summary] {
+    match &*tree.root {
+        Node::Internal {
+            child_summaries, ..
+        } => child_summaries,
+        Node::Leaf { item_summaries, .. } => item_summaries,
     }
 }
 
@@ -203,8 +446,8 @@ fn passes(target_vs_end: Ordering, bias: Bias) -> bool {
 
 #[cfg(test)]
 mod tests {
-    //! The cursor can't move yet; these check that the dimension and target
-    //! traits fit together the way the cursor will use them.
+    //! The dimension and target traits fitting together, then seeks, slices
+    //! and suffixes checked against a linear scan.
 
     use std::cmp::Ordering;
 
@@ -365,5 +608,137 @@ mod tests {
                 }
             }
         }
+
+        /// Cut a tree into three: seek to `from` (or don't, and start fresh),
+        /// slice to `to`, then take the suffix. A `to` behind `from` slices
+        /// nothing. Tiny nodes, so the two paths part at every level.
+        #[test]
+        fn slice_and_suffix_match_a_scan(
+            lens in proptest::collection::vec(0u64..4, 0..200),
+            from in 0u64..700,
+            to in 0u64..700,
+            fresh in proptest::bool::ANY,
+            left in proptest::bool::ANY,
+        ) {
+            let bias = if left { Bias::Left } else { Bias::Right };
+            let mut tree: SumTree<Word, 4> = SumTree::new();
+            for &len in &lens {
+                tree.push(Word(len));
+            }
+            let total: u64 = lens.iter().sum();
+            let (from, to) = (from % (total + 3), to % (total + 3));
+            let lens_of = |t: &SumTree<Word, 4>| t.items().iter().map(|w| w.0).collect::<Vec<_>>();
+
+            let mut cursor = tree.cursor::<Totals>();
+            let start = if fresh {
+                0
+            } else {
+                cursor.seek(&Len(from), bias);
+                scan(&lens, from, bias).0
+            };
+            let end = start.max(scan(&lens, to, bias).0);
+
+            let slice = cursor.slice(&Len(to), bias);
+            slice.check().map_err(proptest::test_runner::TestCaseError::fail)?;
+            proptest::prop_assert_eq!(lens_of(&slice), &lens[start..end]);
+            proptest::prop_assert_eq!(cursor.start().count, end);
+
+            let rest = cursor.suffix();
+            rest.check().map_err(proptest::test_runner::TestCaseError::fail)?;
+            proptest::prop_assert_eq!(lens_of(&rest), &lens[end..]);
+            proptest::prop_assert_eq!(cursor.start().count, lens.len());
+            proptest::prop_assert_eq!(cursor.start().len, total);
+
+            // The source tree is untouched.
+            proptest::prop_assert_eq!(lens_of(&tree), lens);
+        }
+
+        /// Walk every item forward from before the start, off the end, then
+        /// back again and off the front. Tiny nodes, so steps cross leaf and
+        /// node edges at every level.
+        #[test]
+        fn next_and_prev_walk_every_item(lens in proptest::collection::vec(0u64..4, 0..200)) {
+            let tree: SumTree<Word, 4> = tree_of(&lens);
+            let before = prefix_sums(&lens);
+            let n = lens.len();
+            let mut cursor = tree.cursor::<Totals>();
+            let at = |c: &Cursor<Word, Totals, 4>| {
+                (c.item().map(|w| w.0), c.start().count, c.start().len)
+            };
+
+            proptest::prop_assert_eq!(at(&cursor), (None, 0, 0));
+            for i in 0..n {
+                cursor.next();
+                proptest::prop_assert_eq!(at(&cursor), (Some(lens[i]), i, before[i]), "next to {}", i);
+            }
+            cursor.next();
+            proptest::prop_assert_eq!(at(&cursor), (None, n, before[n]), "off the end");
+            cursor.next();
+            proptest::prop_assert_eq!(at(&cursor), (None, n, before[n]), "stays past the end");
+
+            for i in (0..n).rev() {
+                cursor.prev();
+                proptest::prop_assert_eq!(at(&cursor), (Some(lens[i]), i, before[i]), "prev to {}", i);
+            }
+            cursor.prev();
+            proptest::prop_assert_eq!(at(&cursor), (None, 0, 0), "off the front");
+            cursor.prev();
+            proptest::prop_assert_eq!(at(&cursor), (None, 0, 0), "stays before the start");
+
+            // And forward again from there.
+            cursor.next();
+            proptest::prop_assert_eq!(at(&cursor), (lens.first().copied(), 0, 0));
+        }
+
+        /// Seek somewhere, then step both ways from there: steps and seeks
+        /// keep the same path.
+        #[test]
+        fn steps_after_a_seek(
+            lens in proptest::collection::vec(0u64..4, 1..200),
+            target in 0u64..700,
+            left in proptest::bool::ANY,
+        ) {
+            let bias = if left { Bias::Left } else { Bias::Right };
+            let tree: SumTree<Word, 4> = tree_of(&lens);
+            let before = prefix_sums(&lens);
+            let total = before[lens.len()];
+            let target = target % (total + 3);
+            let i = scan(&lens, target, bias).0;
+
+            let mut back = tree.cursor::<Totals>();
+            back.seek(&Len(target), bias);
+            back.prev();
+            if i == 0 {
+                proptest::prop_assert!(back.item().is_none());
+                proptest::prop_assert_eq!(back.start().count, 0);
+            } else {
+                proptest::prop_assert_eq!(back.item().map(|w| w.0), Some(lens[i - 1]));
+                proptest::prop_assert_eq!((back.start().count, back.start().len), (i - 1, before[i - 1]));
+            }
+
+            let mut on = tree.cursor::<Totals>();
+            on.seek(&Len(target), bias);
+            on.next();
+            let j = (i + 1).min(lens.len());
+            proptest::prop_assert_eq!(on.item().map(|w| w.0), lens.get(j).copied());
+            proptest::prop_assert_eq!((on.start().count, on.start().len), (j, before[j]));
+        }
+    }
+
+    fn tree_of(lens: &[u64]) -> SumTree<Word, 4> {
+        let mut tree = SumTree::new();
+        for &len in lens {
+            tree.push(Word(len));
+        }
+        tree
+    }
+
+    /// `before[i]` is the total length of the items before item `i`.
+    fn prefix_sums(lens: &[u64]) -> Vec<u64> {
+        let mut before = vec![0];
+        for &len in lens {
+            before.push(before.last().unwrap() + len);
+        }
+        before
     }
 }

@@ -9,7 +9,7 @@
 //! - `mamre.rs`: where the real tree plugs in.
 //!
 //! Run all:        cargo test
-//! Run the tree:   cargo test --test referee mamre -- --include-ignored
+//! Run the tree:   cargo test --test referee mamre
 //!
 //! When a test fails, proptest shrinks it to a small case and saves it under
 //! `proptest-regressions/`, so it's tried first next time. Commit those.
@@ -30,7 +30,6 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "needs Cursor; see tests/referee/mamre.rs"]
     fn mamre_matches_the_model(start in ops::lines(80), ops in ops::ops()) {
         ops::run::<mamre::Tree>(start, &ops).map_err(TestCaseError::fail)?;
     }
@@ -136,7 +135,6 @@ proptest! {
 
     /// Fewer cases, but trees deep enough for several levels of nodes.
     #[test]
-    #[ignore = "needs Cursor; see tests/referee/mamre.rs"]
     fn mamre_matches_the_model_when_deep(start in ops::lines(5000), ops in ops::ops()) {
         ops::run::<mamre::Tree>(start, &ops).map_err(TestCaseError::fail)?;
     }

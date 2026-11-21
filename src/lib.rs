@@ -4,7 +4,7 @@ mod tree;
 pub mod units;
 use arrayvec::ArrayVec;
 use std::{cmp::Ordering, sync::Arc};
-use units::CAP_SZ;
+use units::CAPSIZE;
 
 pub trait Item: Clone {
     type Summary: Summary;
@@ -76,12 +76,12 @@ impl<S: Summary, A: Dimension<S> + Ord, B: Dimension<S>> SeekTarget<S, (A, B)> f
 }
 
 #[derive(Clone)]
-pub struct SumTree<T: Item, const CAP: usize = CAP_SZ> {
+pub struct SumTree<T: Item, const CAP: usize = CAPSIZE> {
     root: Arc<Node<T, CAP>>,
 }
 
 #[derive(Clone)]
-enum Node<T: Item, const CAP: usize = CAP_SZ> {
+enum Node<T: Item, const CAP: usize = CAPSIZE> {
     Internal {
         /// Levels above the leaves: 1 for a node whose children are leaves.
         /// Fixed at creation; a node never moves to another level.

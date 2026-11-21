@@ -24,6 +24,18 @@ impl<T: Item, const CAP: usize> SumTree<T, CAP> {
         }
     }
 
+    /// A tree that's one leaf holding `items`, whose summaries are already
+    /// known. Any number up to `CAP` is fine: a lone leaf is a root.
+    pub(crate) fn from_leaf(items: &[T], summaries: &[T::Summary]) -> Self {
+        debug_assert_eq!(items.len(), summaries.len());
+        let item_summaries: ArrayVec<T::Summary, CAP> = summaries.iter().cloned().collect();
+        Self::from_node(Node::Leaf {
+            summary: sum_all(&item_summaries),
+            items: items.iter().cloned().collect(),
+            item_summaries,
+        })
+    }
+
     pub fn summary(&self) -> &T::Summary {
         self.root.summary()
     }

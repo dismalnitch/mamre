@@ -3,12 +3,7 @@
 //! `Mamre` holds a `SumTree` of [`Line`]s, with [`Lines`] as its summary.
 //! Its cursors track the whole `Lines` before them, and seek by `Count`,
 //! `Len` or `Height`: targets that each compare against one field of it.
-//!
-//! Still to wire, as the tree grows them:
-//! - `split`: needs `Cursor::slice` and `Cursor::suffix`.
-//!
-//! The referee seeks after every operation, even the first build, so the
-//! tests in `main.rs` stay `#[ignore]`d until all of these are in.
+//! `split` is a `slice` to the target, then a `suffix` for the rest.
 
 use std::{cmp::Ordering, fmt};
 
@@ -62,6 +57,13 @@ impl SeekTarget<Lines, Lines> for Height {
     }
 }
 
+fn cursor_bias(bias: Bias) -> cursor::Bias {
+    match bias {
+        Bias::Left => cursor::Bias::Left,
+        Bias::Right => cursor::Bias::Right,
+    }
+}
+
 #[derive(Clone)]
 pub struct Mamre(SumTree<Line>);
 
@@ -85,8 +87,15 @@ impl Subject for Mamre {
         self.0.append(other.0);
     }
 
-    fn split(&self, _target: Target, _bias: Bias) -> (Self, Self) {
-        todo!("needs Cursor::slice and Cursor::suffix")
+    fn split(&self, target: Target, bias: Bias) -> (Self, Self) {
+        let bias = cursor_bias(bias);
+        let mut cursor = self.0.cursor::<Lines>();
+        let left = match target {
+            Target::Count(n) => cursor.slice(&Count(n), bias),
+            Target::Len(n) => cursor.slice(&Len(n), bias),
+            Target::Height(n) => cursor.slice(&Height(n), bias),
+        };
+        (Mamre(left), Mamre(cursor.suffix()))
     }
 
     fn seek(&self, target: Target, bias: Bias) -> usize {
@@ -94,10 +103,7 @@ impl Subject for Mamre {
     }
 
     fn prefix(&self, target: Target, bias: Bias) -> Lines {
-        let bias = match bias {
-            Bias::Left => cursor::Bias::Left,
-            Bias::Right => cursor::Bias::Right,
-        };
+        let bias = cursor_bias(bias);
         let mut cursor = self.0.cursor::<Lines>();
         match target {
             Target::Count(n) => cursor.seek(&Count(n), bias),
