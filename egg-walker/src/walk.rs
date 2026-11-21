@@ -15,15 +15,26 @@
 //! either side of it (its origins); the shared ordering rule places it
 //! among concurrent inserts; its effect position is where that lands now.
 //!
-//! This first walk replays the whole history every time and keeps records
-//! in a plain list: it's here to be right, and to be the oracle a faster
-//! one is checked against.
+//! A merge only replays what it has to. Its *base* is the latest version
+//! that every event it replays includes: nothing in the base is ever
+//! retreated, so the document at the base needs no records, only a
+//! placeholder run of anonymous items standing for it, split wherever an
+//! edit touches it. The placeholder is longer than any real document, so
+//! the base's length never needs knowing; edits only ever touch its front.
+//!
+//! Records are still in a plain list, and finding the base still reads the
+//! whole graph; both get faster next, checked against this.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::oplog::{Lv, Op, OpLog};
 use crate::order::{Placed, place};
+
+/// Ids at or above this name items of the base document, by position.
+const BASE_ITEM: usize = 1 << 62;
+/// How long the placeholder is: more than any real document.
+const UNDERWATER: usize = 1 << 61;
 
 /// A plain change to a document: what the walk produces.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,10 +53,16 @@ enum Prepare {
     Deleted(u32),
 }
 
+/// One inserted item, or a run of the base document's items.
+#[derive(Clone)]
 struct Record {
-    id: Lv,
-    left: Option<Lv>,
-    right: Option<Lv>,
+    /// The insert's local version, or `BASE_ITEM` plus the first base
+    /// item's position.
+    id: usize,
+    /// 1, except for a run of base items.
+    len: usize,
+    left: Option<usize>,
+    right: Option<usize>,
     prepare: Prepare,
     /// Deleted in the effect version: by any delete replayed so far.
     gone: bool,
@@ -69,32 +86,16 @@ struct Walk<'a, T> {
     /// The prepare version, as a set.
     prepared: Vec<bool>,
     /// Which record each delete replayed so far removed.
-    targets: HashMap<Lv, Lv>,
+    targets: HashMap<Lv, usize>,
+    /// How many events were replayed: what a merge cost.
+    replayed: usize,
 }
 
 impl<T: Clone> OpLog<T> {
     /// The changes that bring a document holding version `from` up to
     /// everything in `from` and `to`, in the order to apply them.
     pub fn changes(&self, from: &[Lv], to: &[Lv]) -> Vec<Change<T>> {
-        let have = self.closure(from);
-        let want = self.closure(to);
-        let mut walk = Walk {
-            log: self,
-            records: Vec::new(),
-            prepared: vec![false; self.len()],
-            targets: HashMap::new(),
-        };
-        // First what the document already holds, to set up its state, then
-        // what's new. Parents always come first either way: `from` holds
-        // all its events' parents.
-        for lv in (0..self.len()).filter(|&lv| have[lv]) {
-            walk.step(lv, None);
-        }
-        let mut out = Vec::new();
-        for lv in (0..self.len()).filter(|&lv| want[lv] && !have[lv]) {
-            walk.step(lv, Some(&mut out));
-        }
-        out
+        self.walk(from, to).0
     }
 
     /// The document at `version`, from nothing.
@@ -104,6 +105,66 @@ impl<T: Clone> OpLog<T> {
             change.apply(&mut doc);
         }
         doc
+    }
+
+    /// The changes, and how many events the walk replayed to find them.
+    pub(crate) fn walk(&self, from: &[Lv], to: &[Lv]) -> (Vec<Change<T>>, usize) {
+        let have = self.closure(from);
+        let mut want = self.closure(to);
+        for (w, &h) in want.iter_mut().zip(&have) {
+            *w |= h;
+        }
+        if want == have {
+            return (Vec::new(), 0);
+        }
+        let base = self.base(&have, &want);
+        let mut walk = Walk {
+            log: self,
+            records: vec![Record {
+                id: BASE_ITEM,
+                len: UNDERWATER,
+                left: None,
+                right: None,
+                prepare: Prepare::Inserted,
+                gone: false,
+            }],
+            prepared: base.clone(),
+            targets: HashMap::new(),
+            replayed: 0,
+        };
+        // First what the document already holds past the base, to set up
+        // its state, then what's new. Parents come first either way:
+        // `from` holds all its events' parents.
+        for lv in (0..self.len()).filter(|&lv| have[lv] && !base[lv]) {
+            walk.step(lv, None);
+        }
+        let mut out = Vec::new();
+        for lv in (0..self.len()).filter(|&lv| want[lv] && !have[lv]) {
+            walk.step(lv, Some(&mut out));
+        }
+        (out, walk.replayed)
+    }
+
+    /// The latest version inside `have` that every event to be replayed
+    /// includes: the new events, and whatever of `have` isn't in the base.
+    /// Shrinking the base can bring more of `have` into the replay, whose
+    /// parents may shrink it further, so it's found by shrinking until it
+    /// holds.
+    fn base(&self, have: &[bool], want: &[bool]) -> Vec<bool> {
+        let mut base = have.to_vec();
+        loop {
+            let mut next = base.clone();
+            for lv in (0..self.len()).filter(|&lv| want[lv] && !base[lv]) {
+                let parents = self.closure(&self.events()[lv].parents);
+                for (b, p) in next.iter_mut().zip(parents) {
+                    *b &= p;
+                }
+            }
+            if next == base {
+                return base;
+            }
+            base = next;
+        }
     }
 }
 
@@ -120,11 +181,13 @@ impl<T> Change<T> {
 
 impl<T: Clone> Walk<'_, T> {
     fn step(&mut self, lv: Lv, out: Option<&mut Vec<Change<T>>>) {
+        self.replayed += 1;
         let event = &self.log.events()[lv];
         let parents = self.log.closure(&event.parents);
         // Move the prepare version to this event's parents: take back what
         // it shouldn't hold, latest first, then add what it's missing,
         // earliest first, so a delete is never undone before its insert.
+        // The base is in every replayed event's parents, so it never moves.
         for x in (0..self.prepared.len()).rev() {
             if self.prepared[x] && !parents[x] {
                 self.retreat(x);
@@ -144,7 +207,7 @@ impl<T: Clone> Walk<'_, T> {
         self.prepared[lv] = true;
     }
 
-    fn index_of(&self, id: Lv) -> usize {
+    fn index_of(&self, id: usize) -> usize {
         self.records
             .iter()
             .position(|r| r.id == id)
@@ -179,25 +242,57 @@ impl<T: Clone> Walk<'_, T> {
         };
     }
 
-    /// The index of the `pos`th record visible in the prepare version, or
-    /// the end if `pos` is just past the last.
-    fn prepared_at(&self, pos: usize) -> usize {
+    /// The index of the record holding the `pos`th item visible in the
+    /// prepare version, split out into a record of its own if it's inside
+    /// a run of base items. The placeholder never runs out, so there
+    /// always is one.
+    fn prepared_at(&mut self, pos: usize) -> usize {
         let mut seen = 0;
-        for (i, r) in self.records.iter().enumerate() {
+        for i in 0..self.records.len() {
+            let r = &self.records[i];
             if r.prepare == Prepare::Inserted {
-                if seen == pos {
-                    return i;
+                if pos < seen + r.len {
+                    return self.isolate(i, pos - seen);
                 }
-                seen += 1;
+                seen += r.len;
             }
         }
-        assert_eq!(seen, pos, "position {pos} is past the end of its version");
-        self.records.len()
+        unreachable!("the placeholder is longer than any document")
     }
 
-    /// How many records the effect version shows before index `i`.
+    /// Splits item `offset` of record `i` into a record of its own, so
+    /// origins and deletes can name it; returns its index.
+    fn isolate(&mut self, i: usize, offset: usize) -> usize {
+        let i = if offset > 0 {
+            self.split(i, offset);
+            i + 1
+        } else {
+            i
+        };
+        if self.records[i].len > 1 {
+            self.split(i, 1);
+        }
+        i
+    }
+
+    /// Splits a run of base items in two at `at`.
+    fn split(&mut self, i: usize, at: usize) {
+        let r = &mut self.records[i];
+        debug_assert!(r.id >= BASE_ITEM && at < r.len, "only base runs split");
+        let mut rest = r.clone();
+        r.len = at;
+        rest.id += at;
+        rest.len -= at;
+        self.records.insert(i + 1, rest);
+    }
+
+    /// How many items the effect version shows before record `i`.
     fn effect_pos(&self, i: usize) -> usize {
-        self.records[..i].iter().filter(|r| !r.gone).count()
+        self.records[..i]
+            .iter()
+            .filter(|r| !r.gone)
+            .map(|r| r.len)
+            .sum()
     }
 
     fn insert(&mut self, lv: Lv, pos: usize, item: T, out: Option<&mut Vec<Change<T>>>) {
@@ -211,20 +306,19 @@ impl<T: Clone> Walk<'_, T> {
         let (left, from) = match pos.checked_sub(1) {
             Some(before) => {
                 let i = self.prepared_at(before);
-                assert!(
-                    i < self.records.len(),
-                    "insert {lv} at {pos} is past the end"
-                );
                 (Some(self.records[i].id), i + 1)
             }
             None => (None, 0),
         };
+        // The right origin is the first item of its record, so it needs no
+        // splitting out: a run that's split later keeps its first item at
+        // its front, so the id still names where a record starts.
         let right = self.records[from..]
             .iter()
             .find(|r| r.prepare != Prepare::NotYet)
             .map(|r| r.id);
 
-        let index: HashMap<Lv, usize> = self
+        let index: HashMap<usize, usize> = self
             .records
             .iter()
             .enumerate()
@@ -242,6 +336,7 @@ impl<T: Clone> Walk<'_, T> {
             dest,
             Record {
                 id: lv,
+                len: 1,
                 left,
                 right,
                 prepare: Prepare::Inserted,
@@ -258,10 +353,6 @@ impl<T: Clone> Walk<'_, T> {
 
     fn delete(&mut self, lv: Lv, pos: usize, out: Option<&mut Vec<Change<T>>>) {
         let at = self.prepared_at(pos);
-        assert!(
-            at < self.records.len(),
-            "delete {lv} at {pos} is past the end"
-        );
         self.records[at].prepare = Prepare::Deleted(1);
         self.targets.insert(lv, self.records[at].id);
         // Already deleted in the effect version by a concurrent delete:
@@ -286,4 +377,60 @@ impl<T> Op<T> {
 /// Orders two ids by the log's tie-break, for the reference to share.
 pub(crate) fn tie_break<T>(log: &OpLog<T>, a: Lv, b: Lv) -> Ordering {
     log.order_key(a).cmp(&log.order_key(b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A long history everyone shares, then two concurrent edits: merging
+    /// them replays only the concurrent work, not the history.
+    #[test]
+    fn a_merge_replays_only_what_is_concurrent() {
+        let mut log: OpLog<u32> = OpLog::new();
+        let alice = log.agent("alice");
+        let bob = log.agent("bob");
+        let mut v = Vec::new();
+        for i in 0..200 {
+            v = log.add_insert(alice, &v, i as usize, [i]);
+        }
+        let a = log.add_insert(alice, &v, 50, [1000, 1001]);
+        let b = log.add_delete(bob, &v, 10..13);
+        let (changes, replayed) = log.walk(&a, &b);
+        // Bob's three deletes are new, and Alice's two inserts are
+        // concurrent with them, so replayed too; the 200 before are the base.
+        assert_eq!(replayed, 5);
+        let mut doc = log.checkout(&a);
+        for change in changes {
+            change.apply(&mut doc);
+        }
+        assert_eq!(doc, log.checkout(&log.union(&a, &b)));
+        assert_eq!(doc.len(), 199);
+    }
+
+    /// Concurrent work on both sides: the base is the fork point, and both
+    /// sides' events are replayed, but not the history before it.
+    #[test]
+    fn a_merge_of_two_branches_starts_at_the_fork() {
+        let mut log: OpLog<u32> = OpLog::new();
+        let alice = log.agent("alice");
+        let bob = log.agent("bob");
+        let mut v = Vec::new();
+        for i in 0..200 {
+            v = log.add_insert(alice, &v, i as usize, [i]);
+        }
+        let mut a = v.clone();
+        let mut b = v.clone();
+        for k in 0..5 {
+            a = log.add_insert(alice, &a, k * 3, [500 + k as u32]);
+            b = log.add_delete(bob, &b, 100..101);
+        }
+        let (changes, replayed) = log.walk(&a, &b);
+        assert_eq!(replayed, 10, "five events each side, none before the fork");
+        let mut doc = log.checkout(&a);
+        for change in changes {
+            change.apply(&mut doc);
+        }
+        assert_eq!(doc, log.checkout(&log.union(&a, &b)));
+    }
 }
