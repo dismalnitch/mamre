@@ -56,9 +56,17 @@ pub fn checkout<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<T> {
             Op::Insert { pos, item } => {
                 let visible = seen.iter().filter(|(_, v)| *v).count();
                 assert!(*pos <= visible, "insert {lv} at {pos} is past the end");
-                let k = nth_visible(*pos).unwrap_or(seen.len());
-                let left = k.checked_sub(1).map(|k| list[seen[k].0].id);
-                let right = seen.get(k).map(|&(i, _)| list[i].id);
+                // Just after the visible item before the position (or at the
+                // very start), and before whatever came next in this
+                // version, deleted or not.
+                let (left, next) = match pos.checked_sub(1) {
+                    Some(before) => {
+                        let k = nth_visible(before).expect("checked above");
+                        (Some(list[seen[k].0].id), k + 1)
+                    }
+                    None => (None, 0),
+                };
+                let right = seen.get(next).map(|&(i, _)| list[i].id);
                 let index_of = |id: Lv| list.iter().position(|item| item.id == id).unwrap();
                 let dest = place(&list, left, right, index_of, |other| {
                     tie_break(log, lv, other)

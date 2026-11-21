@@ -201,16 +201,28 @@ impl<T: Clone> Walk<'_, T> {
     }
 
     fn insert(&mut self, lv: Lv, pos: usize, item: T, out: Option<&mut Vec<Change<T>>>) {
-        let at = self.prepared_at(pos);
-        // The origins: either side of the position, among items that exist
-        // in the prepare version (deleted ones included, concurrent ones
-        // not), as the insert's author saw them.
-        let left = self.records[..at]
+        // The origins, as the insert's author saw them. An insert sticks to
+        // what's before it: its left origin is the visible item just before
+        // the position (none at the start), and its right is whatever came
+        // next in that version, deleted or not. Concurrent items, not in
+        // the version, don't count. (diamond-types' convention, and the
+        // intent: "at the start" stays at the start, wherever tombstones
+        // lie.)
+        let (left, from) = match pos.checked_sub(1) {
+            Some(before) => {
+                let i = self.prepared_at(before);
+                assert!(
+                    i < self.records.len(),
+                    "insert {lv} at {pos} is past the end"
+                );
+                (Some(self.records[i].id), i + 1)
+            }
+            None => (None, 0),
+        };
+        let right = self.records[from..]
             .iter()
-            .rev()
             .find(|r| r.prepare != Prepare::NotYet)
             .map(|r| r.id);
-        let right = self.records.get(at).map(|r| r.id);
 
         let index: HashMap<Lv, usize> = self
             .records

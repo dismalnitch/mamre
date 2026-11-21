@@ -7,7 +7,7 @@
 //! everyone, and every replica must hold the same document, though each
 //! log numbered the events differently.
 
-use mamre_walker::{Lv, OpLog, reference};
+use mamre_egg_walker::{Lv, OpLog, reference};
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]

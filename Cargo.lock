@@ -280,18 +280,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mamre-egg-walker"
+version = "0.1.0"
+dependencies = [
+ "diamond-types",
+ "proptest",
+]
+
+[[package]]
 name = "mamre-rope"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
  "mamre",
- "proptest",
-]
-
-[[package]]
-name = "mamre-walker"
-version = "0.1.0"
-dependencies = [
  "proptest",
 ]
 

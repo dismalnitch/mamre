@@ -1,5 +1,12 @@
-//! An event-graph CRDT after Eg-walker (Gentle and Kleppmann, "Better,
-//! Faster, Smaller", 2024), for sequences of any item, not just text.
+//! An event-graph CRDT after Eg-walker (Gentle & Kleppmann, 2025), for
+//! sequences of any item, not just text.
+//!
+//! Gentle, J., & Kleppmann, M. (2025). Collaborative text editing with
+//! Eg-walker: Better, faster, smaller. In *Proceedings of the Twentieth
+//! European Conference on Computer Systems (EuroSys '25)* (pp. 311–328).
+//! Association for Computing Machinery.
+//! <https://doi.org/10.1145/3689031.3696076>
+//! (Preprint: [arXiv:2409.14252](https://arxiv.org/abs/2409.14252).)
 //!
 //! Every edit is an event: an insert or delete at a plain position, in the
 //! document *as its author saw it*, plus the events it came after. The
@@ -9,7 +16,7 @@
 //!
 //! - [`OpLog`]: every event a replica knows, and syncing them between logs.
 //! - [`OpLog::changes`]: the walk, from one version to another.
-//! - [`reference`]: the slow, obviously-correct version the walk is tested
+//! - [`reference`](mod@reference): the slow, obviously-correct version the walk is tested
 //!   against.
 //!
 //! This is the first, simple walk: it replays the whole history every time,
