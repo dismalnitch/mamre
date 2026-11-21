@@ -21,6 +21,12 @@
 //! heading is, both in O(log n). See [`Rope::address_at`] and
 //! [`Rope::heading_at`].
 //!
+//! Grapheme clusters (what a reader takes for one character: a letter and
+//! its accents, an emoji and its modifiers, a flag) are found by
+//! neighbour, a chunk at a time: [`Rope::next_grapheme_boundary`],
+//! [`Rope::prev_grapheme_boundary`] and [`Rope::is_grapheme_boundary`],
+//! with [`Rope::chunk_at`] for anything else that reads chunk by chunk.
+//!
 //! Positions are byte offsets, as for `str`, and must fall on `char`
 //! boundaries. Lines are split on `\n` only; a `\r` is ordinary text, so
 //! turning `\r\n` into `\n` is up to whoever loads the file.
@@ -30,6 +36,7 @@
 //! it that way, so a rope of `n` bytes has fewer than `2n / N + 1` chunks.
 
 mod angela;
+mod graphemes;
 mod measure;
 mod outline;
 mod scan;
