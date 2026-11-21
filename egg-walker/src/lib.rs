@@ -19,13 +19,16 @@
 //! - [`reference`](mod@reference): the slow, obviously-correct version the walk is tested
 //!   against.
 //!
-//! This is the first, simple walk: it replays the whole history every time,
-//! with records in a plain list. It's here to be right. Speed comes next,
-//! checked against this.
+//! The walk keeps its records in a mamre `SumTree` with order keys, starts
+//! each merge from the latest point the history narrows to, and moves its
+//! prepare version by walking only as far back as it changes. A simpler walk
+//! over a plain list is kept to check it against, change for change.
 
+mod key;
 mod oplog;
 mod order;
 pub mod reference;
+mod simple;
 mod walk;
 
 pub use oplog::{AgentId, Event, Lv, Op, OpLog};

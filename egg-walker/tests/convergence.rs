@@ -61,7 +61,15 @@ fn sync(replicas: &mut [Replica], r: usize, from: usize) {
         .expect("just pulled");
     let before = me.version.clone();
     me.version = me.log.union(&before, &theirs_here);
-    for change in me.log.changes(&before, &me.version) {
+    let changes = me.log.changes(&before, &me.version);
+    // The fast walk and the simple one must agree change for change, not
+    // just on the document they lead to.
+    assert_eq!(
+        changes,
+        me.log.changes_simple(&before, &me.version),
+        "the tree walk and the list walk differ"
+    );
+    for change in changes {
         change.apply(&mut me.doc);
     }
 }

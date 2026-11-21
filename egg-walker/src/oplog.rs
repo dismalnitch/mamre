@@ -50,6 +50,10 @@ pub struct OpLog<T> {
     ids: HashMap<(AgentId, u64), Lv>,
     /// The events nothing else came after: the version of everything.
     frontier: Vec<Lv>,
+    /// Critical events, in order: each has every earlier event among its
+    /// ancestors and every later one among its descendants, so the history
+    /// narrows to it. A merge can start from the latest one it holds.
+    critical: Vec<Lv>,
 }
 
 impl<T> Default for OpLog<T> {
@@ -61,6 +65,7 @@ impl<T> Default for OpLog<T> {
             events: Vec::new(),
             ids: HashMap::new(),
             frontier: Vec::new(),
+            critical: Vec::new(),
         }
     }
 }
@@ -188,11 +193,30 @@ impl<T: Clone> OpLog<T> {
         );
         let next = &mut self.next_seq[agent.0 as usize];
         *next = (*next).max(seq + 1);
+        // A critical event stays critical while every event after it
+        // descends from it: a new event does if any parent is it or after
+        // it. Critical events are a chain, so the ones this breaks are the
+        // latest.
+        let latest_parent = parents.iter().max().copied();
+        while let Some(&c) = self.critical.last()
+            && latest_parent.is_none_or(|p| p < c)
+        {
+            self.critical.pop();
+        }
+        // This event has every earlier one as an ancestor if its parents
+        // are the whole frontier.
+        let mut sorted = parents.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let has_everything = sorted == self.frontier;
         // A frontier entry is a parent of this event or still a frontier
         // entry: it has nothing after it, so it can't be a deeper ancestor.
         self.frontier.retain(|f| !parents.contains(f));
         self.frontier.push(lv);
         self.frontier.sort_unstable();
+        if has_everything {
+            self.critical.push(lv);
+        }
         self.events.push(Event {
             agent,
             seq,
@@ -204,6 +228,83 @@ impl<T: Clone> OpLog<T> {
 }
 
 impl<T> OpLog<T> {
+    /// The latest critical event in `version`, if any: everything up to it
+    /// is in `version`, and everything after it descends from it.
+    pub(crate) fn critical_in(&self, version: &[Lv]) -> Option<Lv> {
+        // Everything after a critical event descends from it, so `version`
+        // holds it if any of its events is it or after it.
+        let latest = *version.iter().max()?;
+        let i = self.critical.partition_point(|&c| c <= latest);
+        i.checked_sub(1).map(|i| self.critical[i])
+    }
+
+    /// The events in `version` and before it, but after `floor`, in order.
+    /// The search stops at `floor`, which all of them descend from.
+    pub(crate) fn events_after(&self, version: &[Lv], floor: Option<Lv>) -> Vec<Lv> {
+        let above = |lv: Lv| floor.is_none_or(|f| lv > f);
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: Vec<Lv> = version.iter().copied().filter(|&lv| above(lv)).collect();
+        while let Some(lv) = stack.pop() {
+            if seen.insert(lv) {
+                stack.extend(
+                    self.events[lv]
+                        .parents
+                        .iter()
+                        .copied()
+                        .filter(|&p| above(p)),
+                );
+            }
+        }
+        let mut out: Vec<Lv> = seen.into_iter().collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// What's in `a` but not `b`, and in `b` but not `a`, latest first.
+    ///
+    /// Walks back from both at once, latest event first, marking which side
+    /// reached each, and stops once everything still to visit was reached
+    /// by both: so it costs what the two differ by, not the whole history.
+    pub(crate) fn diff(&self, a: &[Lv], b: &[Lv]) -> (Vec<Lv>, Vec<Lv>) {
+        const A: u8 = 1;
+        const B: u8 = 2;
+        let mut queue: std::collections::BinaryHeap<(Lv, u8)> = a
+            .iter()
+            .map(|&lv| (lv, A))
+            .chain(b.iter().map(|&lv| (lv, B)))
+            .collect();
+        // How many queued entries one side alone reached.
+        let mut one_sided = queue.len();
+        let (mut only_a, mut only_b) = (Vec::new(), Vec::new());
+        while one_sided > 0 {
+            let (lv, mut side) = queue.pop().expect("one-sided entries are queued");
+            if side != A | B {
+                one_sided -= 1;
+            }
+            while let Some(&(next, more)) = queue.peek()
+                && next == lv
+            {
+                queue.pop();
+                if more != A | B {
+                    one_sided -= 1;
+                }
+                side |= more;
+            }
+            match side {
+                A => only_a.push(lv),
+                B => only_b.push(lv),
+                _ => {}
+            }
+            for &p in &self.events[lv].parents {
+                if side != A | B {
+                    one_sided += 1;
+                }
+                queue.push((p, side));
+            }
+        }
+        (only_a, only_b)
+    }
+
     /// Every event in `version` and before it, as a set by local version.
     pub(crate) fn closure(&self, version: &[Lv]) -> Vec<bool> {
         let mut seen = vec![false; self.events.len()];

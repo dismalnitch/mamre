@@ -8,6 +8,9 @@ keywords = ["crdt", "eg-walker", "collaboration", "sequence", "event-graph"]
 repository = "https://github.com/dismalnitch/mamre"
 publish = false
 
+[dependencies]
+mamre = { path = ".." }
+
 [dev-dependencies]
 proptest = "1.12"
 # The reference implementation of the paper: an independent oracle.
