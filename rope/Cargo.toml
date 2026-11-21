@@ -1,0 +1,15 @@
+[package]
+name = "mamre-rope"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A text rope on mamre's sum tree: chunks of text, summed by bytes, chars, lines, words, paragraphs and sections"
+repository = "https://github.com/dismalnitch/mamre"
+publish = false
+
+[dependencies]
+mamre = { path = ".." }
+arrayvec = "0.7.8"
+
+[dev-dependencies]
+proptest = "1.12"

@@ -7,6 +7,10 @@ description = "A sum tree: a B+ tree that keeps running totals, and can be a Mer
 repository = "https://github.com/dismalnitch/mamre"
 publish = false
 
+# The tree is this root package; mixins built on its public API are members.
+[workspace]
+members = ["rope"]
+
 [dev-dependencies]
 proptest = "1.12"
 

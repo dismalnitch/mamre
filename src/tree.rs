@@ -122,6 +122,28 @@ impl<T: Item, const CAP: usize> SumTree<T, CAP> {
         }
     }
 
+    /// The first item, if there is one. O(log n).
+    pub fn first(&self) -> Option<&T> {
+        self.root.edge_item(Side::Front)
+    }
+
+    /// The last item, if there is one. O(log n).
+    pub fn last(&self) -> Option<&T> {
+        self.root.edge_item(Side::Back)
+    }
+
+    /// Changes the first item in place, and every summary above it. Does
+    /// nothing to an empty tree. Copies only the path down to it, if shared.
+    pub fn update_first(&mut self, f: impl FnOnce(&mut T)) {
+        Arc::make_mut(&mut self.root).update_edge_item(Side::Front, f);
+    }
+
+    /// Changes the last item in place, and every summary above it. Does
+    /// nothing to an empty tree. Copies only the path down to it, if shared.
+    pub fn update_last(&mut self, f: impl FnOnce(&mut T)) {
+        Arc::make_mut(&mut self.root).update_edge_item(Side::Back, f);
+    }
+
     /// The root split off a sibling on its `side`: the tree grows a level,
     /// with a new root holding both, in order.
     fn grow_root(&mut self, split_off: SumTree<T, CAP>, side: Side) {
@@ -208,6 +230,62 @@ impl<T: Item, const CAP: usize> Node<T, CAP> {
         match self {
             Node::Internal { height, .. } => *height,
             Node::Leaf { .. } => 0,
+        }
+    }
+
+    /// The item at this node's `side` edge, down through children.
+    fn edge_item(&self, side: Side) -> Option<&T> {
+        match self {
+            Node::Internal { children, .. } => {
+                let child = match side {
+                    Side::Front => children.first(),
+                    Side::Back => children.last(),
+                };
+                child?.root.edge_item(side)
+            }
+            Node::Leaf { items, .. } => match side {
+                Side::Front => items.first(),
+                Side::Back => items.last(),
+            },
+        }
+    }
+
+    /// Runs `f` on the item at this node's `side` edge, then refreshes the
+    /// cached summaries on the way back up.
+    fn update_edge_item(&mut self, side: Side, f: impl FnOnce(&mut T)) {
+        match self {
+            Node::Internal {
+                summary,
+                children,
+                child_summaries,
+                ..
+            } => {
+                let i = match side {
+                    Side::Front => 0,
+                    Side::Back => children.len() - 1,
+                };
+                let child = &mut children[i];
+                Arc::make_mut(&mut child.root).update_edge_item(side, f);
+                child_summaries[i] = child.summary().clone();
+                *summary = sum_all(child_summaries);
+            }
+            Node::Leaf {
+                summary,
+                items,
+                item_summaries,
+            } => {
+                let i = match side {
+                    Side::Front => 0,
+                    Side::Back if items.is_empty() => return,
+                    Side::Back => items.len() - 1,
+                };
+                let Some(item) = items.get_mut(i) else {
+                    return;
+                };
+                f(item);
+                item_summaries[i] = item.summary();
+                *summary = sum_all(item_summaries);
+            }
         }
     }
 
@@ -579,6 +657,34 @@ mod tests {
             // The inputs are untouched.
             prop_assert_eq!(left.items(), (0..a).collect::<Vec<_>>());
             prop_assert_eq!(right.items(), (a..a + b).collect::<Vec<_>>());
+        }
+
+        /// Change both edge items in place: items, summaries and shape stay
+        /// right all the way up, and a copy taken before is untouched.
+        #[test]
+        fn update_edges_in_place(n in 0u64..600, add in 1u64..100) {
+            let tree: SumTree<u64, 4> = tree_of(0..n);
+            let mut changed = tree.clone();
+            changed.update_first(|x| *x += add);
+            changed.update_last(|x| *x += add);
+
+            let mut want: Vec<u64> = (0..n).collect();
+            if let Some(x) = want.first_mut() {
+                *x += add;
+            }
+            if let Some(x) = want.last_mut() {
+                *x += add;
+            }
+            changed.check().map_err(TestCaseError::fail)?;
+            prop_assert_eq!(changed.items(), want.clone());
+            prop_assert_eq!(changed.first(), want.first());
+            prop_assert_eq!(changed.last(), want.last());
+            let mut s = CountSum::empty();
+            for x in &want {
+                s.concat(&x.summary());
+            }
+            prop_assert_eq!(changed.summary(), &s);
+            prop_assert_eq!(tree.items(), (0..n).collect::<Vec<_>>());
         }
     }
 }
