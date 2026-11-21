@@ -132,13 +132,20 @@ impl<T: Clone> OpLog<T> {
             agent: run.agent,
             seq: run.seq + k as u64,
             parents: self.parents(lv).collect(),
-            op: match &run.op {
-                RunOp::Insert { pos, items } => Op::Insert {
-                    pos: pos + k,
-                    item: items[k].clone(),
-                },
-                RunOp::Delete { pos, .. } => Op::Delete { pos: *pos },
+            op: self.op(lv),
+        }
+    }
+
+    /// Just the operation of event `lv`.
+    pub(crate) fn op(&self, lv: Lv) -> Op<T> {
+        let run = self.run_of(lv);
+        let k = lv - run.start;
+        match &run.op {
+            RunOp::Insert { pos, items } => Op::Insert {
+                pos: pos + k,
+                item: items[k].clone(),
             },
+            RunOp::Delete { pos, .. } => Op::Delete { pos: *pos },
         }
     }
 
@@ -171,6 +178,13 @@ impl<T: Clone> OpLog<T> {
             version = vec![lv];
         }
         version
+    }
+
+    /// Adds an event made elsewhere: `agent`'s event number `seq`, after
+    /// `parents`. Returns its local version. For logs decoded or synced from
+    /// outside; local edits go through `add_insert` and `add_delete`.
+    pub fn add_event(&mut self, agent: AgentId, seq: u64, parents: &[Lv], op: Op<T>) -> Lv {
+        self.push(agent, seq, normalize(parents.to_vec()), op)
     }
 
     /// Adds every event `other` knows and this log doesn't, in `other`'s
@@ -347,6 +361,12 @@ impl<T> OpLog<T> {
     /// don't count, and the base can be several events (two people's work,
     /// merged).
     pub(crate) fn conflict(&self, from: &[Lv], to: &[Lv]) -> (Vec<Lv>, Vec<Lv>, Vec<Lv>) {
+        // From nothing: everything in `to` is new, and there's no base.
+        if from.is_empty() {
+            let have = self.closure(to);
+            let new = (0..self.len()).filter(|&lv| have[lv]).collect();
+            return (Vec::new(), new, Vec::new());
+        }
         const FROM: u8 = 1;
         const TO: u8 = 2;
         const BOTH: u8 = FROM | TO;
@@ -410,6 +430,9 @@ impl<T> OpLog<T> {
     /// every event in `base`. Each event's share of `base` is what its
     /// parents include, so one pass in order settles it.
     fn all_include(&self, events: &[Lv], base: &[Lv]) -> bool {
+        if base.is_empty() {
+            return true;
+        }
         let words = base.len().div_ceil(64);
         let full: Vec<u64> = (0..words)
             .map(|w| {

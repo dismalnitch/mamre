@@ -15,3 +15,11 @@ mamre = { path = ".." }
 proptest = "1.12"
 # The reference implementation of the paper: an independent oracle.
 diamond-types = "1.0.0"
+# A real document for the benchmarks to apply changes to.
+mamre-rope = { path = "../rope" }
+
+# Benchmarks on the Eg-walker paper's editing traces: fetch them first with
+# benchmark_data/fetch.sh.
+[[bench]]
+name = "traces"
+harness = false

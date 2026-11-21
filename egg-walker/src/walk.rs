@@ -211,6 +211,8 @@ struct Walk<'a, T> {
     targets: HashMap<Lv, (Key, usize)>,
     /// How many events were replayed: what a merge cost.
     replayed: usize,
+    /// Nothing has touched the records since they were made.
+    fresh: bool,
 }
 
 impl<T: Clone> OpLog<T> {
@@ -237,25 +239,41 @@ impl<T: Clone> OpLog<T> {
         if new.is_empty() {
             return (Vec::new(), Stats::default());
         }
-        let mut records = SumTree::new();
-        records.push(Record::base_run(0, UNDERWATER));
-        let mut walk = Walk {
-            log: self,
-            records,
-            prepared: base,
-            starts: BTreeMap::new(),
-            targets: HashMap::new(),
-            replayed: 0,
-        };
         // First what the document already holds past the base, to set up
         // its state, then what's new. Parents come first either way:
         // `from` holds all its events' parents.
-        for &lv in &old {
-            walk.step(lv, None);
-        }
+        let order: Vec<(Lv, bool)> = old
+            .iter()
+            .map(|&lv| (lv, false))
+            .chain(new.iter().map(|&lv| (lv, true)))
+            .collect();
+        let critical = self.critical_points(&order, &old, &new, &base);
+        let mut walk = Walk::new(self, base);
         let mut out = Vec::new();
-        for &lv in &new {
-            walk.step(lv, Some(&mut out));
+        for (&(lv, output), &critical) in order.iter().zip(&critical) {
+            if critical {
+                // It saw everything replayed so far, and everything after
+                // it sees it: its position is final, and nothing will ever
+                // reach back past it. Apply it as it is, and start afresh
+                // from it.
+                walk.replayed += 1;
+                if output {
+                    out.push(match self.op(lv) {
+                        Op::Insert { pos, item } => Change::Insert { pos, item },
+                        Op::Delete { pos } => Change::Delete { pos },
+                    });
+                }
+                if walk.fresh {
+                    walk.prepared.clear();
+                    walk.prepared.push(lv);
+                } else {
+                    let replayed = walk.replayed;
+                    walk = Walk::new(self, vec![lv]);
+                    walk.replayed = replayed;
+                }
+            } else {
+                walk.step(lv, output.then_some(&mut out));
+            }
         }
         let stats = Stats {
             replayed: walk.replayed,
@@ -263,11 +281,88 @@ impl<T: Clone> OpLog<T> {
         };
         (out, stats)
     }
+
+    /// Which events in a replay are critical: each saw everything replayed
+    /// before it (its parents are all of it), and everything replayed after
+    /// it descends from it. There the walk needs no history at all.
+    ///
+    /// Found in one pass: an event is a candidate if its parents are the
+    /// whole frontier so far, and a later event that doesn't descend from a
+    /// candidate rules it out. A later event descends from a candidate if
+    /// any parent was replayed at or after it; candidates form a chain, so
+    /// the ones ruled out are the latest.
+    fn critical_points(
+        &self,
+        order: &[(Lv, bool)],
+        old: &[Lv],
+        new: &[Lv],
+        base: &[Lv],
+    ) -> Vec<bool> {
+        // Where an event was replayed, if it was: `order` is `old` then
+        // `new`, each sorted, and only what's replayed so far counts.
+        let at = |lv: Lv, i: usize| {
+            let found = match old.binary_search(&lv) {
+                Ok(k) => Some(k),
+                Err(_) => new.binary_search(&lv).ok().map(|k| old.len() + k),
+            };
+            found.filter(|&k| k < i)
+        };
+        let mut frontier: Vec<Lv> = base.to_vec();
+        frontier.sort_unstable();
+        let mut parents: Vec<Lv> = Vec::new();
+        let mut candidates: Vec<usize> = Vec::new();
+        for (i, &(lv, _)) in order.iter().enumerate() {
+            parents.clear();
+            parents.extend(self.parents(lv));
+            parents.sort_unstable();
+            let latest = parents.iter().filter_map(|&p| at(p, i)).max();
+            while let Some(&c) = candidates.last()
+                && latest.is_none_or(|l| l < c)
+            {
+                candidates.pop();
+            }
+            let sees_everything = parents == frontier;
+            if sees_everything {
+                // The usual case, typing: the frontier becomes just this.
+                frontier.clear();
+                frontier.push(lv);
+                candidates.push(i);
+            } else {
+                frontier.retain(|f| !parents.contains(f));
+                frontier.push(lv);
+                frontier.sort_unstable();
+            }
+        }
+        let mut critical = vec![false; order.len()];
+        for c in candidates {
+            critical[c] = true;
+        }
+        critical
+    }
+}
+
+impl<'a, T: Clone> Walk<'a, T> {
+    /// A walk whose prepare version is `base`, with the document there as
+    /// the placeholder.
+    fn new(log: &'a OpLog<T>, base: Vec<Lv>) -> Self {
+        let mut records = SumTree::new();
+        records.push(Record::base_run(0, UNDERWATER));
+        Walk {
+            log,
+            records,
+            prepared: base,
+            starts: BTreeMap::new(),
+            targets: HashMap::new(),
+            replayed: 0,
+            fresh: true,
+        }
+    }
 }
 
 impl<T: Clone> Walk<'_, T> {
     fn step(&mut self, lv: Lv, out: Option<&mut Vec<Change<T>>>) {
         self.replayed += 1;
+        self.fresh = false;
         let event = self.log.event(lv);
         // Move the prepare version to this event's parents: take back what
         // it shouldn't hold, latest first, then add what it's missing,
