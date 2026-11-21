@@ -1,9 +1,9 @@
 pub mod cursor;
 pub mod hash;
-pub mod tree;
+mod tree;
 pub mod units;
 use arrayvec::ArrayVec;
-use std::{cmp::Ordering, error::Error, sync::Arc};
+use std::{cmp::Ordering, sync::Arc};
 use units::CAP_SZ;
 
 pub trait Item: Clone {
@@ -96,31 +96,6 @@ enum Node<T: Item, const CAP: usize = CAP_SZ> {
         item_summaries: ArrayVec<T::Summary, CAP>,
     },
 }
-
-/// Errors produced by tree operations.
-///
-/// `#[non_exhaustive]` lets new variants be added later without breaking
-/// downstream `match`es; callers must include a `_ =>` arm.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TreeError {
-    /// The operation would not change the tree (e.g. splitting a node
-    /// that doesn't need it).
-    NoEffectError,
-}
-
-impl std::fmt::Display for TreeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TreeError::NoEffectError => f.write_str("operation had no effect"),
-        }
-    }
-}
-
-impl Error for TreeError {}
-
-/// Convenience alias for results of tree operations.
-pub type TreeResult<T> = Result<T, TreeError>;
 
 // struct TextSummary {
 //     /// Length in UTF-8

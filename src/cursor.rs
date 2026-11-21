@@ -5,8 +5,6 @@
 //! `slice`/`suffix` cut the tree there. Together with `SumTree::append`, they
 //! are all you need to build insert, delete and replace.
 
-use std::cmp;
-
 use std::cmp::Ordering;
 
 use crate::{Dimension, Item, Node, SeekTarget, SumTree, units::CAP_SZ};
@@ -21,19 +19,17 @@ pub enum Bias {
 }
 
 /// One level of the cursor's path from the root down to the current leaf.
-struct StackEntry<'a, T: Item, D, const CAP: usize> {
+struct StackEntry<'a, T: Item, const CAP: usize> {
     /// The node at this level.
     tree: &'a SumTree<T, CAP>,
     /// Which child (internal node) or item (leaf) the cursor is on.
     index: usize,
-    /// The total, in dimension `D`, of everything before `tree`.
-    position: D,
 }
 
 pub struct Cursor<'a, T: Item, D: Dimension<T::Summary>, const CAP: usize = CAP_SZ> {
     tree: &'a SumTree<T, CAP>,
     /// Root-to-leaf path. Empty means the cursor hasn't started yet.
-    stack: Vec<StackEntry<'a, T, D, CAP>>,
+    stack: Vec<StackEntry<'a, T, CAP>>,
     /// The total, in dimension `D`, of everything before the current item.
     position: D,
     /// True once the cursor has moved past the last item.
@@ -104,7 +100,6 @@ impl<'a, T: Item, D: Dimension<T::Summary>, const CAP: usize> Cursor<'a, T, D, C
             self.stack.push(StackEntry {
                 tree: self.tree,
                 index: 0,
-                position: D::zero(),
             });
         }
 
@@ -146,7 +141,6 @@ impl<'a, T: Item, D: Dimension<T::Summary>, const CAP: usize> Cursor<'a, T, D, C
                     self.stack.push(StackEntry {
                         tree: &children[index],
                         index: 0,
-                        position: self.position.clone(),
                     });
                 }
                 Node::Leaf { .. } => {
@@ -283,8 +277,8 @@ mod tests {
         assert_eq!(pair.0, Count(2));
         assert_eq!(pair.1, s);
 
-        let mut nothing = <() as Dimension<Totals>>::zero();
-        nothing.add_summary(&s);
+        <() as Dimension<Totals>>::zero();
+        ().add_summary(&s);
     }
 
     #[test]

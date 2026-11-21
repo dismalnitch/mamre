@@ -2,6 +2,12 @@ use std::{iter, sync::Arc};
 
 use crate::{ArrayVec, Item, Node, SumTree, Summary};
 
+impl<T: Item, const CAP: usize> Default for SumTree<T, CAP> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Item, const CAP: usize> SumTree<T, CAP> {
     /// An empty tree: the root is an empty leaf, so every tree has a root.
     pub fn new() -> Self {
@@ -78,8 +84,6 @@ impl<T: Item, const CAP: usize> SumTree<T, CAP> {
             self.grow_root(split_off, side);
         }
     }
-
-    pub fn slice(&self) {}
 
     /// Every item, in order.
     pub fn items(&self) -> Vec<T> {
@@ -178,17 +182,17 @@ fn sum_all<S: Summary, const CAP: usize>(children: &ArrayVec<S, CAP>) -> S {
     for child in children.iter() {
         s.concat(child);
     }
-    return s;
+    s
 }
 
 impl<T: Item, const CAP: usize> Node<T, CAP> {
-    pub fn summary(&self) -> &T::Summary {
+    pub(crate) fn summary(&self) -> &T::Summary {
         match self {
             Node::Internal { summary, .. } | Node::Leaf { summary, .. } => summary,
         }
     }
 
-    pub fn height(&self) -> u8 {
+    pub(crate) fn height(&self) -> u8 {
         match self {
             Node::Internal { height, .. } => *height,
             Node::Leaf { .. } => 0,
@@ -328,7 +332,7 @@ impl<T: Item, const CAP: usize> Node<T, CAP> {
         }
     }
 
-    pub fn push(&mut self, in_item: T) -> Option<SumTree<T, CAP>> {
+    pub(crate) fn push(&mut self, in_item: T) -> Option<SumTree<T, CAP>> {
         match self {
             Node::Internal { .. } => {
                 self.update_edge_child(Side::Back, |child| child.push(in_item))
