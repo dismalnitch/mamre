@@ -147,6 +147,11 @@ impl<T: Clone> OpLog<T> {
         }
     }
 
+    /// Where the run holding event `lv` ends: the event after its last.
+    pub(crate) fn run_end(&self, lv: Lv) -> Lv {
+        self.run_of(lv).end()
+    }
+
     /// Just the operation of event `lv`.
     pub(crate) fn op(&self, lv: Lv) -> Op<T> {
         let run = self.run_of(lv);
@@ -528,9 +533,17 @@ impl<T> OpLog<T> {
         let mut seen = vec![false; self.len()];
         let mut stack: Vec<Lv> = version.to_vec();
         while let Some(lv) = stack.pop() {
-            if !seen[lv] {
-                seen[lv] = true;
-                stack.extend(self.parents(lv));
+            // Down its run, each event the only parent of the next, to the
+            // start or to what's already seen.
+            let run = self.run_of(lv);
+            let mut x = lv;
+            while !seen[x] {
+                seen[x] = true;
+                if x == run.start {
+                    stack.extend(&run.parents);
+                    break;
+                }
+                x -= 1;
             }
         }
         seen

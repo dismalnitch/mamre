@@ -111,6 +111,11 @@ impl<'a, T: Clone> Changes<'a, T> {
 
     /// Event `lv`'s item goes in at `pos`.
     pub(crate) fn insert(&mut self, pos: usize, lv: Lv) {
+        self.insert_run(pos, lv, 1);
+    }
+
+    /// The items of events `lv..lv + n`, one run in the log, go in at `pos`.
+    pub(crate) fn insert_run(&mut self, pos: usize, lv: Lv, n: usize) {
         // Typing: the next event of the same run, just after the last.
         // Today the next event of a run always lands right after: it sticks
         // to the last, and anything that could come between would include
@@ -124,12 +129,12 @@ impl<'a, T: Clone> Changes<'a, T> {
         }) = self.out.last_mut()
             && *first + items.len() == lv
             && *at + items.len() == pos
-            && let Some(more) = self.log.items(*first, items.len() + 1)
+            && let Some(more) = self.log.items(*first, items.len() + n)
         {
             *items = more;
             return;
         }
-        let items = self.log.items(lv, 1).expect("an insert has an item");
+        let items = self.log.items(lv, n).expect("inserts of one run");
         self.out.push(Change::Insert {
             pos,
             items,
@@ -139,20 +144,26 @@ impl<'a, T: Clone> Changes<'a, T> {
 
     /// The item at `pos` goes.
     pub(crate) fn delete(&mut self, pos: usize) {
+        self.delete_run(pos, 1);
+    }
+
+    /// The item at `pos` goes, `n` times over: the `n` items from `pos`.
+    pub(crate) fn delete_run(&mut self, pos: usize, n: usize) {
         if let Some(Change::Delete { range }) = self.out.last_mut() {
-            // Deleting forward: the next item has moved up to the start.
+            // Deleting forward: the next items have moved up to the start.
             if pos == range.start {
-                range.end += 1;
+                range.end += n;
                 return;
             }
-            // Backspacing: the one before.
+            // Backspacing: the one before, then what's moved up after it.
             if pos + 1 == range.start {
                 range.start -= 1;
+                range.end += n - 1;
                 return;
             }
         }
         self.out.push(Change::Delete {
-            range: pos..pos + 1,
+            range: pos..pos + n,
         });
     }
 }
@@ -285,10 +296,12 @@ impl SeekTarget<Counts, Counts> for At<'_> {
     }
 }
 
-/// What a walk cost: events replayed, and records it ended with.
+/// What a walk cost: events replayed, how many of them took a full step
+/// (not critical, and first of their run), and records it ended with.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Stats {
     pub replayed: usize,
+    pub stepped: usize,
     pub records: usize,
 }
 
@@ -298,11 +311,13 @@ struct Walk<'a, T> {
     /// The prepare version, as its latest events.
     prepared: Vec<Lv>,
     /// Where each run of inserts begins, its first key, and how far it's
-    /// got; and each delete's target, by key and id.
+    /// got; and the item each delete deleted.
     starts: BTreeMap<Lv, (Key, usize)>,
-    targets: HashMap<Lv, (Key, usize)>,
-    /// How many events were replayed: what a merge cost.
+    targets: HashMap<Lv, usize>,
+    /// How many events were replayed, and stepped in full: what a merge
+    /// cost.
     replayed: usize,
+    stepped: usize,
     /// Nothing has touched the records since they were made.
     fresh: bool,
 }
@@ -342,33 +357,51 @@ impl<T: Clone> OpLog<T> {
         let critical = self.critical_points(&order, &old, &new, &base);
         let mut walk = Walk::new(self, base);
         let mut out = Changes::new(self);
-        for (&(lv, output), &critical) in order.iter().zip(&critical) {
-            if critical {
-                // It saw everything replayed so far, and everything after
-                // it sees it: its position is final, and nothing will ever
-                // reach back past it. Apply it as it is, and start afresh
-                // from it.
-                walk.replayed += 1;
+        let mut i = 0;
+        while i < order.len() {
+            let (lv, output) = order[i];
+            // It and the rest of its run replayed straight after it, alike
+            // critical or not: each the last one's only child, carrying on
+            // what it did.
+            let end = self.run_end(lv);
+            let mut j = i + 1;
+            while j < order.len()
+                && order[j] == (order[j - 1].0 + 1, output)
+                && order[j].0 < end
+                && critical[j] == critical[i]
+            {
+                j += 1;
+            }
+            let n = j - i;
+            if critical[i] {
+                // Each saw everything replayed before it, and everything
+                // after sees it: its position is final, and nothing will
+                // ever reach back past it. Apply them as they are, and
+                // start afresh from the last.
+                walk.replayed += n;
                 if output {
                     match self.op(lv) {
-                        Op::Insert { pos, .. } => out.insert(pos, lv),
-                        Op::Delete { pos } => out.delete(pos),
+                        Op::Insert { pos, .. } => out.insert_run(pos, lv, n),
+                        Op::Delete { pos } => out.delete_run(pos, n),
                     }
                 }
+                let last = lv + n - 1;
                 if walk.fresh {
                     walk.prepared.clear();
-                    walk.prepared.push(lv);
+                    walk.prepared.push(last);
                 } else {
-                    let replayed = walk.replayed;
-                    walk = Walk::new(self, vec![lv]);
-                    walk.replayed = replayed;
+                    let (replayed, stepped) = (walk.replayed, walk.stepped);
+                    walk = Walk::new(self, vec![last]);
+                    (walk.replayed, walk.stepped) = (replayed, stepped);
                 }
             } else {
-                walk.step(lv, output.then_some(&mut out));
+                walk.step_run(lv, n, output.then_some(&mut out));
             }
+            i = j;
         }
         let stats = Stats {
             replayed: walk.replayed,
+            stepped: walk.stepped,
             records: walk.records.iter().count(),
         };
         (out.out, stats)
@@ -403,7 +436,9 @@ impl<T: Clone> OpLog<T> {
         frontier.sort_unstable();
         let mut parents: Vec<Lv> = Vec::new();
         let mut candidates: Vec<usize> = Vec::new();
-        for (i, &(lv, _)) in order.iter().enumerate() {
+        let mut i = 0;
+        while i < order.len() {
+            let lv = order[i].0;
             parents.clear();
             parents.extend(self.parents(lv));
             parents.sort_unstable();
@@ -413,17 +448,28 @@ impl<T: Clone> OpLog<T> {
             {
                 candidates.pop();
             }
+            // The rest of its run replayed straight after it: each one's
+            // only parent is the one before, replayed just before it, so
+            // none rules out a candidate, and each sees everything if the
+            // first did.
+            let end = self.run_end(lv);
+            let mut j = i + 1;
+            while j < order.len() && order[j].0 == order[j - 1].0 + 1 && order[j].0 < end {
+                j += 1;
+            }
+            let last = order[j - 1].0;
             let sees_everything = parents == frontier;
             if sees_everything {
                 // The usual case, typing: the frontier becomes just this.
                 frontier.clear();
-                frontier.push(lv);
-                candidates.push(i);
+                frontier.push(last);
+                candidates.extend(i..j);
             } else {
                 frontier.retain(|f| !parents.contains(f));
-                frontier.push(lv);
+                frontier.push(last);
                 frontier.sort_unstable();
             }
+            i = j;
         }
         let mut critical = vec![false; order.len()];
         for c in candidates {
@@ -446,6 +492,7 @@ impl<'a, T: Clone> Walk<'a, T> {
             starts: BTreeMap::new(),
             targets: HashMap::new(),
             replayed: 0,
+            stepped: 0,
             fresh: true,
         }
     }
@@ -454,6 +501,7 @@ impl<'a, T: Clone> Walk<'a, T> {
 impl<'a, T: Clone> Walk<'a, T> {
     fn step(&mut self, lv: Lv, out: Option<&mut Changes<'a, T>>) {
         self.replayed += 1;
+        self.stepped += 1;
         self.fresh = false;
         let event = self.log.event(lv);
         // Move the prepare version to this event's parents: take back what
@@ -463,18 +511,119 @@ impl<'a, T: Clone> Walk<'a, T> {
         // there; for typing, the parents are the last event, and there's
         // nothing to move.
         let (retreat, mut advance) = self.log.diff(&self.prepared, &event.parents);
-        for x in retreat {
-            self.shift(x, false);
-        }
+        self.shift_all(&retreat, false);
         advance.reverse();
-        for x in advance {
-            self.shift(x, true);
-        }
+        self.shift_all(&advance, true);
         match event.op {
             Op::Insert { pos, .. } => self.insert(lv, pos, out),
             Op::Delete { pos } => self.delete(lv, pos, out),
         }
         self.prepared = vec![lv];
+    }
+
+    /// Replays events `lv..lv + n`, one run in the log: each the only child
+    /// of the one before, carrying on what it did. The first steps as any
+    /// event does; the rest need no shifting (their parents are the
+    /// prepare version by then), and nothing can come between their items
+    /// (anything that could would include them, and so replay after), so
+    /// typing extends one record, and deleting forward deletes what's
+    /// there, a record at a time.
+    fn step_run(&mut self, lv: Lv, n: usize, mut out: Option<&mut Changes<'a, T>>) {
+        self.step(lv, out.as_deref_mut());
+        if n == 1 {
+            return;
+        }
+        let rest = lv + 1..lv + n;
+        let done = if self.log.is_insert(lv) {
+            self.carry_on_typing(lv, n - 1, out.as_deref_mut())
+        } else {
+            self.carry_on_deleting(lv, n - 1, out.as_deref_mut());
+            true
+        };
+        if done {
+            self.replayed += n - 1;
+            self.prepared = vec![lv + n - 1];
+        } else {
+            for x in rest {
+                self.step(x, out.as_deref_mut());
+            }
+        }
+    }
+
+    /// Puts in the `n` inserts after `lv`, which just went in, by extending
+    /// its record, if its keys can carry on that far before what's next.
+    /// Whether it did.
+    fn carry_on_typing(&mut self, lv: Lv, n: usize, out: Option<&mut Changes<'a, T>>) -> bool {
+        let (&first, (run_key, len)) = self
+            .starts
+            .range(..=lv)
+            .next_back()
+            .expect("the insert just started or carried on a run");
+        debug_assert_eq!(first + len, lv + 1, "the insert ends its run");
+        let key = self.key_of(lv);
+        let last = run_key.extended(lv + n - first);
+        let mut cursor = self.records.cursor::<Counts>();
+        cursor.seek(&At(&key), Bias::Left);
+        let record = cursor.item().expect("the insert is in the tree");
+        debug_assert!(record.last == key && record.prepare == Prepare::Inserted && !record.gone);
+        cursor.next();
+        // Defensive, as in `extend`.
+        if cursor.item().is_some_and(|next| next.key <= last) {
+            return false;
+        }
+        self.records.update_at(&At(&key), Bias::Left, |r| {
+            r.len += n;
+            r.last = last;
+        });
+        self.starts.get_mut(&first).expect("found above").1 += n;
+        if let Some(out) = out {
+            out.insert_run(self.effect_pos(&key, lv) + 1, lv + 1, n);
+        }
+        true
+    }
+
+    /// The `n` deletes after `lv`, each at the same place as it: the next
+    /// `n` items the prepare version shows there, a record at a time.
+    fn carry_on_deleting(&mut self, lv: Lv, n: usize, mut out: Option<&mut Changes<'a, T>>) {
+        let Op::Delete { pos } = self.log.op(lv) else {
+            unreachable!("a run of deletes")
+        };
+        let mut x = lv + 1;
+        while x <= lv + n {
+            let (record, offset) = {
+                let mut cursor = self.records.cursor::<Counts>();
+                cursor.seek(&Prepared(pos), Bias::Right);
+                let record = cursor
+                    .item()
+                    .expect("the placeholder never runs out")
+                    .clone();
+                (record, pos - cursor.start().prepared)
+            };
+            // The item there is the first the prepare version shows after
+            // the one just deleted, and a record's items are all in one
+            // state: so it starts its record.
+            debug_assert_eq!(offset, 0, "an item after a deleted one starts its record");
+            let m = (lv + n + 1 - x).min(record.len);
+            if m < record.len {
+                self.split(&record, m);
+            }
+            let id = record.id;
+            let key = record.item_key(id);
+            let was_gone = self
+                .records
+                .update_at(&At(&key), Bias::Left, |r| {
+                    r.prepare = Prepare::Deleted(1);
+                    std::mem::replace(&mut r.gone, true)
+                })
+                .expect("the items are in the tree");
+            for k in 0..m {
+                self.targets.insert(x + k, id + k);
+            }
+            if !was_gone && let Some(out) = out.as_deref_mut() {
+                out.delete_run(self.effect_pos(&key, id), m);
+            }
+            x += m;
+        }
     }
 
     /// The key of insert `lv`'s item.
@@ -500,38 +649,83 @@ impl<'a, T: Clone> Walk<'a, T> {
         (record, cursor.start().clone())
     }
 
-    /// Advances (`forward`) or retreats event `x` in the prepare version.
-    fn shift(&mut self, x: Lv, forward: bool) {
-        let insert = self.log.is_insert(x);
-        let (key, id) = if insert {
-            (self.key_of(x), x)
-        } else {
-            self.targets[&x].clone()
-        };
-        self.isolate(&key, id);
-        self.records.update_at(&At(&key), Bias::Left, |r| {
-            r.prepare = match (insert, forward, r.prepare) {
-                (true, true, Prepare::NotYet) => Prepare::Inserted,
-                (true, false, Prepare::Inserted) => Prepare::NotYet,
-                (false, true, Prepare::Inserted) => Prepare::Deleted(1),
-                (false, true, Prepare::Deleted(n)) => Prepare::Deleted(n + 1),
-                (false, false, Prepare::Deleted(1)) => Prepare::Inserted,
-                (false, false, Prepare::Deleted(n)) => Prepare::Deleted(n - 1),
-                (_, _, state) => unreachable!("shifting {x} from {state:?}"),
-            };
-        });
+    /// Advances (`forward`) or retreats `events`, in order. Runs of them
+    /// shift together: inserts one after another, whose items are too, and
+    /// deletes of items side by side (deleting forward, or backspacing).
+    /// Each run costs a split at either end and a change per record, not
+    /// per item, and leaves its items in as few records as they were.
+    fn shift_all(&mut self, events: &[Lv], forward: bool) {
+        let mut i = 0;
+        while i < events.len() {
+            let insert = self.log.is_insert(events[i]);
+            // The item each event shifts.
+            let item = |x: Lv| if insert { x } else { self.targets[&x] };
+            let first = item(events[i]);
+            let (mut lo, mut hi) = (first, first);
+            let mut j = i + 1;
+            // Which way the items go, once there are two.
+            let mut step: Option<bool> = None;
+            while let Some(&x) = events.get(j)
+                && self.log.is_insert(x) == insert
+            {
+                let next = item(x);
+                let up = match step {
+                    Some(up) => up,
+                    None if next == hi + 1 => true,
+                    None if next + 1 == lo => false,
+                    None => break,
+                };
+                if up && next == hi + 1 {
+                    hi = next;
+                } else if !up && next + 1 == lo {
+                    lo = next;
+                } else {
+                    break;
+                }
+                step = Some(up);
+                j += 1;
+            }
+            self.shift_items(lo, hi, insert, forward);
+            i = j;
+        }
     }
 
-    /// Splits item `id` (whose key is `key`) out of its record, so its state
-    /// can change alone.
-    fn isolate(&mut self, key: &Key, id: usize) {
-        let (record, _) = self.record_at(key);
-        let offset = id - record.id;
-        if offset + 1 < record.len {
-            self.split(&record, offset + 1);
+    /// Advances (`forward`) or retreats an insert of, or a delete of each
+    /// of, items `lo..=hi`.
+    fn shift_items(&mut self, lo: usize, hi: usize, insert: bool, forward: bool) {
+        let mut id = lo;
+        while id <= hi {
+            let key = self.item_key(id);
+            let (record, _) = self.record_at(&key);
+            // This record's share of the items: split it out.
+            let end = (record.id + record.len).min(hi + 1);
+            if end < record.id + record.len {
+                self.split(&record, end - record.id);
+            }
+            if id > record.id {
+                self.split(&record, id - record.id);
+            }
+            self.records.update_at(&At(&key), Bias::Left, |r| {
+                r.prepare = match (insert, forward, r.prepare) {
+                    (true, true, Prepare::NotYet) => Prepare::Inserted,
+                    (true, false, Prepare::Inserted) => Prepare::NotYet,
+                    (false, true, Prepare::Inserted) => Prepare::Deleted(1),
+                    (false, true, Prepare::Deleted(n)) => Prepare::Deleted(n + 1),
+                    (false, false, Prepare::Deleted(1)) => Prepare::Inserted,
+                    (false, false, Prepare::Deleted(n)) => Prepare::Deleted(n - 1),
+                    (_, _, state) => unreachable!("shifting item {id} from {state:?}"),
+                };
+            });
+            id = end;
         }
-        if offset > 0 {
-            self.split(&record, offset);
+    }
+
+    /// The key of item `id`: an insert's, or the base document's.
+    fn item_key(&self, id: usize) -> Key {
+        if id >= BASE_ITEM {
+            Key::base_item(id - BASE_ITEM)
+        } else {
+            self.key_of(id)
         }
     }
 
@@ -765,7 +959,7 @@ impl<'a, T: Clone> Walk<'a, T> {
                 std::mem::replace(&mut r.gone, true)
             })
             .expect("the item is in the tree");
-        self.targets.insert(lv, (key.clone(), id));
+        self.targets.insert(lv, id);
         // Already deleted in the effect version by a concurrent delete:
         // nothing more to do to the document.
         if !was_gone && let Some(out) = out {
@@ -926,6 +1120,73 @@ mod tests {
             change.apply(&mut doc);
         }
         assert_eq!(doc, log.checkout(&log.union(&from, &n)));
+    }
+
+    /// One person typing and deleting never needs the full step: each
+    /// event saw everything before it, and everything after sees it.
+    #[test]
+    fn typing_alone_is_all_critical() {
+        let mut log: OpLog<char> = OpLog::new();
+        let alice = log.agent("alice");
+        let mut v = log.add_insert(alice, &[], 0, "hello world".chars());
+        v = log.add_delete(alice, &v, 5..11);
+        v = log.add_insert(alice, &v, 0, "oh, ".chars());
+        v = log.add_delete(alice, &v, 0..1);
+        let (changes, stats) = log.walk(&[], &v);
+        assert_eq!(stats.stepped, 0);
+        assert_eq!(stats.replayed, log.len());
+        // Each edit, one change.
+        assert_eq!(changes.len(), 4);
+        assert_eq!(log.checkout(&v).into_iter().collect::<String>(), "h, hello");
+    }
+
+    /// Concurrent typing steps a run at a time: each run's first event in
+    /// full, the rest carrying on from it.
+    #[test]
+    fn a_concurrent_run_steps_once() {
+        let mut log: OpLog<char> = OpLog::new();
+        let (alice, bob) = (log.agent("alice"), log.agent("bob"));
+        let a = log.add_insert(alice, &[], 0, "hello".chars());
+        let b = log.add_insert(bob, &[], 0, "world".chars());
+        let mut gone = log.add_delete(bob, &b, 1..4);
+        gone = log.union(&a, &gone);
+        let (_, stats) = log.walk(&[], &gone);
+        assert_eq!(stats.replayed, log.len());
+        assert!(stats.stepped <= 3, "{} stepped", stats.stepped);
+        assert_eq!(log.checkout(&gone), crate::reference::checkout(&log, &gone));
+    }
+
+    /// A fork from inside a run: an event whose parents are partway along
+    /// someone's typing, with another branch already going. Syncing whole
+    /// logs never makes one, but syncing part of one can. Which ops show a
+    /// mistake depends on how the two roots order, so try several.
+    #[test]
+    fn a_fork_from_inside_a_run() {
+        for fork in [
+            Op::Insert { pos: 0, item: 'y' },
+            Op::Insert { pos: 1, item: 'y' },
+            Op::Insert { pos: 2, item: 'y' },
+            Op::Delete { pos: 0 },
+            Op::Delete { pos: 1 },
+        ] {
+            let mut log: OpLog<char> = OpLog::new();
+            let (bob, alice, carol) = (log.agent("bob"), log.agent("alice"), log.agent("carol"));
+            log.add_event(bob, 0, &[], Op::Insert { pos: 0, item: 'x' });
+            for (k, c) in "abc".chars().enumerate() {
+                let parents: Vec<Lv> = k.checked_sub(1).map(|p| p + 1).into_iter().collect();
+                log.add_event(alice, k as u64, &parents, Op::Insert { pos: k, item: c });
+            }
+            assert_eq!(log.runs(), 2, "alice's typing is one run");
+            // Carol saw bob's and alice's first, not the rest of her run.
+            log.add_event(carol, 0, &[0, 1], fork.clone());
+            for v in [vec![4], vec![3, 4], vec![0, 4]] {
+                assert_eq!(
+                    log.checkout(&v),
+                    crate::reference::checkout(&log, &v),
+                    "{fork:?} at {v:?}"
+                );
+            }
+        }
     }
 
     /// Typing makes runs: a document typed in a few stretches, with the
