@@ -42,7 +42,8 @@ use std::marker::PhantomData;
 use std::ops::Range;
 
 use arrayvec::ArrayString;
-use mamre::{Item, SumTree, cursor::Bias};
+use mamre::cursor::{Bias, Cursor};
+use mamre::{Item, SumTree};
 
 pub use angela::Angela;
 pub use measure::{Markdown, Measure, Plain, Prose};
@@ -187,10 +188,13 @@ impl<M: Measure, const N: usize> Rope<M, N> {
     /// Panics if `range` is out of bounds or doesn't fall on `char`
     /// boundaries.
     pub fn replace(&mut self, range: Range<usize>, text: &str) {
-        self.check_range(&range);
+        // Char boundaries are checked where the text is to hand: on the
+        // chunks an edit in place touches, and otherwise here.
+        self.check_bounds(&range);
         if self.replace_in_chunk(&range, text) {
             return;
         }
+        self.check_range(&range);
         let mut out = self.prefix(range.start);
         out.push_str(text);
         out.append(self.suffix_from(range.end));
@@ -306,54 +310,51 @@ impl<M: Measure, const N: usize> Rope<M, N> {
         Ok(())
     }
 
-    /// Replaces `range` inside the one chunk holding it, in place, if the
-    /// result still fits in a few chunks and keeps them as full as they must
-    /// be: most edits, typing above all. One that overflows its chunk
-    /// becomes a few, as even as char boundaries allow, spliced in where it
-    /// was. Either way only the path down to the chunk is copied. Whether
-    /// it did.
+    /// Replaces `range` in place, when it touches only a few chunks: most
+    /// edits, typing above all. Inside one chunk that still holds it, with
+    /// no neighbour that would fit alongside, the chunk is just changed;
+    /// otherwise the chunks it touches are rewritten (see `replace_chunks`).
+    /// Either way only paths down to chunks are copied. Whether it did.
     fn replace_in_chunk(&mut self, range: &Range<usize>, text: &str) -> bool {
-        // At the very end, the last chunk, so typing at the end grows it.
-        let bias = if range.start == self.len() {
-            Bias::Left
-        } else {
-            Bias::Right
-        };
-        let mut cursor = self.tree.cursor::<ByteOffset>();
-        cursor.seek(&ByteOffset(range.start), bias);
-        let Some(chunk) = cursor.item() else {
-            return false;
-        };
-        let start = cursor.start().0;
-        let (a, b) = (range.start - start, range.end - start);
-        let len = chunk.text.len();
-        if b > len {
-            return false;
-        }
-        let new_len = len - (b - a) + text.len();
-        // More than this many chunks is a big insert: slicing is as good.
-        const MOST: usize = 4;
-        let pieces = new_len.div_ceil(N);
-        if new_len == 0 || pieces > MOST {
-            return false;
-        }
-        // Neither neighbour may fit alongside what's next to it.
-        let neighbour = |forward: bool| {
-            let mut around = cursor.clone();
-            if forward {
-                around.next();
-            } else {
-                around.prev();
-            }
-            around.item().map_or(0, |c| c.text.len())
-        };
-        let fits = |a: usize, b: usize| a > 0 && b > 0 && a + b <= N;
-
-        if pieces == 1 {
-            if new_len < len && (fits(neighbour(false), new_len) || fits(new_len, neighbour(true)))
-            {
+        let (bias, start, a, b, len, neighbours_fit) = {
+            let Some((cursor, bias)) = self.seek_chunk(range.start) else {
                 return false;
+            };
+            let chunk = cursor.item().expect("seek_chunk lands on a chunk");
+            let start = cursor.start().0;
+            let len = chunk.text.len();
+            for at in [range.start, range.end] {
+                if at - start <= len {
+                    assert!(
+                        chunk.text.is_char_boundary(at - start),
+                        "byte {at} is not a char boundary"
+                    );
+                }
             }
+            let new_len = (len + text.len()).saturating_sub(range.len());
+            let neighbour = |forward: bool| {
+                let mut around = cursor.clone();
+                if forward {
+                    around.next();
+                } else {
+                    around.prev();
+                }
+                around.item().map_or(0, |c| c.text.len())
+            };
+            let neighbours_fit = range.end - start <= len
+                && new_len < len
+                && (fits::<N>(neighbour(false), new_len) || fits::<N>(new_len, neighbour(true)));
+            (
+                bias,
+                start,
+                range.start - start,
+                range.end - start,
+                len,
+                neighbours_fit,
+            )
+        };
+        let new_len = (len + text.len()).saturating_sub(range.len());
+        if b <= len && new_len > 0 && new_len <= N && !neighbours_fit {
             self.tree
                 .update_at::<ByteOffset, _>(&ByteOffset(range.start), bias, |chunk| {
                     let mut edited = ArrayString::new();
@@ -364,14 +365,72 @@ impl<M: Measure, const N: usize> Rope<M, N> {
                 });
             return true;
         }
+        self.replace_chunks(range, text, start)
+    }
 
-        let mut edited = String::with_capacity(new_len);
-        edited.push_str(&chunk.text[..a]);
+    /// The chunk holding byte `at`, and the bias that finds it: at the very
+    /// end, the last chunk, so typing at the end grows it. `None` for an
+    /// empty rope.
+    fn seek_chunk(&self, at: usize) -> Option<(Cursor<'_, Chunk<M, N>, ByteOffset>, Bias)> {
+        let bias = if at == self.len() {
+            Bias::Left
+        } else {
+            Bias::Right
+        };
+        let mut cursor = self.tree.cursor::<ByteOffset>();
+        cursor.seek(&ByteOffset(at), bias);
+        cursor.item()?;
+        Some((cursor, bias))
+    }
+
+    /// Replaces `range` by rewriting the chunks it touches (up to eight,
+    /// the first starting at byte `start`) as however many even chunks the
+    /// result needs (up to four): overwritten in place, extras spliced in
+    /// after, leftovers removed. Then a neighbour that now fits alongside
+    /// either end merges into it: once each end is enough, since a merged
+    /// chunk is bigger than the old neighbour, which didn't fit with its
+    /// own, and even pieces never fit two to one. Whether it did.
+    fn replace_chunks(&mut self, range: &Range<usize>, text: &str, start: usize) -> bool {
+        // More than these is a big edit: slicing is as good.
+        const MOST_OLD: usize = 8;
+        const MOST_NEW: usize = 4;
+        let mut old = String::new();
+        let mut k = 0;
+        {
+            let mut cursor = self.tree.cursor::<ByteOffset>();
+            cursor.seek(&ByteOffset(start), Bias::Right);
+            while let Some(chunk) = cursor.item() {
+                old.push_str(&chunk.text);
+                k += 1;
+                if start + old.len() >= range.end {
+                    break;
+                }
+                if k == MOST_OLD {
+                    return false;
+                }
+                cursor.next();
+            }
+        }
+        if k == 0 || start + old.len() < range.end {
+            return false;
+        }
+        for at in [range.start, range.end] {
+            assert!(
+                old.is_char_boundary(at - start),
+                "byte {at} is not a char boundary"
+            );
+        }
+        let mut edited = String::with_capacity(old.len() + text.len());
+        edited.push_str(&old[..range.start - start]);
         edited.push_str(text);
-        edited.push_str(&chunk.text[b..]);
-        let mut chunks: Vec<Chunk<M, N>> = Vec::with_capacity(pieces);
+        edited.push_str(&old[range.end - start..]);
+        let m = edited.len().div_ceil(N);
+        if m > MOST_NEW {
+            return false;
+        }
+        let mut pieces: Vec<Chunk<M, N>> = Vec::with_capacity(m);
         let mut rest = edited.as_str();
-        for left in (1..=pieces).rev() {
+        for left in (1..=m).rev() {
             let take = if left == 1 {
                 rest.len()
             } else {
@@ -380,25 +439,73 @@ impl<M: Measure, const N: usize> Rope<M, N> {
             if take == 0 || take > N {
                 return false;
             }
-            chunks.push(Chunk::new(&rest[..take]));
+            pieces.push(Chunk::new(&rest[..take]));
             rest = &rest[take..];
         }
         // Even pieces of more than a chunk never fit two to one (shaving to
         // char boundaries could only matter for tiny chunks), but check.
-        let lens: Vec<usize> = chunks.iter().map(|c| c.text.len()).collect();
-        if lens.windows(2).any(|w| fits(w[0], w[1]))
-            || fits(neighbour(false), lens[0])
-            || fits(lens[lens.len() - 1], neighbour(true))
+        if pieces
+            .windows(2)
+            .any(|w| fits::<N>(w[0].text.len(), w[1].text.len()))
         {
             return false;
         }
-        self.tree
-            .splice_at::<ByteOffset, _, _>(&ByteOffset(range.start), bias, |chunk| {
-                let mut chunks = chunks.into_iter();
-                *chunk = chunks.next().expect("two chunks or more");
-                ((), chunks)
-            });
+
+        // Overwrite in order: each piece starts where the last one ended.
+        let mut at = start;
+        let mut pieces = pieces.into_iter();
+        for _ in 0..m.min(k) {
+            let piece = pieces.next().expect("m pieces");
+            let piece_len = piece.text.len();
+            self.tree
+                .update_at::<ByteOffset, _>(&ByteOffset(at), Bias::Right, |chunk| *chunk = piece);
+            at += piece_len;
+        }
+        if m > k {
+            // The rest go after the last one overwritten.
+            self.tree
+                .splice_at::<ByteOffset, _, _>(&ByteOffset(at - 1), Bias::Right, |_| {
+                    ((), pieces.collect::<Vec<_>>())
+                });
+        }
+        for _ in m..k {
+            // Each leftover moves up to where the new text ends.
+            self.tree
+                .remove_at::<ByteOffset>(&ByteOffset(at), Bias::Right);
+        }
+        self.merge_at(start);
+        self.merge_at(start + edited.len());
         true
+    }
+
+    /// Merges the chunks either side of byte `offset`, if it's between two
+    /// and they fit in one.
+    fn merge_at(&mut self, offset: usize) {
+        if offset == 0 || offset >= self.len() {
+            return;
+        }
+        let right = {
+            let mut cursor = self.tree.cursor::<ByteOffset>();
+            cursor.seek(&ByteOffset(offset), Bias::Left);
+            let Some(left) = cursor.item() else {
+                return;
+            };
+            if cursor.start().0 + left.text.len() != offset {
+                return;
+            }
+            let left_len = left.text.len();
+            cursor.next();
+            match cursor.item() {
+                Some(right) if left_len + right.text.len() <= N => right.text,
+                _ => return,
+            }
+        };
+        self.tree
+            .update_at::<ByteOffset, _>(&ByteOffset(offset), Bias::Left, |chunk| {
+                chunk.text.push_str(&right);
+            });
+        self.tree
+            .remove_at::<ByteOffset>(&ByteOffset(offset + right.len()), Bias::Right);
     }
 
     /// Everything before byte `end`.
@@ -452,6 +559,14 @@ impl<M: Measure, const N: usize> Rope<M, N> {
         fits
     }
 
+    fn check_bounds(&self, range: &Range<usize>) {
+        assert!(
+            range.start <= range.end && range.end <= self.len(),
+            "range {range:?} is out of bounds for a rope of {} bytes",
+            self.len()
+        );
+    }
+
     fn check_range(&self, range: &Range<usize>) {
         assert!(
             range.start <= range.end && range.end <= self.len(),
@@ -477,6 +592,11 @@ impl<M: Measure, const N: usize> Rope<M, N> {
 }
 
 /// The largest `char` boundary in `text` at or below `at`.
+/// Whether two chunks of these lengths, both there, would fit in one.
+fn fits<const N: usize>(a: usize, b: usize) -> bool {
+    a > 0 && b > 0 && a + b <= N
+}
+
 fn floor_boundary(text: &str, at: usize) -> usize {
     if at >= text.len() {
         return text.len();

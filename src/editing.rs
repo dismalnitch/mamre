@@ -275,6 +275,41 @@ mod tests {
             );
         }
 
+        /// Removing in place, mixed with splicing, shrinks, borrows, merges
+        /// and collapses as a Vec would, and leaves a shared copy alone.
+        #[test]
+        fn remove_at_matches_a_vec(
+            start in prop::collection::vec(0u64..1000, 0..80),
+            edits in prop::collection::vec((any::<prop::sample::Index>(), 0usize..=4), 1..80),
+        ) {
+            let mut tree = build(&start);
+            let copy = tree.clone();
+            let mut want = start.clone();
+            for (k, (at, more)) in edits.into_iter().enumerate() {
+                if want.is_empty() || more == 4 {
+                    // Grow it again now and then, so there's more to remove.
+                    let at = if want.is_empty() { 0 } else { at.index(want.len()) };
+                    let new: Vec<u64> = (0..3).map(|j| 5000 + 10 * k as u64 + j).collect();
+                    if want.is_empty() {
+                        tree = build(&new);
+                        want = new;
+                    } else {
+                        tree.splice_at::<Count, _, _>(&Count(at), Bias::Right, |_| {
+                            ((), new.iter().map(|&v| N(v)).collect::<Vec<_>>())
+                        });
+                        want.splice(at + 1..at + 1, new);
+                    }
+                } else {
+                    let at = at.index(want.len());
+                    let gone = tree.remove_at::<Count>(&Count(at), Bias::Right);
+                    prop_assert_eq!(gone.map(|n| n.0), Some(want.remove(at)));
+                }
+                holds(&tree, &want)?;
+            }
+            holds(&copy, &start)?;
+            prop_assert!(tree.remove_at::<Count>(&Count(want.len()), Bias::Right).is_none());
+        }
+
         #[test]
         fn remove_matches_a_vec((start, a, b) in setup()) {
             let mut tree = build(&start);

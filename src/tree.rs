@@ -212,6 +212,30 @@ impl<T: Item, const CAP: usize> SumTree<T, CAP> {
         Some(out)
     }
 
+    /// Removes the item a seek for `target` lands on, in place, and returns
+    /// it: `None` if the target is past the last item. Only the path down to
+    /// it is copied if shared; a node left too small on the way back up
+    /// borrows from a sibling, or merges with it when both fit in one, and
+    /// a root left with one child gives way to it. O(log n), where
+    /// [`remove`](Self::remove) slices and rejoins the tree.
+    pub fn remove_at<D: Dimension<T::Summary>>(
+        &mut self,
+        target: &impl SeekTarget<T::Summary, D>,
+        bias: Bias,
+    ) -> Option<T> {
+        let path = self.root.path_to::<D>(target, bias)?;
+        let item = Arc::make_mut(&mut self.root).remove_path(&path);
+        while let Node::Internal { children, .. } = &*self.root
+            && children.len() == 1
+        {
+            let Node::Internal { children, .. } = Arc::make_mut(&mut self.root) else {
+                unreachable!("matched above")
+            };
+            *self = children.pop().expect("one child");
+        }
+        Some(item)
+    }
+
     /// Changes the first item in place, and every summary above it. `None`,
     /// without calling `f`, for an empty tree.
     pub fn update_first<R>(&mut self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
@@ -341,6 +365,96 @@ fn insert_after<E, const CAP: usize>(
         }
     }
     Some(split_off)
+}
+
+/// Child `i` has too few entries: it merges with a sibling if both fit in
+/// one node, and otherwise the two share their entries evenly. Siblings are
+/// at the same height, so both are leaves or both internal.
+fn mend<T: Item, const CAP: usize>(
+    children: &mut ArrayVec<SumTree<T, CAP>, CAP>,
+    child_summaries: &mut ArrayVec<T::Summary, CAP>,
+    i: usize,
+) {
+    let l = if i > 0 { i - 1 } else { i };
+    let (left, right) = children.split_at_mut(l + 1);
+    let (left, right) = (&mut left[l], &mut right[0]);
+    let merge = left.root.len() + right.root.len() <= CAP;
+    let (left_node, right_node) = (
+        Arc::make_mut(&mut left.root),
+        Arc::make_mut(&mut right.root),
+    );
+    match (left_node, right_node) {
+        (
+            Node::Leaf {
+                summary: ls,
+                items: li,
+                item_summaries: lis,
+            },
+            Node::Leaf {
+                summary: rs,
+                items: ri,
+                item_summaries: ris,
+            },
+        ) => {
+            share(li, ri, merge);
+            share(lis, ris, merge);
+            *ls = sum_all(lis);
+            *rs = sum_all(ris);
+        }
+        (
+            Node::Internal {
+                summary: ls,
+                children: lc,
+                child_summaries: lcs,
+                ..
+            },
+            Node::Internal {
+                summary: rs,
+                children: rc,
+                child_summaries: rcs,
+                ..
+            },
+        ) => {
+            share(lc, rc, merge);
+            share(lcs, rcs, merge);
+            *ls = sum_all(lcs);
+            *rs = sum_all(rcs);
+        }
+        _ => unreachable!("siblings are at the same height"),
+    }
+    if merge {
+        children.remove(l + 1);
+        child_summaries.remove(l + 1);
+    } else {
+        child_summaries[l + 1] = children[l + 1].summary().clone();
+    }
+    child_summaries[l] = children[l].summary().clone();
+}
+
+/// Moves entries between neighbours `left` and `right`: all of `right`
+/// into `left` if `merge`, and otherwise so they hold half each (`left`
+/// the smaller half, if odd). Order is kept.
+fn share<E, const CAP: usize>(
+    left: &mut ArrayVec<E, CAP>,
+    right: &mut ArrayVec<E, CAP>,
+    merge: bool,
+) {
+    if merge {
+        left.extend(right.drain(..));
+        return;
+    }
+    let total = left.len() + right.len();
+    let keep = total / 2;
+    if left.len() > keep {
+        // Left's surplus goes to the front of right.
+        let mut moved: ArrayVec<E, CAP> = left.drain(keep..).collect();
+        let n = moved.len();
+        right.extend(moved.drain(..));
+        right.rotate_right(n);
+    } else {
+        let n = keep - left.len();
+        left.extend(right.drain(..n));
+    }
 }
 
 fn sum_all<S: Summary, const CAP: usize>(children: &ArrayVec<S, CAP>) -> S {
@@ -552,6 +666,48 @@ impl<T: Item, const CAP: usize> Node<T, CAP> {
                     });
                 (out, split_off)
             }
+        }
+    }
+
+    /// Removes the item at the end of `path`, refreshing summaries and
+    /// mending any child left too small on the way back up. This node may
+    /// be left too small itself: its parent mends it.
+    fn remove_path(&mut self, path: &[usize]) -> T {
+        let i = path[0];
+        match self {
+            Node::Internal {
+                summary,
+                children,
+                child_summaries,
+                ..
+            } => {
+                let child = &mut children[i];
+                let item = Arc::make_mut(&mut child.root).remove_path(&path[1..]);
+                child_summaries[i] = child.summary().clone();
+                if child.root.len() < CAP / 2 && children.len() > 1 {
+                    mend(children, child_summaries, i);
+                }
+                *summary = sum_all(child_summaries);
+                item
+            }
+            Node::Leaf {
+                summary,
+                items,
+                item_summaries,
+            } => {
+                item_summaries.remove(i);
+                let item = items.remove(i);
+                *summary = sum_all(item_summaries);
+                item
+            }
+        }
+    }
+
+    /// How many entries: children, or items.
+    fn len(&self) -> usize {
+        match self {
+            Node::Internal { children, .. } => children.len(),
+            Node::Leaf { items, .. } => items.len(),
         }
     }
 
