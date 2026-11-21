@@ -42,11 +42,54 @@ pub struct Cursor<'a, T: Item, D: Dimension<T::Summary>, const CAP: usize = CAPS
     at_end: bool,
 }
 
+/// Every item of a tree, in order, by reference. The items borrow from the
+/// tree, not from the iterator, so they can all be held at once.
+///
+/// A wrapper rather than `impl Iterator for Cursor`, because `Cursor` already
+/// has its own `next` (which moves and returns nothing) and the two would
+/// collide.
+#[derive(Clone)]
+pub struct Iter<'a, T: Item, const CAP: usize = CAPSIZE> {
+    /// Tracks the `()` dimension: nothing to add up, so stepping is free.
+    cursor: Cursor<'a, T, (), CAP>,
+}
+
+impl<'a, T: Item, const CAP: usize> Iterator for Iter<'a, T, CAP> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<&'a T> {
+        // The cursor starts before the first item, so move, then look. Past
+        // the end, `next` stays put and `item` keeps saying `None`.
+        self.cursor.next();
+        self.cursor.item()
+    }
+}
+
+/// Once it returns `None`, it always will.
+impl<T: Item, const CAP: usize> std::iter::FusedIterator for Iter<'_, T, CAP> {}
+
+impl<'a, T: Item, const CAP: usize> IntoIterator for &'a SumTree<T, CAP> {
+    type Item = &'a T;
+    type IntoIter = Iter<'a, T, CAP>;
+
+    /// So `for item in &tree` works.
+    fn into_iter(self) -> Iter<'a, T, CAP> {
+        self.iter()
+    }
+}
+
 impl<T: Item, const CAP: usize> SumTree<T, CAP> {
     /// A cursor over this tree that measures and seeks in dimension `D`. It
     /// starts before the first item; `seek` to move it.
     pub fn cursor<D: Dimension<T::Summary>>(&self) -> Cursor<'_, T, D, CAP> {
         Cursor::new(self)
+    }
+
+    /// Every item, in order, by reference.
+    pub fn iter(&self) -> Iter<'_, T, CAP> {
+        Iter {
+            cursor: self.cursor(),
+        }
     }
 }
 
@@ -723,6 +766,39 @@ mod tests {
             proptest::prop_assert_eq!(on.item().map(|w| w.0), lens.get(j).copied());
             proptest::prop_assert_eq!((on.start().count, on.start().len), (j, before[j]));
         }
+
+        /// `iter` and `for item in &tree` give every item in order, then stop
+        /// for good.
+        #[test]
+        fn iter_yields_every_item(lens in proptest::collection::vec(0u64..4, 0..200)) {
+            let tree = tree_of(&lens);
+            proptest::prop_assert_eq!(tree.iter().map(|w| w.0).collect::<Vec<_>>(), lens.clone());
+
+            let mut seen = Vec::new();
+            for word in &tree {
+                seen.push(word.0);
+            }
+            proptest::prop_assert_eq!(&seen, &lens);
+
+            let mut iter = tree.iter();
+            for _ in &lens {
+                iter.next();
+            }
+            proptest::prop_assert!(iter.next().is_none());
+            proptest::prop_assert!(iter.next().is_none());
+        }
+    }
+
+    /// Items borrow from the tree, not the iterator: they outlive it, and
+    /// can all be held at once. This one is checked by compiling.
+    #[test]
+    fn iter_items_outlive_the_iterator() {
+        let tree = tree_of(&[1, 2, 3]);
+        let words: Vec<&Word> = {
+            let iter = tree.iter();
+            iter.collect()
+        };
+        assert_eq!(words.iter().map(|w| w.0).collect::<Vec<_>>(), [1, 2, 3]);
     }
 
     fn tree_of(lens: &[u64]) -> SumTree<Word, 4> {
