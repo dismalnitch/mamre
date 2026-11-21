@@ -1,0 +1,11 @@
+[package]
+name = "mamre-walker"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "An event-graph CRDT after Eg-walker: edits are plain positions, merging replays only what's concurrent, and it works on sequences of any item"
+repository = "https://github.com/dismalnitch/mamre"
+publish = false
+
+[dev-dependencies]
+proptest = "1.12"

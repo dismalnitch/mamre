@@ -9,7 +9,7 @@ publish = false
 
 # The tree is this root package; mixins built on its public API are members.
 [workspace]
-members = ["rope", "diamond"]
+members = ["rope", "diamond", "walker"]
 
 [dev-dependencies]
 proptest = "1.12"
