@@ -117,3 +117,44 @@ pub fn seek(lines: &[Line], target: Target, bias: Bias) -> usize {
 pub fn prefix(lines: &[Line], target: Target, bias: Bias) -> Lines {
     summarize(&lines[..seek(lines, target, bias)])
 }
+
+/// Where a seek lands, then where a second seek lands with the same bias,
+/// never behind the first: the range an edit between them covers.
+pub fn range(lines: &[Line], from: Target, to: Target, bias: Bias) -> std::ops::Range<usize> {
+    let a = seek(lines, from, bias);
+    a..seek(lines, to, bias).max(a)
+}
+
+/// One step of a cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    Next,
+    Prev,
+}
+
+/// Where a cursor is, after seeking to `start` (or starting fresh, before the
+/// first item, if there's none) and then after each step: the item it's on,
+/// and the summary of everything before it.
+///
+/// Before the first item, there's no item and nothing before it. Past the
+/// last, there's no item and everything is before it. A step off either end
+/// lands there, and a step further the same way stays.
+pub fn walk(lines: &[Line], start: Option<(Target, Bias)>, steps: &[Step]) -> Vec<(Option<Line>, Lines)> {
+    // `None` is before the first item; `Some(lines.len())` is past the last.
+    let mut at = start.map(|(target, bias)| seek(lines, target, bias));
+    let here = |at: Option<usize>| match at {
+        None => (None, Lines::default()),
+        Some(i) => (lines.get(i).copied(), summarize(&lines[..i])),
+    };
+    let mut out = vec![here(at)];
+    for step in steps {
+        at = match (step, at) {
+            (Step::Next, None) => Some(0),
+            (Step::Next, Some(i)) => Some((i + 1).min(lines.len())),
+            (Step::Prev, None | Some(0)) => None,
+            (Step::Prev, Some(i)) => Some(i - 1),
+        };
+        out.push(here(at));
+    }
+    out
+}

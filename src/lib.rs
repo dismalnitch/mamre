@@ -1,4 +1,5 @@
 pub mod cursor;
+mod editing;
 pub mod hash;
 mod tree;
 pub mod units;

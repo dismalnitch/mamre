@@ -1,7 +1,7 @@
 //! What the referee needs from a tree. Wire mamre's tree to this trait in
 //! `mamre.rs`; the referee checks it against the model.
 
-use crate::model::{self, Bias, Line, Lines, Target};
+use crate::model::{self, Bias, Line, Lines, Step, Target};
 
 pub trait Subject: Clone + std::fmt::Debug {
     fn new() -> Self;
@@ -32,6 +32,36 @@ pub trait Subject: Clone + std::fmt::Debug {
 
     /// See [`model::prefix`].
     fn prefix(&self, target: Target, bias: Bias) -> Lines;
+
+    /// Replaces the items in [`model::range`] with `lines`.
+    ///
+    /// The default splits and joins; a tree with its own edits should use
+    /// them instead, so the referee checks those.
+    fn replace(&mut self, from: Target, to: Target, bias: Bias, lines: Vec<Line>) {
+        let a = self.seek(from, bias);
+        let b = self.seek(to, bias).max(a);
+        let (mut left, rest) = self.split(Target::Count(a), Bias::Right);
+        let (_, right) = rest.split(Target::Count(b - a), Bias::Right);
+        left.append(Self::from_items(lines));
+        left.append(right);
+        *self = left;
+    }
+
+    /// Puts `lines` in where a seek for `at` lands.
+    fn insert(&mut self, at: Target, bias: Bias, lines: Vec<Line>) {
+        self.replace(at, at, bias, lines);
+    }
+
+    /// Removes the items in [`model::range`].
+    fn remove(&mut self, from: Target, to: Target, bias: Bias) {
+        self.replace(from, to, bias, Vec::new());
+    }
+
+    /// See [`model::walk`]. The default asks the model; a tree with a cursor
+    /// should walk one.
+    fn walk(&self, start: Option<(Target, Bias)>, steps: &[Step]) -> Vec<(Option<Line>, Lines)> {
+        model::walk(&self.items(), start, steps)
+    }
 
     /// The summary of the whole tree.
     fn summary(&self) -> Lines;

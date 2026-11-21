@@ -4,7 +4,7 @@
 use proptest::collection::vec;
 use proptest::prelude::*;
 
-use crate::model::{self, Bias, Line, Target};
+use crate::model::{self, Bias, Line, Step, Target};
 use crate::subject::Subject;
 
 /// A target to seek to, chosen relative to whatever the tree holds when the
@@ -69,8 +69,18 @@ pub enum Op {
     /// Replace the items between two seeks with new ones, by splitting and
     /// joining.
     Splice { from: Aim, to: Aim, insert: Vec<Line> },
+    /// Replace the items between two seeks with new ones, with the tree's
+    /// own edit. Both ends use `from`'s bias.
+    Replace { from: Aim, to: Aim, insert: Vec<Line> },
+    /// Put new items in where a seek lands.
+    Insert { at: Aim, insert: Vec<Line> },
+    /// Remove the items between two seeks. Both ends use `from`'s bias.
+    Remove { from: Aim, to: Aim },
     /// Seek, and check where it lands and the summary before it.
     Seek(Aim),
+    /// Seek (or start fresh, before the first item), then step, checking
+    /// the item and the summary before it after every step.
+    Walk { start: Option<Aim>, steps: Vec<Step> },
 }
 
 /// Applies `op` to both, and returns what went wrong, if anything.
@@ -121,9 +131,45 @@ fn apply<S: Subject>(tree: &mut S, model: &mut Vec<Line>, op: &Op) -> Result<(),
             *tree = left;
             model.splice(a..b, insert.iter().copied());
         }
+        Op::Replace { from, to, insert } => {
+            let (a, bias) = from.resolve(model);
+            let (b, _) = to.resolve(model);
+            let range = model::range(model, a, b, bias);
+            tree.replace(a, b, bias, insert.clone());
+            model.splice(range, insert.iter().copied());
+        }
+        Op::Insert { at, insert } => {
+            let (target, bias) = at.resolve(model);
+            let at = model::seek(model, target, bias);
+            tree.insert(target, bias, insert.clone());
+            model.splice(at..at, insert.iter().copied());
+        }
+        Op::Remove { from, to } => {
+            let (a, bias) = from.resolve(model);
+            let (b, _) = to.resolve(model);
+            let range = model::range(model, a, b, bias);
+            tree.remove(a, b, bias);
+            model.drain(range);
+        }
         Op::Seek(aim) => {
             let (target, bias) = aim.resolve(model);
             check_seek(tree, model, target, bias)?;
+        }
+        Op::Walk { start, steps } => {
+            let start = start.map(|aim| aim.resolve(model));
+            let want = model::walk(model, start, steps);
+            let got = tree.walk(start, steps);
+            if let Some(i) = (0..want.len()).find(|&i| got.get(i) != Some(&want[i])) {
+                let after = match i {
+                    0 => "before any step".to_string(),
+                    i => format!("after step {} ({:?})", i - 1, steps[i - 1]),
+                };
+                return Err(format!(
+                    "walk from {start:?}, {after}: at {:?}, want {:?}",
+                    got.get(i),
+                    want[i]
+                ));
+            }
         }
     }
     Ok(())
@@ -228,8 +274,20 @@ fn op() -> impl Strategy<Value = Op> {
         2 => aim().prop_map(Op::KeepLeft),
         2 => aim().prop_map(Op::KeepRight),
         3 => (aim(), aim(), lines(20)).prop_map(|(from, to, insert)| Op::Splice { from, to, insert }),
+        3 => (aim(), aim(), lines(20)).prop_map(|(from, to, insert)| Op::Replace { from, to, insert }),
+        2 => (aim(), lines(20)).prop_map(|(at, insert)| Op::Insert { at, insert }),
+        2 => (aim(), aim()).prop_map(|(from, to)| Op::Remove { from, to }),
         4 => aim().prop_map(Op::Seek),
+        3 => (prop::option::weighted(0.75, aim()), steps()).prop_map(|(start, steps)| Op::Walk { start, steps }),
     ]
+}
+
+/// Mostly runs one way, so walks reach the ends and step off them, with
+/// turns mixed in.
+fn steps() -> impl Strategy<Value = Vec<Step>> {
+    let run = (prop_oneof![Just(Step::Next), Just(Step::Prev)], 1usize..=12)
+        .prop_map(|(step, n)| vec![step; n]);
+    vec(run, 0..=4).prop_map(|runs| runs.concat())
 }
 
 pub fn ops() -> impl Strategy<Value = Vec<Op>> {
