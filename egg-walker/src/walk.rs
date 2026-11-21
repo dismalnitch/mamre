@@ -776,8 +776,7 @@ impl<'a, T: Clone> Walk<'a, T> {
     /// counted from that item. (The record may have shrunk since `record`
     /// was read, but never from its front.)
     fn split(&mut self, record: &Record, at: usize) {
-        let mut rest = None;
-        self.records.update_at(&At(&record.key), Bias::Left, |r| {
+        self.records.splice_at(&At(&record.key), Bias::Left, |r| {
             debug_assert!(r.id == record.id && at < r.len, "splitting inside a record");
             let mut tail = r.clone();
             tail.id = r.id + at;
@@ -788,10 +787,8 @@ impl<'a, T: Clone> Walk<'a, T> {
             }
             r.len = at;
             r.last = r.item_key(r.id + at - 1);
-            rest = Some(tail);
+            ((), [tail])
         });
-        let before = record.item_key(record.id + at - 1);
-        self.records.insert(&At(&before), Bias::Right, rest);
     }
 
     /// How many items the effect version shows before item `id`, whose key
@@ -836,7 +833,12 @@ impl<'a, T: Clone> Walk<'a, T> {
                     gone: false,
                 };
                 match &next {
-                    Some(n) => self.records.insert(&At(n), Bias::Left, [record]),
+                    // In front of `next`: swap in, and it goes after.
+                    Some(n) => {
+                        self.records.splice_at(&At(n), Bias::Left, |r| {
+                            ((), [std::mem::replace(r, record)])
+                        });
+                    }
                     None => self.records.push(record),
                 }
                 self.starts.insert(lv, (key.clone(), 1));

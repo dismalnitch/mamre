@@ -227,6 +227,54 @@ mod tests {
             holds(&tree, &want)?;
         }
 
+        /// Splicing in place, again and again, grows and splits nodes as a
+        /// Vec would, and leaves a shared copy alone.
+        #[test]
+        fn splice_at_matches_a_vec(
+            start in prop::collection::vec(0u64..1000, 1..60),
+            edits in prop::collection::vec((any::<prop::sample::Index>(), 0u64..1000, 0usize..=4, any::<bool>()), 1..40),
+        ) {
+            let mut tree = build(&start);
+            let copy = tree.clone();
+            let mut want = start.clone();
+            for (k, (at, value, more, before)) in edits.into_iter().enumerate() {
+                let at = at.index(want.len());
+                let new: Vec<u64> = (0..more as u64).map(|j| 5000 + 10 * k as u64 + j).collect();
+                let out = tree.splice_at::<Count, _, _>(&Count(at), Bias::Right, |item| {
+                    let old = item.0;
+                    if before {
+                        // In front: the first new one swaps in, the old
+                        // item goes after the rest.
+                        let mut put: Vec<N> = new.iter().map(|&v| N(v)).collect();
+                        put.push(N(old));
+                        let first = put.remove(0);
+                        *item = first;
+                        (old, put)
+                    } else {
+                        item.0 = value;
+                        (old, new.iter().map(|&v| N(v)).collect())
+                    }
+                });
+                prop_assert_eq!(out, Some(want[at]));
+                if before {
+                    let mut put = new.clone();
+                    put.push(want[at]);
+                    let first = put.remove(0);
+                    want[at] = first;
+                    want.splice(at + 1..at + 1, put);
+                } else {
+                    want[at] = value;
+                    want.splice(at + 1..at + 1, new);
+                }
+                holds(&tree, &want)?;
+            }
+            holds(&copy, &start)?;
+            prop_assert_eq!(
+                tree.splice_at::<Count, _, _>(&Count(want.len()), Bias::Right, |_| ((), [])),
+                None
+            );
+        }
+
         #[test]
         fn remove_matches_a_vec((start, a, b) in setup()) {
             let mut tree = build(&start);

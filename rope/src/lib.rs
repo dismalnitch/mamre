@@ -307,12 +307,20 @@ impl<M: Measure, const N: usize> Rope<M, N> {
     }
 
     /// Replaces `range` inside the one chunk holding it, in place, if the
-    /// result still fits there and keeps the chunks as full as they must be:
-    /// most edits, typing above all, which then copy only the path down to
-    /// the chunk. Whether it did.
+    /// result still fits in a few chunks and keeps them as full as they must
+    /// be: most edits, typing above all. One that overflows its chunk
+    /// becomes a few, as even as char boundaries allow, spliced in where it
+    /// was. Either way only the path down to the chunk is copied. Whether
+    /// it did.
     fn replace_in_chunk(&mut self, range: &Range<usize>, text: &str) -> bool {
+        // At the very end, the last chunk, so typing at the end grows it.
+        let bias = if range.start == self.len() {
+            Bias::Left
+        } else {
+            Bias::Right
+        };
         let mut cursor = self.tree.cursor::<ByteOffset>();
-        cursor.seek(&ByteOffset(range.start), Bias::Right);
+        cursor.seek(&ByteOffset(range.start), bias);
         let Some(chunk) = cursor.item() else {
             return false;
         };
@@ -323,28 +331,72 @@ impl<M: Measure, const N: usize> Rope<M, N> {
             return false;
         }
         let new_len = len - (b - a) + text.len();
-        if new_len == 0 || new_len > N {
+        // More than this many chunks is a big insert: slicing is as good.
+        const MOST: usize = 4;
+        let pieces = new_len.div_ceil(N);
+        if new_len == 0 || pieces > MOST {
             return false;
         }
-        if new_len < len {
-            // Shrinking: each neighbour must still not fit alongside it.
+        // Neither neighbour may fit alongside what's next to it.
+        let neighbour = |forward: bool| {
             let mut around = cursor.clone();
-            around.prev();
-            let before = around.item().map_or(0, |c| c.text.len());
-            let mut around = cursor.clone();
-            around.next();
-            let after = around.item().map_or(0, |c| c.text.len());
-            if (before > 0 && before + new_len <= N) || (after > 0 && new_len + after <= N) {
+            if forward {
+                around.next();
+            } else {
+                around.prev();
+            }
+            around.item().map_or(0, |c| c.text.len())
+        };
+        let fits = |a: usize, b: usize| a > 0 && b > 0 && a + b <= N;
+
+        if pieces == 1 {
+            if new_len < len && (fits(neighbour(false), new_len) || fits(new_len, neighbour(true)))
+            {
                 return false;
             }
+            self.tree
+                .update_at::<ByteOffset, _>(&ByteOffset(range.start), bias, |chunk| {
+                    let mut edited = ArrayString::new();
+                    edited.push_str(&chunk.text[..a]);
+                    edited.push_str(text);
+                    edited.push_str(&chunk.text[b..]);
+                    chunk.text = edited;
+                });
+            return true;
+        }
+
+        let mut edited = String::with_capacity(new_len);
+        edited.push_str(&chunk.text[..a]);
+        edited.push_str(text);
+        edited.push_str(&chunk.text[b..]);
+        let mut chunks: Vec<Chunk<M, N>> = Vec::with_capacity(pieces);
+        let mut rest = edited.as_str();
+        for left in (1..=pieces).rev() {
+            let take = if left == 1 {
+                rest.len()
+            } else {
+                floor_boundary(rest, rest.len().div_ceil(left))
+            };
+            if take == 0 || take > N {
+                return false;
+            }
+            chunks.push(Chunk::new(&rest[..take]));
+            rest = &rest[take..];
+        }
+        // Even pieces of more than a chunk never fit two to one (shaving to
+        // char boundaries could only matter for tiny chunks), but check.
+        let lens: Vec<usize> = chunks.iter().map(|c| c.text.len()).collect();
+        if lens.windows(2).any(|w| fits(w[0], w[1]))
+            || fits(neighbour(false), lens[0])
+            || fits(lens[lens.len() - 1], neighbour(true))
+        {
+            return false;
         }
         self.tree
-            .update_at::<ByteOffset, _>(&ByteOffset(range.start), Bias::Right, |chunk| {
-                let mut edited = ArrayString::new();
-                edited.push_str(&chunk.text[..a]);
-                edited.push_str(text);
-                edited.push_str(&chunk.text[b..]);
-                chunk.text = edited;
+            .splice_at::<ByteOffset, _, _>(&ByteOffset(range.start), bias, |chunk| {
+                let mut chunks = chunks.into_iter();
+                *chunk = chunks.next().expect("two chunks or more");
+                ((), chunks)
             });
         true
     }

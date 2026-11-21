@@ -183,6 +183,35 @@ impl<T: Item, const CAP: usize> SumTree<T, CAP> {
         Some(Arc::make_mut(&mut self.root).update_path(&path, f))
     }
 
+    /// Changes the item a seek for `target` lands on, in place, and puts
+    /// the items `f` returns right after it: up to `CAP` of them. Like
+    /// [`update_at`](Self::update_at), only the path down to the item is
+    /// copied if shared, and a node that overflows splits in two on the way
+    /// back up. Returns what `f` returns, or `None` without calling it if
+    /// the target is past the last item.
+    ///
+    /// To put items before it instead, have `f` swap the first of them in
+    /// and hand the old item back after the rest. O(log n), where
+    /// [`replace`](Self::replace) slices and rejoins the tree.
+    pub fn splice_at<D, R, I>(
+        &mut self,
+        target: &impl SeekTarget<T::Summary, D>,
+        bias: Bias,
+        f: impl FnOnce(&mut T) -> (R, I),
+    ) -> Option<R>
+    where
+        D: Dimension<T::Summary>,
+        I: IntoIterator<Item = T>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let path = self.root.path_to::<D>(target, bias)?;
+        let (out, split_off) = Arc::make_mut(&mut self.root).splice_path(&path, f);
+        if let Some(split_off) = split_off {
+            self.grow_root(split_off, Side::Back);
+        }
+        Some(out)
+    }
+
     /// Changes the first item in place, and every summary above it. `None`,
     /// without calling `f`, for an empty tree.
     pub fn update_first<R>(&mut self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
@@ -277,6 +306,38 @@ fn extend_or_split<E, const CAP: usize>(
                 split_off.extend(incoming);
                 split_off.extend(v.drain(..give - n));
             }
+        }
+    }
+    Some(split_off)
+}
+
+/// Puts `new` (emptying it) into `v` right after entry `i`. If they don't
+/// all fit, `v` keeps the first half and the rest is returned, for a new
+/// sibling after it. Only live entries move.
+fn insert_after<E, const CAP: usize>(
+    v: &mut ArrayVec<E, CAP>,
+    i: usize,
+    new: &mut ArrayVec<E, CAP>,
+) -> Option<ArrayVec<E, CAP>> {
+    let total = v.len() + new.len();
+    if total <= CAP {
+        for (k, e) in new.drain(..).enumerate() {
+            v.insert(i + 1 + k, e);
+        }
+        return None;
+    }
+    // In order: `v` up to `i`, then `new`, then the rest of `v`.
+    let mut tail: ArrayVec<E, CAP> = v.drain(i + 1..).collect();
+    let keep = total / 2;
+    let mut split_off = ArrayVec::new();
+    if v.len() > keep {
+        split_off.extend(v.drain(keep..));
+    }
+    for e in new.drain(..).chain(tail.drain(..)) {
+        if v.len() < keep {
+            v.push(e);
+        } else {
+            split_off.push(e);
         }
     }
     Some(split_off)
@@ -410,6 +471,86 @@ impl<T: Item, const CAP: usize> Node<T, CAP> {
                 item_summaries[i] = items[i].summary();
                 *summary = sum_all(item_summaries);
                 out
+            }
+        }
+    }
+
+    /// Runs `f` on the item at the end of `path` and puts what it returns
+    /// right after it, refreshing summaries on the way back up. Returns a
+    /// new sibling, to go after this node, if it overflowed.
+    fn splice_path<R, I>(
+        &mut self,
+        path: &[usize],
+        f: impl FnOnce(&mut T) -> (R, I),
+    ) -> (R, Option<SumTree<T, CAP>>)
+    where
+        I: IntoIterator<Item = T>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let i = path[0];
+        match self {
+            Node::Internal {
+                height,
+                summary,
+                children,
+                child_summaries,
+            } => {
+                let child = &mut children[i];
+                let (out, split_off) = Arc::make_mut(&mut child.root).splice_path(&path[1..], f);
+                child_summaries[i] = child.summary().clone();
+                let Some(split_off) = split_off else {
+                    *summary = sum_all(child_summaries);
+                    return (out, None);
+                };
+                let mut new_summaries: ArrayVec<T::Summary, CAP> =
+                    iter::once(split_off.summary().clone()).collect();
+                let mut new_children: ArrayVec<SumTree<T, CAP>, CAP> =
+                    iter::once(split_off).collect();
+                let more_summaries = insert_after(child_summaries, i, &mut new_summaries);
+                let more_children = insert_after(children, i, &mut new_children);
+                *summary = sum_all(child_summaries);
+                let split_off =
+                    more_children
+                        .zip(more_summaries)
+                        .map(|(children, child_summaries)| {
+                            SumTree::from_node(Node::Internal {
+                                height: *height,
+                                summary: sum_all(&child_summaries),
+                                children,
+                                child_summaries,
+                            })
+                        });
+                (out, split_off)
+            }
+            Node::Leaf {
+                summary,
+                items,
+                item_summaries,
+            } => {
+                let (out, extra) = f(&mut items[i]);
+                item_summaries[i] = items[i].summary();
+                let extra = extra.into_iter();
+                assert!(extra.len() <= CAP, "splice_at puts in at most CAP items");
+                let mut new_items: ArrayVec<T, CAP> = extra.collect();
+                if new_items.is_empty() {
+                    *summary = sum_all(item_summaries);
+                    return (out, None);
+                }
+                let mut new_summaries: ArrayVec<T::Summary, CAP> =
+                    new_items.iter().map(Item::summary).collect();
+                let more_summaries = insert_after(item_summaries, i, &mut new_summaries);
+                let more_items = insert_after(items, i, &mut new_items);
+                *summary = sum_all(item_summaries);
+                let split_off = more_items
+                    .zip(more_summaries)
+                    .map(|(items, item_summaries)| {
+                        SumTree::from_node(Node::Leaf {
+                            summary: sum_all(&item_summaries),
+                            items,
+                            item_summaries,
+                        })
+                    });
+                (out, split_off)
             }
         }
     }
