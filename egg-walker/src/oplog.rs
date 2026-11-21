@@ -2,7 +2,10 @@
 //!
 //! An event is one insert or delete of one item, at a position in the
 //! document *as it was at the event's parents*: plain positions, no IDs in
-//! the document. Its parents are the events it came after, so concurrent
+//! the document. Or it undoes a delete: an *undelete* names the delete it
+//! undoes, and an item is visible while every delete of it is undone. Undo
+//! and redo never make new items, so anything keyed to an item (an anchor)
+//! finds it again. Its parents are the events it came after, so concurrent
 //! edits are siblings. Events are numbered locally (`Lv`) in the order this
 //! log learned them, which is always a topological order: parents first.
 //!
@@ -16,6 +19,14 @@
 
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::ops::Range;
+
+/// What an event does, without its details.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Insert,
+    Delete,
+    Undelete,
+}
 
 /// A local version: an event's number in this log. Parents always have
 /// smaller numbers than their children.
@@ -33,6 +44,10 @@ pub enum Op<T> {
     Insert { pos: usize, item: T },
     /// Removes the item at `pos`.
     Delete { pos: usize },
+    /// Undoes delete `target`, an earlier event this one includes. Once any
+    /// undelete of a delete exists, that delete is undone for good; a redo
+    /// is a new delete.
+    Undelete { target: Lv },
 }
 
 /// One event, as a log hands it out.
@@ -63,13 +78,16 @@ enum RunOp<T> {
     Insert { pos: usize, items: Vec<T> },
     /// `len` items each removed at `pos`: deleting forward.
     Delete { pos: usize, len: usize },
+    /// Deletes `target..target + len` undone, in order: undoing a run of
+    /// deletes.
+    Undelete { target: Lv, len: usize },
 }
 
 impl<T> Run<T> {
     fn len(&self) -> usize {
         match &self.op {
             RunOp::Insert { items, .. } => items.len(),
-            RunOp::Delete { len, .. } => *len,
+            RunOp::Delete { len, .. } | RunOp::Undelete { len, .. } => *len,
         }
     }
 
@@ -143,7 +161,7 @@ impl<T: Clone> OpLog<T> {
         let k = first - run.start;
         match &run.op {
             RunOp::Insert { items, .. } => items.get(k..k + len),
-            RunOp::Delete { .. } => None,
+            RunOp::Delete { .. } | RunOp::Undelete { .. } => None,
         }
     }
 
@@ -157,6 +175,7 @@ impl<T: Clone> OpLog<T> {
                 item: items[k].clone(),
             },
             RunOp::Delete { pos, .. } => Op::Delete { pos: *pos },
+            RunOp::Undelete { target, .. } => Op::Undelete { target: target + k },
         }
     }
 
@@ -191,6 +210,28 @@ impl<T: Clone> OpLog<T> {
         version
     }
 
+    /// Undoes `deletes`, in a document at `parents`, as `agent`: one
+    /// undelete each, in order. Each must be a delete `parents` includes.
+    /// Returns the version after.
+    pub fn add_undelete(
+        &mut self,
+        agent: AgentId,
+        parents: &[Lv],
+        deletes: impl IntoIterator<Item = Lv>,
+    ) -> Vec<Lv> {
+        let mut version = normalize(parents.to_vec());
+        for target in deletes {
+            debug_assert!(
+                self.contains(parents, target),
+                "an undelete undoes a delete it includes"
+            );
+            let seq = self.next_seq[agent.0 as usize];
+            let lv = self.push(agent, seq, version, Op::Undelete { target });
+            version = vec![lv];
+        }
+        version
+    }
+
     /// Adds an event made elsewhere: `agent`'s event number `seq`, after
     /// `parents`. Returns its local version. For logs decoded or synced from
     /// outside; local edits go through `add_insert` and `add_delete`.
@@ -216,7 +257,15 @@ impl<T: Clone> OpLog<T> {
                         .expect("parents arrive before children")
                 })
                 .collect();
-            self.push(agent, event.seq, parents, event.op);
+            let op = match event.op {
+                Op::Undelete { target } => Op::Undelete {
+                    target: self
+                        .local(other, target)
+                        .expect("an undelete's target arrives before it"),
+                },
+                op => op,
+            };
+            self.push(agent, event.seq, parents, op);
             added += 1;
         }
         added
@@ -250,6 +299,12 @@ impl<T: Clone> OpLog<T> {
             self.find(agent, seq).is_none(),
             "two events can't share an agent and seq"
         );
+        if let Op::Undelete { target } = op {
+            assert!(
+                target < lv && matches!(self.run_of(target).op, RunOp::Delete { .. }),
+                "an undelete undoes an earlier delete"
+            );
+        }
         let next = &mut self.next_seq[agent.0 as usize];
         *next = (*next).max(seq + 1);
         // A frontier entry is a parent of this event or still a frontier
@@ -269,6 +324,9 @@ impl<T: Clone> OpLog<T> {
                         *pos == p + items.len()
                     }
                     (RunOp::Delete { pos: p, .. }, Op::Delete { pos }) => pos == p,
+                    (RunOp::Undelete { target: t, len }, Op::Undelete { target }) => {
+                        *target == t + len
+                    }
                     _ => false,
                 }
         });
@@ -276,7 +334,8 @@ impl<T: Clone> OpLog<T> {
             let run = self.runs.last_mut().expect("checked above");
             match (&mut run.op, op) {
                 (RunOp::Insert { items, .. }, Op::Insert { item, .. }) => items.push(item),
-                (RunOp::Delete { len, .. }, Op::Delete { .. }) => *len += 1,
+                (RunOp::Delete { len, .. }, Op::Delete { .. })
+                | (RunOp::Undelete { len, .. }, Op::Undelete { .. }) => *len += 1,
                 _ => unreachable!("checked above"),
             }
             let span = self.spans[agent.0 as usize]
@@ -295,6 +354,7 @@ impl<T: Clone> OpLog<T> {
                         items: vec![item],
                     },
                     Op::Delete { pos } => RunOp::Delete { pos, len: 1 },
+                    Op::Undelete { target } => RunOp::Undelete { target, len: 1 },
                 },
             });
             self.spans[agent.0 as usize].insert(seq, (lv, 1));
@@ -403,6 +463,24 @@ impl<T> OpLog<T> {
         matches!(self.run_of(lv).op, RunOp::Insert { .. })
     }
 
+    /// What kind of event `lv` is.
+    pub(crate) fn kind(&self, lv: Lv) -> Kind {
+        match self.run_of(lv).op {
+            RunOp::Insert { .. } => Kind::Insert,
+            RunOp::Delete { .. } => Kind::Delete,
+            RunOp::Undelete { .. } => Kind::Undelete,
+        }
+    }
+
+    /// The delete undelete `lv` undoes.
+    pub(crate) fn undeleted(&self, lv: Lv) -> Lv {
+        let run = self.run_of(lv);
+        match run.op {
+            RunOp::Undelete { target, .. } => target + (lv - run.start),
+            _ => panic!("event {lv} isn't an undelete"),
+        }
+    }
+
     /// What a merge of `to` into `from` must replay, and the base it can
     /// start from: `(old, new, base)`, where `old` is replayed events
     /// `from` already holds, `new` the ones it doesn't (both in order), and
@@ -416,7 +494,8 @@ impl<T> OpLog<T> {
     /// further and tries again. So it costs what's happened since the two
     /// versions met, not the whole history; unmerged branches elsewhere
     /// don't count, and the base can be several events (two people's work,
-    /// merged).
+    /// merged). An undelete's delete is always replayed with it, so the item
+    /// it brings back is known to the walk.
     pub(crate) fn conflict(
         &self,
         from: &[Lv],
@@ -457,7 +536,15 @@ impl<T> OpLog<T> {
                 let base: Vec<Lv> = queue.keys().copied().collect();
                 let mut replayed: Vec<Lv> = visited.iter().map(|&(lv, _)| lv).collect();
                 replayed.sort_unstable();
-                if self.all_include(&replayed, &base) {
+                // An undelete needs the delete it undoes replayed too, so
+                // the item it brings back is known: the base can't hold it.
+                let undoes_replayed = || {
+                    replayed
+                        .iter()
+                        .filter(|&&lv| self.kind(lv) == Kind::Undelete)
+                        .all(|&lv| replayed.binary_search(&self.undeleted(lv)).is_ok())
+                };
+                if self.all_include(&replayed, &base) && undoes_replayed() {
                     let mut old = Vec::new();
                     let mut new = Vec::new();
                     for &(lv, side) in &visited {

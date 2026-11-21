@@ -2,9 +2,9 @@
 //! plain list and the prepare version tracked over the whole log. It's
 //! kept as an oracle: the fast walk must produce exactly these changes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::oplog::{Lv, Op, OpLog};
+use crate::oplog::{Kind, Lv, Op, OpLog};
 use crate::order::{Placed, place};
 use crate::walk::{Change, Changes};
 
@@ -34,8 +34,9 @@ struct Record {
     left: Option<usize>,
     right: Option<usize>,
     prepare: Prepare,
-    /// Deleted in the effect version: by any delete replayed so far.
-    gone: bool,
+    /// How many deletes replayed so far removed it, not undone: it shows in
+    /// the effect version if none.
+    dead: u32,
 }
 
 impl Placed for Record {
@@ -57,6 +58,13 @@ struct Walk<'a, T> {
     prepared: Vec<bool>,
     /// Which record each delete replayed so far removed.
     targets: HashMap<Lv, usize>,
+    /// How many undeletes of each delete the prepare version holds.
+    undos: HashMap<Lv, u32>,
+    /// The deletes undone in the effect version.
+    undone: HashSet<Lv>,
+    /// Which insert each base item came from, once asked.
+    base_ids: Option<Vec<Lv>>,
+    base: Vec<bool>,
 }
 
 impl<T: Clone> OpLog<T> {
@@ -84,10 +92,14 @@ impl<T: Clone> OpLog<T> {
                 left: None,
                 right: None,
                 prepare: Prepare::Inserted,
-                gone: false,
+                dead: 0,
             }],
             prepared: base.clone(),
             targets: HashMap::new(),
+            undos: HashMap::new(),
+            undone: HashSet::new(),
+            base_ids: None,
+            base: base.clone(),
         };
         // First what the document already holds past the base, to set up
         // its state, then what's new. Parents come first either way:
@@ -115,6 +127,18 @@ impl<T: Clone> OpLog<T> {
                 let parents = self.closure(&self.parents(lv).collect::<Vec<_>>());
                 for (b, p) in next.iter_mut().zip(parents) {
                     *b &= p;
+                }
+                // An undelete needs its delete replayed too, so the item it
+                // brings back is known: the base can't hold the delete.
+                if self.kind(lv) == Kind::Undelete {
+                    let d = self.undeleted(lv);
+                    if base[d] {
+                        for x in (0..self.len()).filter(|&x| base[x]) {
+                            if self.closure(&[x])[d] {
+                                next[x] = false;
+                            }
+                        }
+                    }
                 }
             }
             if next == base {
@@ -148,6 +172,7 @@ impl<'a, T: Clone> Walk<'a, T> {
         match &event.op {
             Op::Insert { pos, .. } => self.insert(lv, *pos, out),
             Op::Delete { pos } => self.delete(lv, *pos, out),
+            Op::Undelete { target } => self.undelete(*target, out),
         }
         self.prepared[lv] = true;
     }
@@ -160,6 +185,9 @@ impl<'a, T: Clone> Walk<'a, T> {
     }
 
     fn retreat(&mut self, x: Lv) {
+        if self.log.kind(x) == Kind::Undelete {
+            return self.shift_undelete(x, false);
+        }
         let insert = self.log.is_insert(x);
         let i = if insert {
             self.index_of(x)
@@ -176,6 +204,9 @@ impl<'a, T: Clone> Walk<'a, T> {
     }
 
     fn advance(&mut self, x: Lv) {
+        if self.log.kind(x) == Kind::Undelete {
+            return self.shift_undelete(x, true);
+        }
         let insert = self.log.is_insert(x);
         let i = if insert {
             self.index_of(x)
@@ -189,6 +220,69 @@ impl<'a, T: Clone> Walk<'a, T> {
             (false, Prepare::Deleted(n)) => Prepare::Deleted(n + 1),
             (_, state) => unreachable!("advancing {x} from {state:?}"),
         };
+    }
+
+    /// Adds (`forward`) or takes back undelete `x` in the prepare version:
+    /// its delete is live there while no undelete of it is.
+    fn shift_undelete(&mut self, x: Lv, forward: bool) {
+        let d = self.log.undeleted(x);
+        let before = self.undos.get(&d).copied().unwrap_or(0);
+        let after = if forward { before + 1 } else { before - 1 };
+        self.undos.insert(d, after);
+        // Only the first undelete of a delete changes anything.
+        if (before == 0) == (after == 0) {
+            return;
+        }
+        let i = self.index_of(self.targets[&d]);
+        let record = &mut self.records[i];
+        record.prepare = match (forward, record.prepare) {
+            (true, Prepare::Deleted(1)) => Prepare::Inserted,
+            (true, Prepare::Deleted(n)) => Prepare::Deleted(n - 1),
+            (false, Prepare::Inserted) => Prepare::Deleted(1),
+            (false, Prepare::Deleted(n)) => Prepare::Deleted(n + 1),
+            (_, state) => unreachable!("shifting undelete {x} from {state:?}"),
+        };
+    }
+
+    /// Undoes delete `d`: the item it removed shows again if nothing else
+    /// still removes it.
+    fn undelete(&mut self, d: Lv, out: Option<&mut Changes<'a, T>>) {
+        let count = self.undos.get(&d).copied().unwrap_or(0) + 1;
+        self.undos.insert(d, count);
+        let first_here = count == 1;
+        let i = self.index_of(self.targets[&d]);
+        if first_here {
+            let record = &mut self.records[i];
+            record.prepare = match record.prepare {
+                Prepare::Deleted(1) => Prepare::Inserted,
+                Prepare::Deleted(n) => Prepare::Deleted(n - 1),
+                state => unreachable!("undoing delete {d} of an item {state:?}"),
+            };
+        }
+        // Already undone in the effect version by a concurrent undelete.
+        if !self.undone.insert(d) {
+            return;
+        }
+        self.records[i].dead -= 1;
+        if self.records[i].dead == 0
+            && let Some(out) = out
+        {
+            let id = self.identity(i);
+            out.insert(self.effect_pos(i), id);
+        }
+    }
+
+    /// The insert record `i`'s item came from: a base item's is found by
+    /// its place in the base document.
+    fn identity(&mut self, i: usize) -> Lv {
+        let id = self.records[i].id;
+        if id < BASE_ITEM {
+            return id;
+        }
+        let ids = self
+            .base_ids
+            .get_or_insert_with(|| crate::reference::visible_ids(self.log, &self.base));
+        ids[id - BASE_ITEM]
     }
 
     /// The index of the record holding the `pos`th item visible in the
@@ -239,7 +333,7 @@ impl<'a, T: Clone> Walk<'a, T> {
     fn effect_pos(&self, i: usize) -> usize {
         self.records[..i]
             .iter()
-            .filter(|r| !r.gone)
+            .filter(|r| r.dead == 0)
             .map(|r| r.len)
             .sum()
     }
@@ -289,7 +383,7 @@ impl<'a, T: Clone> Walk<'a, T> {
                 left,
                 right,
                 prepare: Prepare::Inserted,
-                gone: false,
+                dead: 0,
             },
         );
         if let Some(out) = out {
@@ -303,11 +397,11 @@ impl<'a, T: Clone> Walk<'a, T> {
         self.targets.insert(lv, self.records[at].id);
         // Already deleted in the effect version by a concurrent delete:
         // nothing more to do to the document.
-        if !self.records[at].gone {
-            if let Some(out) = out {
-                out.delete(self.effect_pos(at));
-            }
-            self.records[at].gone = true;
+        if self.records[at].dead == 0
+            && let Some(out) = out
+        {
+            out.delete(self.effect_pos(at));
         }
+        self.records[at].dead += 1;
     }
 }

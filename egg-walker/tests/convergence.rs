@@ -7,7 +7,7 @@
 //! everyone, and every replica must hold the same document, though each
 //! log numbered the events differently.
 
-use mamre_egg_walker::{Lv, OpLog, reference};
+use mamre_egg_walker::{Lv, Op, OpLog, reference};
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -22,6 +22,9 @@ enum Act {
     /// yet: its later edits get later numbers than events it merges after,
     /// so a merge replays new events numbered among old ones.
     Fetch { r: usize, from: usize },
+    /// Replica `r` undoes one of the deletes it has (maybe one already
+    /// undone), and up to `n` more after it: undoing a run.
+    Undo { r: usize, pick: u16, n: usize },
 }
 
 struct Replica {
@@ -121,6 +124,39 @@ fn run(replicas: usize, acts: &[Act]) -> Result<(), String> {
                 }
                 r
             }
+            Act::Undo { r, pick, n } => {
+                let rep = &mut reps[r];
+                let is_delete =
+                    |log: &OpLog<u32>, lv: Lv| matches!(log.event(lv).op, Op::Delete { .. });
+                let deletes: Vec<Lv> = (0..rep.log.len())
+                    .filter(|&lv| is_delete(&rep.log, lv) && rep.log.contains(&rep.version, lv))
+                    .collect();
+                if !deletes.is_empty() {
+                    let first = deletes[frac(deletes.len() - 1, pick)];
+                    let targets: Vec<Lv> = (first..first + n)
+                        .take_while(|&d| {
+                            d < rep.log.len()
+                                && is_delete(&rep.log, d)
+                                && rep.log.contains(&rep.version, d)
+                        })
+                        .collect();
+                    let agent = rep.log.agent(&rep.name.clone());
+                    let before = rep.version.clone();
+                    rep.version = rep.log.add_undelete(agent, &before, targets);
+                    // The editor doesn't know where undone text goes: the
+                    // walk does.
+                    let changes = rep.log.changes(&before, &rep.version);
+                    assert_eq!(
+                        changes,
+                        rep.log.changes_simple(&before, &rep.version),
+                        "the tree walk and the list walk differ on an undo"
+                    );
+                    for change in changes {
+                        change.apply(&mut rep.doc);
+                    }
+                }
+                r
+            }
         };
         verify(&reps[r]).map_err(|e| format!("step {step}, {act:?}: {e}"))?;
     }
@@ -151,7 +187,8 @@ fn acts(replicas: usize) -> impl Strategy<Value = Vec<Act>> {
         4 => (r.clone(), any::<u16>(), 1usize..4).prop_map(|(r, at, n)| Act::Insert { r, at, n }),
         2 => (r.clone(), any::<u16>(), any::<u16>()).prop_map(|(r, a, b)| Act::Delete { r, a, b }),
         2 => (r.clone(), r.clone()).prop_map(|(r, from)| Act::Sync { r, from }),
-        1 => (r.clone(), r).prop_map(|(r, from)| Act::Fetch { r, from }),
+        1 => (r.clone(), r.clone()).prop_map(|(r, from)| Act::Fetch { r, from }),
+        2 => (r, any::<u16>(), 1usize..4).prop_map(|(r, pick, n)| Act::Undo { r, pick, n }),
     ];
     prop::collection::vec(act, 1..50)
 }
@@ -210,5 +247,132 @@ fn insert_inside_a_concurrent_delete() {
             .into_iter()
             .collect::<String>(),
         "hXo"
+    );
+}
+
+fn text(log: &OpLog<char>, v: &[Lv]) -> String {
+    log.checkout(v).into_iter().collect()
+}
+
+/// The events items came from in a change list's inserts, in order, by
+/// agent and sequence number, so they compare across logs.
+fn revived(log: &OpLog<char>, from: &[Lv], to: &[Lv]) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for change in log.changes(from, to) {
+        if let mamre_egg_walker::Change::Insert { items, first, .. } = change {
+            for k in 0..items.len() {
+                let e = log.event(first + k);
+                out.push((log.agent_name(e.agent).to_string(), e.seq));
+            }
+        }
+    }
+    out
+}
+
+/// Undo brings back the same items, not copies: locally, and on another
+/// replica, whose log numbers them differently.
+#[test]
+fn undo_brings_back_the_same_items() {
+    let mut a: OpLog<char> = OpLog::new();
+    let alice = a.agent("alice");
+    let typed = a.add_insert(alice, &[], 0, "hello".chars());
+    let gone = a.add_delete(alice, &typed, 1..4);
+    let undone = a.add_undelete(alice, &gone, gone[0] - 2..=gone[0]);
+    assert_eq!(text(&a, &gone), "ho");
+    assert_eq!(text(&a, &undone), "hello");
+    let alices: Vec<(String, u64)> = (1..4).map(|seq| ("alice".to_string(), seq)).collect();
+    assert_eq!(revived(&a, &gone, &undone), alices);
+
+    // Bob had the delete; the undo reaches him later.
+    let mut b: OpLog<char> = OpLog::new();
+    b.agent("bob");
+    b.pull(&a);
+    let bob_gone = b.translate(&a, &gone).unwrap();
+    let bob_undone = b.translate(&a, &undone).unwrap();
+    assert_eq!(revived(&b, &bob_gone, &bob_undone), alices);
+}
+
+/// Two people undo the same delete at once: the text comes back once.
+#[test]
+fn concurrent_undos_of_one_delete_agree() {
+    let mut a: OpLog<char> = OpLog::new();
+    let alice = a.agent("alice");
+    let typed = a.add_insert(alice, &[], 0, "hello".chars());
+    let gone = a.add_delete(alice, &typed, 1..4);
+    let mut b = a.clone();
+    let bob = b.agent("bob");
+    let deletes: Vec<Lv> = (gone[0] - 2..=gone[0]).collect();
+    let va = a.add_undelete(alice, &gone, deletes.clone());
+    let vb = b.add_undelete(bob, &gone, deletes);
+    a.pull(&b);
+    let both = a.union(&va, &a.translate(&b, &vb).unwrap());
+    assert_eq!(text(&a, &both), "hello");
+    let mut doc = a.checkout(&va);
+    for change in a.changes(&va, &both) {
+        change.apply(&mut doc);
+    }
+    assert_eq!(doc.into_iter().collect::<String>(), "hello");
+}
+
+/// Undoing a delete that overlaps someone else's: theirs still holds.
+#[test]
+fn undo_against_a_concurrent_delete() {
+    let mut a: OpLog<char> = OpLog::new();
+    let alice = a.agent("alice");
+    let typed = a.add_insert(alice, &[], 0, "hello".chars());
+    let mut b = a.clone();
+    let bob = b.agent("bob");
+    let gone = a.add_delete(alice, &typed, 1..4);
+    let vb = b.add_delete(bob, &typed, 3..4);
+    let undone = a.add_undelete(alice, &gone, gone[0] - 2..=gone[0]);
+    a.pull(&b);
+    let both = a.union(&undone, &a.translate(&b, &vb).unwrap());
+    assert_eq!(text(&a, &both), "helo");
+    assert_eq!(
+        reference::checkout(&a, &both)
+            .into_iter()
+            .collect::<String>(),
+        "helo"
+    );
+}
+
+/// Redo after undo is a new delete, and it holds.
+#[test]
+fn redo_is_a_new_delete() {
+    let mut a: OpLog<char> = OpLog::new();
+    let alice = a.agent("alice");
+    let typed = a.add_insert(alice, &[], 0, "hello".chars());
+    let gone = a.add_delete(alice, &typed, 0..5);
+    let undone = a.add_undelete(alice, &gone, gone[0] - 4..=gone[0]);
+    let again = a.add_delete(alice, &undone, 1..3);
+    assert_eq!(text(&a, &again), "hlo");
+    let back = a.add_undelete(alice, &again, again[0] - 1..=again[0]);
+    assert_eq!(text(&a, &back), "hello");
+}
+
+/// Undoing a delete of old text, after a long stretch of typing: the walk
+/// has started afresh many times since, and still brings back the
+/// original items.
+#[test]
+fn undo_of_old_text_keeps_identity() {
+    let mut a: OpLog<char> = OpLog::new();
+    let alice = a.agent("alice");
+    let mut v = a.add_insert(alice, &[], 0, "the quick brown fox".chars());
+    let gone = a.add_delete(alice, &v, 4..10);
+    v = gone.clone();
+    for k in 0..50 {
+        let len = a.checkout(&v).len();
+        v = a.add_insert(alice, &v, len, format!(" {k}").chars());
+    }
+    let undone = a.add_undelete(alice, &v, gone[0] - 5..=gone[0]);
+    assert!(text(&a, &undone).starts_with("the quick brown fox 0 1"));
+    let quick: Vec<(String, u64)> = (4..10).map(|seq| ("alice".to_string(), seq)).collect();
+    assert_eq!(revived(&a, &v, &undone), quick);
+    // And from nothing, as a checkout sees it.
+    assert_eq!(
+        text(&a, &undone),
+        reference::checkout(&a, &undone)
+            .into_iter()
+            .collect::<String>()
     );
 }

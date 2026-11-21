@@ -32,16 +32,25 @@
 //! typing is a handful of records, not one per item. The prepare
 //! version is kept as its latest events and moved by walking the graph
 //! back only as far as the two versions differ: for typing, nothing.
+//!
+//! An undelete counts against its delete: an item is deleted in a version
+//! while some delete of it there has no undelete there. Undoing brings the
+//! item back as itself, so the change says which insert it came from. The
+//! walk only knows that for items it has records for, so a merge always
+//! replays the delete an undelete undoes, and never starts afresh between
+//! the two; an item from the base document is looked up by its place there
+//! (see `ids.rs`).
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
 use mamre::cursor::Bias;
 use mamre::{Item, SeekTarget, SumTree, Summary};
 
+use crate::ids::Ids;
 use crate::key::Key;
-use crate::oplog::{Lv, Op, OpLog};
+use crate::oplog::{Kind, Lv, Op, OpLog};
 
 /// Ids at or above this name items of the base document, by position.
 pub(crate) const BASE_ITEM: usize = 1 << 62;
@@ -99,6 +108,9 @@ impl<T: Clone> Change<'_, T> {
 pub(crate) struct Changes<'a, T> {
     log: &'a OpLog<T>,
     pub(crate) out: Vec<Change<'a, T>>,
+    /// The identities of the document the changes make, if it started
+    /// empty and they're being kept.
+    pub(crate) ids: Option<Ids>,
 }
 
 impl<'a, T: Clone> Changes<'a, T> {
@@ -106,6 +118,7 @@ impl<'a, T: Clone> Changes<'a, T> {
         Changes {
             log,
             out: Vec::new(),
+            ids: None,
         }
     }
 
@@ -116,6 +129,9 @@ impl<'a, T: Clone> Changes<'a, T> {
 
     /// The items of events `lv..lv + n`, one run in the log, go in at `pos`.
     pub(crate) fn insert_run(&mut self, pos: usize, lv: Lv, n: usize) {
+        if let Some(ids) = &mut self.ids {
+            ids.insert(pos, lv, n);
+        }
         // Typing: the next event of the same run, just after the last.
         // Today the next event of a run always lands right after: it sticks
         // to the last, and anything that could come between would include
@@ -149,6 +165,9 @@ impl<'a, T: Clone> Changes<'a, T> {
 
     /// The item at `pos` goes, `n` times over: the `n` items from `pos`.
     pub(crate) fn delete_run(&mut self, pos: usize, n: usize) {
+        if let Some(ids) = &mut self.ids {
+            ids.remove(pos..pos + n);
+        }
         if let Some(Change::Delete { range }) = self.out.last_mut() {
             // Deleting forward: the next items have moved up to the start.
             if pos == range.start {
@@ -205,8 +224,9 @@ struct Record {
     left: Option<Key>,
     right: Option<Key>,
     prepare: Prepare,
-    /// Deleted in the effect version: by any delete replayed so far.
-    gone: bool,
+    /// How many deletes replayed so far removed it, not undone: it shows in
+    /// the effect version if none.
+    dead: u32,
 }
 
 impl Record {
@@ -220,7 +240,7 @@ impl Record {
             left: None,
             right: None,
             prepare: Prepare::Inserted,
-            gone: false,
+            dead: 0,
         }
     }
 
@@ -268,7 +288,7 @@ impl Item for Record {
             } else {
                 0
             },
-            effect: if self.gone { 0 } else { self.len },
+            effect: if self.dead > 0 { 0 } else { self.len },
             last: Some(self.last.clone()),
         }
     }
@@ -314,6 +334,14 @@ struct Walk<'a, T> {
     /// got; and the item each delete deleted.
     starts: BTreeMap<Lv, (Key, usize)>,
     targets: HashMap<Lv, usize>,
+    /// How many undeletes of each delete the prepare version holds, and
+    /// the deletes undone in the effect version.
+    undos: HashMap<Lv, u32>,
+    undone: HashSet<Lv>,
+    /// The version the placeholder stands for, and which insert each of its
+    /// items came from, once known.
+    base: Vec<Lv>,
+    base_ids: Option<Ids>,
     /// How many events were replayed, and stepped in full: what a merge
     /// cost.
     replayed: usize,
@@ -340,11 +368,37 @@ impl<T: Clone> OpLog<T> {
 
     /// The changes, and what finding them cost.
     pub(crate) fn walk(&self, from: &[Lv], to: &[Lv]) -> (Vec<Change<'_, T>>, Stats) {
+        let (out, stats) = self.walk_into(from, to, false);
+        (out.out, stats)
+    }
+
+    /// Which insert each item at `version` came from.
+    pub(crate) fn ids_at(&self, version: &[Lv]) -> Ids {
+        self.walk_into(&[], version, true)
+            .0
+            .ids
+            .expect("a walk from nothing keeps identities")
+    }
+
+    /// The walk, keeping the identities of the document it makes if
+    /// `keep_ids` (and it starts from nothing).
+    fn walk_into(&self, from: &[Lv], to: &[Lv], keep_ids: bool) -> (Changes<'_, T>, Stats) {
+        let mut out = Changes::new(self);
         // What to replay, and the base: a version every replayed event
         // includes whole, so none of it is ever retreated.
         let (old, new, base) = self.conflict(from, to);
+        // From nothing, the document the changes make is the whole effect
+        // version, so its identities can be kept as it goes and handed to
+        // each fresh start: an undo needs them to bring back items from
+        // before one.
+        let undoes = new
+            .iter()
+            .any(|span| self.kind(span.start) == Kind::Undelete);
+        if from.is_empty() && (keep_ids || undoes) {
+            out.ids = Some(Ids::default());
+        }
         if new.is_empty() {
-            return (Vec::new(), Stats::default());
+            return (out, Stats::default());
         }
         // First what the document already holds past the base, to set up
         // its state, then what's new. Parents come first either way:
@@ -357,8 +411,7 @@ impl<T: Clone> OpLog<T> {
             .collect();
         let critical = self.critical_points(&order, &old, &new, &base);
         let mut critical = critical.iter().peekable();
-        let mut walk = Walk::new(self, base);
-        let mut out = Changes::new(self);
+        let mut walk = Walk::new(self, base, out.ids.clone());
         // How many events have been replayed: where the next is in `order`.
         let mut at = 0;
         for (span, output) in order {
@@ -382,15 +435,19 @@ impl<T: Clone> OpLog<T> {
                         match self.op(lv) {
                             Op::Insert { pos, .. } => out.insert_run(pos, lv, n),
                             Op::Delete { pos } => out.delete_run(pos, n),
+                            Op::Undelete { .. } => unreachable!("an undelete is never critical"),
                         }
                     }
                     let last = lv + n - 1;
                     if walk.fresh {
+                        // The placeholder now stands for the document here.
                         walk.prepared.clear();
                         walk.prepared.push(last);
+                        walk.base.clone_from(&walk.prepared);
+                        walk.base_ids.clone_from(&out.ids);
                     } else {
                         let (replayed, stepped) = (walk.replayed, walk.stepped);
-                        walk = Walk::new(self, vec![last]);
+                        walk = Walk::new(self, vec![last], out.ids.clone());
                         (walk.replayed, walk.stepped) = (replayed, stepped);
                     }
                 } else {
@@ -407,7 +464,7 @@ impl<T: Clone> OpLog<T> {
             stepped: walk.stepped,
             records: walk.records.iter().count(),
         };
-        (out.out, stats)
+        (out, stats)
     }
 
     /// Where a replay is critical, as ranges of places in it: each event
@@ -495,22 +552,42 @@ impl<T: Clone> OpLog<T> {
             }
             i += span.len();
         }
-        candidates
+        // Never at an undelete, nor anywhere from the delete it undoes to
+        // it: a fresh start forgets the records, and the item it brings
+        // back must still have one.
+        let mut forbidden: Vec<Range<usize>> = Vec::new();
+        let mut at = 0;
+        for (span, _) in order {
+            if self.kind(span.start) == Kind::Undelete {
+                for (k, u) in span.clone().enumerate() {
+                    let d = self.undeleted(u);
+                    let from =
+                        replayed_at(d, at + k).expect("a merge replays an undelete's delete");
+                    forbidden.push(from..at + k + 1);
+                }
+            }
+            at += span.len();
+        }
+        without(candidates, forbidden)
     }
 }
 
 impl<'a, T: Clone> Walk<'a, T> {
     /// A walk whose prepare version is `base`, with the document there as
     /// the placeholder.
-    fn new(log: &'a OpLog<T>, base: Vec<Lv>) -> Self {
+    fn new(log: &'a OpLog<T>, base: Vec<Lv>, base_ids: Option<Ids>) -> Self {
         let mut records = SumTree::new();
         records.push(Record::base_run(0, UNDERWATER));
         Walk {
             log,
             records,
-            prepared: base,
+            prepared: base.clone(),
             starts: BTreeMap::new(),
             targets: HashMap::new(),
+            undos: HashMap::new(),
+            undone: HashSet::new(),
+            base,
+            base_ids,
             replayed: 0,
             stepped: 0,
             fresh: true,
@@ -537,6 +614,7 @@ impl<'a, T: Clone> Walk<'a, T> {
         match event.op {
             Op::Insert { pos, .. } => self.insert(lv, pos, out),
             Op::Delete { pos } => self.delete(lv, pos, out),
+            Op::Undelete { target } => self.undelete(target, out),
         }
         self.prepared = vec![lv];
     }
@@ -554,11 +632,14 @@ impl<'a, T: Clone> Walk<'a, T> {
             return;
         }
         let rest = lv + 1..lv + n;
-        let done = if self.log.is_insert(lv) {
-            self.carry_on_typing(lv, n - 1, out.as_deref_mut())
-        } else {
-            self.carry_on_deleting(lv, n - 1, out.as_deref_mut());
-            true
+        let done = match self.log.kind(lv) {
+            Kind::Insert => self.carry_on_typing(lv, n - 1, out.as_deref_mut()),
+            Kind::Delete => {
+                self.carry_on_deleting(lv, n - 1, out.as_deref_mut());
+                true
+            }
+            // One at a time.
+            Kind::Undelete => false,
         };
         if done {
             self.replayed += n - 1;
@@ -585,7 +666,9 @@ impl<'a, T: Clone> Walk<'a, T> {
         let mut cursor = self.records.cursor::<Counts>();
         cursor.seek(&At(&key), Bias::Left);
         let record = cursor.item().expect("the insert is in the tree");
-        debug_assert!(record.last == key && record.prepare == Prepare::Inserted && !record.gone);
+        debug_assert!(
+            record.last == key && record.prepare == Prepare::Inserted && record.dead == 0
+        );
         cursor.next();
         // Defensive, as in `extend`.
         if cursor.item().is_some_and(|next| next.key <= last) {
@@ -629,17 +712,18 @@ impl<'a, T: Clone> Walk<'a, T> {
             }
             let id = record.id;
             let key = record.item_key(id);
-            let was_gone = self
+            let was_dead = self
                 .records
                 .update_at(&At(&key), Bias::Left, |r| {
                     r.prepare = Prepare::Deleted(1);
-                    std::mem::replace(&mut r.gone, true)
+                    r.dead += 1;
+                    r.dead > 1
                 })
                 .expect("the items are in the tree");
             for k in 0..m {
                 self.targets.insert(x + k, id + k);
             }
-            if !was_gone && let Some(out) = out.as_deref_mut() {
+            if !was_dead && let Some(out) = out.as_deref_mut() {
                 out.delete_run(self.effect_pos(&key, id), m);
             }
             x += m;
@@ -677,7 +761,13 @@ impl<'a, T: Clone> Walk<'a, T> {
     fn shift_all(&mut self, events: &[Lv], forward: bool) {
         let mut i = 0;
         while i < events.len() {
-            let insert = self.log.is_insert(events[i]);
+            let kind = self.log.kind(events[i]);
+            if kind == Kind::Undelete {
+                self.shift_undelete(events[i], forward);
+                i += 1;
+                continue;
+            }
+            let insert = kind == Kind::Insert;
             // The item each event shifts.
             let item = |x: Lv| if insert { x } else { self.targets[&x] };
             let first = item(events[i]);
@@ -686,7 +776,7 @@ impl<'a, T: Clone> Walk<'a, T> {
             // Which way the items go, once there are two.
             let mut step: Option<bool> = None;
             while let Some(&x) = events.get(j)
-                && self.log.is_insert(x) == insert
+                && self.log.kind(x) == kind
             {
                 let next = item(x);
                 let up = match step {
@@ -795,7 +885,7 @@ impl<'a, T: Clone> Walk<'a, T> {
     /// is `key`.
     fn effect_pos(&self, key: &Key, id: usize) -> usize {
         let (record, before) = self.record_at(key);
-        before.effect + if record.gone { 0 } else { id - record.id }
+        before.effect + if record.dead > 0 { 0 } else { id - record.id }
     }
 
     fn insert(&mut self, lv: Lv, pos: usize, out: Option<&mut Changes<'a, T>>) {
@@ -830,7 +920,7 @@ impl<'a, T: Clone> Walk<'a, T> {
                     left,
                     right,
                     prepare: Prepare::Inserted,
-                    gone: false,
+                    dead: 0,
                 };
                 match &next {
                     // In front of `next`: swap in, and it goes after.
@@ -891,7 +981,7 @@ impl<'a, T: Clone> Walk<'a, T> {
         let carries_on = record.last == before_key
             && record.right.as_ref() == right
             && record.prepare == Prepare::Inserted
-            && !record.gone;
+            && record.dead == 0;
         if !carries_on {
             return None;
         }
@@ -974,20 +1064,126 @@ impl<'a, T: Clone> Walk<'a, T> {
 
     fn delete(&mut self, lv: Lv, pos: usize, out: Option<&mut Changes<'a, T>>) {
         let (key, id) = self.prepared_item(pos, true);
-        let was_gone = self
+        let was_dead = self
             .records
             .update_at(&At(&key), Bias::Left, |r| {
                 r.prepare = Prepare::Deleted(1);
-                std::mem::replace(&mut r.gone, true)
+                r.dead += 1;
+                r.dead > 1
             })
             .expect("the item is in the tree");
         self.targets.insert(lv, id);
         // Already deleted in the effect version by a concurrent delete:
         // nothing more to do to the document.
-        if !was_gone && let Some(out) = out {
+        if !was_dead && let Some(out) = out {
             out.delete(self.effect_pos(&key, id));
         }
     }
+
+    /// Undoes delete `d`: the item it removed shows again, in both
+    /// versions, if nothing else still removes it there.
+    fn undelete(&mut self, d: Lv, out: Option<&mut Changes<'a, T>>) {
+        let count = self.undos.get(&d).copied().unwrap_or(0) + 1;
+        self.undos.insert(d, count);
+        let item = self.targets[&d];
+        let first_here = count == 1;
+        // Already undone in the effect version by a concurrent undelete.
+        let first_anywhere = self.undone.insert(d);
+        let revived = self.update_item(item, |r| {
+            if first_here {
+                r.prepare = match r.prepare {
+                    Prepare::Deleted(1) => Prepare::Inserted,
+                    Prepare::Deleted(n) => Prepare::Deleted(n - 1),
+                    state => unreachable!("undoing delete {d} of an item {state:?}"),
+                };
+            }
+            if first_anywhere {
+                r.dead -= 1;
+            }
+            first_anywhere && r.dead == 0
+        });
+        if revived && let Some(out) = out {
+            let id = self.identity(item);
+            out.insert(self.effect_pos(&self.item_key(item), item), id);
+        }
+    }
+
+    /// Adds (`forward`) or takes back undelete `x` in the prepare version:
+    /// its delete is live there while no undelete of it is.
+    fn shift_undelete(&mut self, x: Lv, forward: bool) {
+        let d = self.log.undeleted(x);
+        let before = self.undos.get(&d).copied().unwrap_or(0);
+        let after = if forward { before + 1 } else { before - 1 };
+        self.undos.insert(d, after);
+        // Only the first undelete of a delete changes anything.
+        if (before == 0) == (after == 0) {
+            return;
+        }
+        self.update_item(self.targets[&d], |r| {
+            r.prepare = match (forward, r.prepare) {
+                (true, Prepare::Deleted(1)) => Prepare::Inserted,
+                (true, Prepare::Deleted(n)) => Prepare::Deleted(n - 1),
+                (false, Prepare::Inserted) => Prepare::Deleted(1),
+                (false, Prepare::Deleted(n)) => Prepare::Deleted(n + 1),
+                (_, state) => unreachable!("shifting undelete {x} from {state:?}"),
+            };
+        });
+    }
+
+    /// Splits item `id` out of its record and changes it alone.
+    fn update_item<R>(&mut self, id: usize, f: impl FnOnce(&mut Record) -> R) -> R {
+        let key = self.item_key(id);
+        let (record, _) = self.record_at(&key);
+        if id + 1 < record.id + record.len {
+            self.split(&record, id + 1 - record.id);
+        }
+        if id > record.id {
+            self.split(&record, id - record.id);
+        }
+        self.records
+            .update_at(&At(&key), Bias::Left, f)
+            .expect("the item is in the tree")
+    }
+
+    /// The insert item `id` came from: a base item's is found by its place
+    /// in the base document.
+    fn identity(&mut self, id: usize) -> Lv {
+        if id < BASE_ITEM {
+            return id;
+        }
+        if self.base_ids.is_none() {
+            self.base_ids = Some(self.log.ids_at(&self.base));
+        }
+        self.base_ids
+            .as_ref()
+            .expect("just made")
+            .get(id - BASE_ITEM)
+    }
+}
+
+/// `ranges` (sorted, apart) with every place in `cut` taken out.
+fn without(ranges: Vec<Range<usize>>, mut cut: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    if cut.is_empty() {
+        return ranges;
+    }
+    cut.sort_unstable_by_key(|c| c.start);
+    let mut out = Vec::new();
+    for range in ranges {
+        let mut start = range.start;
+        for c in cut
+            .iter()
+            .filter(|c| c.end > range.start && c.start < range.end)
+        {
+            if c.start > start {
+                out.push(start..c.start);
+            }
+            start = start.max(c.end);
+        }
+        if start < range.end {
+            out.push(start..range.end);
+        }
+    }
+    out
 }
 
 /// Compares right origins, where `None` is after everything.

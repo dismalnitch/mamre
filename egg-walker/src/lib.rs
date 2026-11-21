@@ -24,6 +24,7 @@
 //! prepare version by walking only as far back as it changes. A simpler walk
 //! over a plain list is kept to check it against, change for change.
 
+mod ids;
 mod key;
 mod oplog;
 mod order;

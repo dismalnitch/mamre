@@ -3,9 +3,11 @@
 //! the document from scratch, by definition, before applying it.
 //!
 //! No retreating, advancing or effect positions: an item exists at a
-//! version if its insert is in it, and is visible if no delete in it
-//! removed it. The walk must agree with this on every history. They share
+//! version if its insert is in it, and is visible if every delete in it that
+//! removed it is undone there too (some undelete of it is in the version). The walk must agree with this on every history. They share
 //! only the ordering rule for concurrent inserts.
+
+use std::collections::HashMap;
 
 use crate::oplog::{Lv, Op, OpLog};
 use crate::order::{Placed, place};
@@ -33,7 +35,38 @@ impl<T> Placed for Item<T> {
 
 /// The document at `version`, the slow way.
 pub fn checkout<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<T> {
+    let at = log.closure(version);
+    let (list, visible) = replay(log);
+    list.into_iter()
+        .filter(|item| at[item.id] && visible(item, &at))
+        .map(|item| item.value)
+        .collect()
+}
+
+/// Which insert each item visible at `at` (a version, as a set) came
+/// from, in order: their identities.
+pub(crate) fn visible_ids<T: Clone>(log: &OpLog<T>, at: &[bool]) -> Vec<Lv> {
+    let (list, visible) = replay(log);
+    list.iter()
+        .filter(|item| at[item.id] && visible(item, at))
+        .map(|item| item.id)
+        .collect()
+}
+
+/// Every item, in order, and whether an item is visible at a version.
+#[allow(clippy::type_complexity)]
+fn replay<T: Clone>(log: &OpLog<T>) -> (Vec<Item<T>>, impl Fn(&Item<T>, &[bool]) -> bool) {
     let mut list: Vec<Item<T>> = Vec::new();
+    // Each delete's undeletes.
+    let mut undone_by: HashMap<Lv, Vec<Lv>> = HashMap::new();
+    fn visible<T>(item: &Item<T>, at: &[bool], undone_by: &HashMap<Lv, Vec<Lv>>) -> bool {
+        item.deleted_by.iter().all(|&d| {
+            !at[d]
+                || undone_by
+                    .get(&d)
+                    .is_some_and(|us| us.iter().any(|&u| at[u]))
+        })
+    }
     for lv in 0..log.len() {
         let event = log.event(lv);
         let at = log.closure(&event.parents);
@@ -43,7 +76,7 @@ pub fn checkout<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<T> {
             .iter()
             .enumerate()
             .filter(|(_, item)| at[item.id])
-            .map(|(i, item)| (i, !item.deleted_by.iter().any(|&d| at[d])))
+            .map(|(i, item)| (i, visible(item, &at, &undone_by)))
             .collect();
         // The index, in `seen`, of the `pos`th visible item, or its end.
         let nth_visible = |pos: usize| {
@@ -87,11 +120,13 @@ pub fn checkout<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<T> {
                 let k = nth_visible(*pos).expect("a delete is of an item its version shows");
                 list[seen[k].0].deleted_by.push(lv);
             }
+            Op::Undelete { target } => {
+                assert!(at[*target], "undelete {lv} undoes a delete it includes");
+                undone_by.entry(*target).or_default().push(lv);
+            }
         }
     }
-    let at = log.closure(version);
-    list.into_iter()
-        .filter(|item| at[item.id] && !item.deleted_by.iter().any(|&d| at[d]))
-        .map(|item| item.value)
-        .collect()
+    (list, move |item: &Item<T>, at: &[bool]| {
+        visible(item, at, &undone_by)
+    })
 }
