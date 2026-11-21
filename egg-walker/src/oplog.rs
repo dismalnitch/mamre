@@ -147,11 +147,6 @@ impl<T: Clone> OpLog<T> {
         }
     }
 
-    /// Where the run holding event `lv` ends: the event after its last.
-    pub(crate) fn run_end(&self, lv: Lv) -> Lv {
-        self.run_of(lv).end()
-    }
-
     /// Just the operation of event `lv`.
     pub(crate) fn op(&self, lv: Lv) -> Op<T> {
         let run = self.run_of(lv);
@@ -333,10 +328,56 @@ impl<T> OpLog<T> {
     }
 
     fn run_of(&self, lv: Lv) -> &Run<T> {
-        let i = self.runs.partition_point(|r| r.start <= lv);
-        let run = &self.runs[i - 1];
-        debug_assert!(lv < run.end(), "event {lv} isn't in the log");
-        run
+        &self.runs[self.run_index(lv)]
+    }
+
+    fn run_index(&self, lv: Lv) -> usize {
+        let i = self.runs.partition_point(|r| r.start <= lv) - 1;
+        debug_assert!(lv < self.runs[i].end(), "event {lv} isn't in the log");
+        i
+    }
+
+    /// Sorted events as spans, each inside one run.
+    pub(crate) fn spans_of(&self, events: &[Lv]) -> Vec<Range<Lv>> {
+        let mut spans: Vec<Range<Lv>> = Vec::new();
+        let mut end = 0;
+        for &lv in events {
+            match spans.last_mut() {
+                Some(span) if span.end == lv && lv < end => span.end += 1,
+                _ => {
+                    end = self.run_of(lv).end();
+                    spans.push(lv..lv + 1);
+                }
+            }
+        }
+        spans
+    }
+
+    /// Everything `version` includes, as spans, each inside one run. A run
+    /// is included up to some event, so this costs what the runs do, not
+    /// the events.
+    fn closure_spans(&self, version: &[Lv]) -> Vec<Range<Lv>> {
+        // How far into each run is included.
+        let mut upto = vec![0; self.runs.len()];
+        let mut stack: Vec<Lv> = version.to_vec();
+        while let Some(lv) = stack.pop() {
+            let r = self.run_index(lv);
+            let run = &self.runs[r];
+            let want = lv - run.start + 1;
+            if want <= upto[r] {
+                continue;
+            }
+            if upto[r] == 0 {
+                stack.extend(&run.parents);
+            }
+            upto[r] = want;
+        }
+        self.runs
+            .iter()
+            .zip(upto)
+            .filter(|&(_, n)| n > 0)
+            .map(|(run, n)| run.start..run.start + n)
+            .collect()
     }
 
     /// This log's number for the event `agent` numbered `seq`.
@@ -376,12 +417,14 @@ impl<T> OpLog<T> {
     /// versions met, not the whole history; unmerged branches elsewhere
     /// don't count, and the base can be several events (two people's work,
     /// merged).
-    pub(crate) fn conflict(&self, from: &[Lv], to: &[Lv]) -> (Vec<Lv>, Vec<Lv>, Vec<Lv>) {
+    pub(crate) fn conflict(
+        &self,
+        from: &[Lv],
+        to: &[Lv],
+    ) -> (Vec<Range<Lv>>, Vec<Range<Lv>>, Vec<Lv>) {
         // From nothing: everything in `to` is new, and there's no base.
         if from.is_empty() {
-            let have = self.closure(to);
-            let new = (0..self.len()).filter(|&lv| have[lv]).collect();
-            return (Vec::new(), new, Vec::new());
+            return (Vec::new(), self.closure_spans(to), Vec::new());
         }
         const FROM: u8 = 1;
         const TO: u8 = 2;
@@ -426,7 +469,7 @@ impl<T> OpLog<T> {
                     }
                     old.sort_unstable();
                     new.sort_unstable();
-                    return (old, new, base);
+                    return (self.spans_of(&old), self.spans_of(&new), base);
                 }
             }
             let Some((lv, side)) = queue.pop_last() else {

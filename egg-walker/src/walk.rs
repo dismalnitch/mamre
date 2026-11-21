@@ -348,56 +348,59 @@ impl<T: Clone> OpLog<T> {
         }
         // First what the document already holds past the base, to set up
         // its state, then what's new. Parents come first either way:
-        // `from` holds all its events' parents.
-        let order: Vec<(Lv, bool)> = old
+        // `from` holds all its events' parents. Each span is events of one
+        // run, replayed one after another.
+        let order: Vec<(Range<Lv>, bool)> = old
             .iter()
-            .map(|&lv| (lv, false))
-            .chain(new.iter().map(|&lv| (lv, true)))
+            .map(|span| (span.clone(), false))
+            .chain(new.iter().map(|span| (span.clone(), true)))
             .collect();
         let critical = self.critical_points(&order, &old, &new, &base);
+        let mut critical = critical.iter().peekable();
         let mut walk = Walk::new(self, base);
         let mut out = Changes::new(self);
-        let mut i = 0;
-        while i < order.len() {
-            let (lv, output) = order[i];
-            // It and the rest of its run replayed straight after it, alike
-            // critical or not: each the last one's only child, carrying on
-            // what it did.
-            let end = self.run_end(lv);
-            let mut j = i + 1;
-            while j < order.len()
-                && order[j] == (order[j - 1].0 + 1, output)
-                && order[j].0 < end
-                && critical[j] == critical[i]
-            {
-                j += 1;
-            }
-            let n = j - i;
-            if critical[i] {
-                // Each saw everything replayed before it, and everything
-                // after sees it: its position is final, and nothing will
-                // ever reach back past it. Apply them as they are, and
-                // start afresh from the last.
-                walk.replayed += n;
-                if output {
-                    match self.op(lv) {
-                        Op::Insert { pos, .. } => out.insert_run(pos, lv, n),
-                        Op::Delete { pos } => out.delete_run(pos, n),
+        // How many events have been replayed: where the next is in `order`.
+        let mut at = 0;
+        for (span, output) in order {
+            let mut lv = span.start;
+            while lv < span.end {
+                // The stretch from here that's all critical, or none of it.
+                while critical.next_if(|c| c.end <= at).is_some() {}
+                let (is_critical, until) = match critical.peek() {
+                    Some(c) if c.start <= at => (true, c.end),
+                    Some(c) => (false, c.start),
+                    None => (false, usize::MAX),
+                };
+                let n = (span.end - lv).min(until - at);
+                if is_critical {
+                    // Each saw everything replayed before it, and everything
+                    // after sees it: its position is final, and nothing will
+                    // ever reach back past it. Apply them as they are, and
+                    // start afresh from the last.
+                    walk.replayed += n;
+                    if output {
+                        match self.op(lv) {
+                            Op::Insert { pos, .. } => out.insert_run(pos, lv, n),
+                            Op::Delete { pos } => out.delete_run(pos, n),
+                        }
                     }
-                }
-                let last = lv + n - 1;
-                if walk.fresh {
-                    walk.prepared.clear();
-                    walk.prepared.push(last);
+                    let last = lv + n - 1;
+                    if walk.fresh {
+                        walk.prepared.clear();
+                        walk.prepared.push(last);
+                    } else {
+                        let (replayed, stepped) = (walk.replayed, walk.stepped);
+                        walk = Walk::new(self, vec![last]);
+                        (walk.replayed, walk.stepped) = (replayed, stepped);
+                    }
                 } else {
-                    let (replayed, stepped) = (walk.replayed, walk.stepped);
-                    walk = Walk::new(self, vec![last]);
-                    (walk.replayed, walk.stepped) = (replayed, stepped);
+                    // Each the last one's only child, carrying on what it
+                    // did.
+                    walk.step_run(lv, n, output.then_some(&mut out));
                 }
-            } else {
-                walk.step_run(lv, n, output.then_some(&mut out));
+                lv += n;
+                at += n;
             }
-            i = j;
         }
         let stats = Stats {
             replayed: walk.replayed,
@@ -407,75 +410,92 @@ impl<T: Clone> OpLog<T> {
         (out.out, stats)
     }
 
-    /// Which events in a replay are critical: each saw everything replayed
-    /// before it (its parents are all of it), and everything replayed after
-    /// it descends from it. There the walk needs no history at all.
+    /// Where a replay is critical, as ranges of places in it: each event
+    /// there saw everything replayed before it (its parents are all of it),
+    /// and everything replayed after it descends from it. There the walk
+    /// needs no history at all.
     ///
     /// Found in one pass: an event is a candidate if its parents are the
     /// whole frontier so far, and a later event that doesn't descend from a
     /// candidate rules it out. A later event descends from a candidate if
     /// any parent was replayed at or after it; candidates form a chain, so
-    /// the ones ruled out are the latest.
+    /// the ones ruled out are the latest. Within a span, each event's only
+    /// parent is the one before, replayed just before it: none rules
+    /// anything out, and each sees everything if the first did.
     fn critical_points(
         &self,
-        order: &[(Lv, bool)],
-        old: &[Lv],
-        new: &[Lv],
+        order: &[(Range<Lv>, bool)],
+        old: &[Range<Lv>],
+        new: &[Range<Lv>],
         base: &[Lv],
-    ) -> Vec<bool> {
-        // Where an event was replayed, if it was: `order` is `old` then
-        // `new`, each sorted, and only what's replayed so far counts.
-        let at = |lv: Lv, i: usize| {
-            let found = match old.binary_search(&lv) {
-                Ok(k) => Some(k),
-                Err(_) => new.binary_search(&lv).ok().map(|k| old.len() + k),
-            };
-            found.filter(|&k| k < i)
+    ) -> Vec<Range<usize>> {
+        // Where an event was replayed, if it was before `i`: `order` is
+        // `old` then `new`, each sorted.
+        let starts = |spans: &[Range<Lv>]| -> Vec<usize> {
+            spans
+                .iter()
+                .scan(0, |n, span| {
+                    let start = *n;
+                    *n += span.len();
+                    Some(start)
+                })
+                .collect()
+        };
+        let (old_at, new_at) = (starts(old), starts(new));
+        let old_len: usize = old.iter().map(|s| s.len()).sum();
+        let find = |spans: &[Range<Lv>], at: &[usize], lv: Lv| {
+            let k = spans.partition_point(|s| s.end <= lv);
+            spans
+                .get(k)
+                .filter(|s| s.start <= lv)
+                .map(|s| at[k] + lv - s.start)
+        };
+        let replayed_at = |lv: Lv, i: usize| {
+            find(old, &old_at, lv)
+                .or_else(|| find(new, &new_at, lv).map(|k| old_len + k))
+                .filter(|&k| k < i)
         };
         let mut frontier: Vec<Lv> = base.to_vec();
         frontier.sort_unstable();
         let mut parents: Vec<Lv> = Vec::new();
-        let mut candidates: Vec<usize> = Vec::new();
+        let mut candidates: Vec<Range<usize>> = Vec::new();
         let mut i = 0;
-        while i < order.len() {
-            let lv = order[i].0;
+        for (span, _) in order {
             parents.clear();
-            parents.extend(self.parents(lv));
+            parents.extend(self.parents(span.start));
             parents.sort_unstable();
-            let latest = parents.iter().filter_map(|&p| at(p, i)).max();
-            while let Some(&c) = candidates.last()
-                && latest.is_none_or(|l| l < c)
-            {
-                candidates.pop();
+            // Rule out the candidates it doesn't descend from: those after
+            // its latest parent.
+            match parents.iter().filter_map(|&p| replayed_at(p, i)).max() {
+                None => candidates.clear(),
+                Some(latest) => {
+                    while let Some(c) = candidates.last_mut() {
+                        if c.start > latest {
+                            candidates.pop();
+                        } else {
+                            c.end = c.end.min(latest + 1);
+                            break;
+                        }
+                    }
+                }
             }
-            // The rest of its run replayed straight after it: each one's
-            // only parent is the one before, replayed just before it, so
-            // none rules out a candidate, and each sees everything if the
-            // first did.
-            let end = self.run_end(lv);
-            let mut j = i + 1;
-            while j < order.len() && order[j].0 == order[j - 1].0 + 1 && order[j].0 < end {
-                j += 1;
-            }
-            let last = order[j - 1].0;
-            let sees_everything = parents == frontier;
-            if sees_everything {
+            let last = span.end - 1;
+            if parents == frontier {
                 // The usual case, typing: the frontier becomes just this.
                 frontier.clear();
                 frontier.push(last);
-                candidates.extend(i..j);
+                match candidates.last_mut() {
+                    Some(c) if c.end == i => c.end = i + span.len(),
+                    _ => candidates.push(i..i + span.len()),
+                }
             } else {
                 frontier.retain(|f| !parents.contains(f));
                 frontier.push(last);
                 frontier.sort_unstable();
             }
-            i = j;
+            i += span.len();
         }
-        let mut critical = vec![false; order.len()];
-        for c in candidates {
-            critical[c] = true;
-        }
-        critical
+        candidates
     }
 }
 
@@ -1114,7 +1134,8 @@ mod tests {
         let n = log.add_insert(alice, &c, 0, [5]);
         let (old, new, base) = log.conflict(&from, &n);
         assert!(base.is_empty(), "nothing is under every replayed event");
-        assert_eq!((old.len(), new.len()), (4, 1));
+        let count = |spans: &[Range<Lv>]| spans.iter().map(|s| s.len()).sum::<usize>();
+        assert_eq!((count(&old), count(&new)), (4, 1));
         let mut doc = log.checkout(&from);
         for change in log.changes(&from, &n) {
             change.apply(&mut doc);
