@@ -36,9 +36,9 @@ pub enum Unit {
     /// whitespace is not a boundary.
     VimParagraph,
     /// A markdown section: from a heading line to the next heading. A
-    /// heading is simplified to a line starting with one or more `#`
-    /// followed by a space, a tab or the end of the line; no indentation,
-    /// no limit of six.
+    /// heading is CommonMark's ATX heading, simplified: a line starting with
+    /// one to six `#`, its level, followed by a space, a tab or the end of
+    /// the line. No leading indentation.
     Section,
 }
 
@@ -117,7 +117,7 @@ impl Unit {
     /// Whether a unit is still waiting to be recognized when the text ends
     /// in this state: a heading line with nothing after its `#`s yet.
     pub(crate) fn pending(self, state: u8) -> bool {
-        self == Unit::Section && state == section::HASHES
+        self == Unit::Section && section::pending(state).is_some()
     }
 
     /// Whether the machine is inside a unit in this state, so one is open
@@ -456,23 +456,45 @@ mod vim_paragraph {
     }
 }
 
-/// Markdown sections: a heading is confirmed by the space, tab or newline
-/// after its `#`s, and the section runs to the next one.
-mod section {
+/// Markdown headings: confirmed by the space, tab or newline after one to
+/// six `#` at the start of a line; a section runs to the next heading.
+///
+/// States: `LINE_START`, then 1 to 6 for that many `#` so far, then
+/// `OTHER` for the rest of a line that isn't (or is past) a heading's
+/// marker.
+pub(crate) mod section {
     pub const START: u8 = LINE_START;
-    const LINE_START: u8 = 0;
-    pub const HASHES: u8 = 1;
-    const OTHER: u8 = 2;
+    pub const LINE_START: u8 = 0;
+    const OTHER: u8 = 7;
+    /// How many states there are.
+    pub const STATES: usize = 8;
+
+    /// One step: the next state, and the level of the heading this `char`
+    /// confirms, or 0.
+    pub fn heading(state: u8, c: char) -> (u8, u8) {
+        let hashes = (1..=6).contains(&state);
+        match c {
+            '\n' => (LINE_START, if hashes { state } else { 0 }),
+            '#' if state == LINE_START => (1, 0),
+            '#' if hashes && state < 6 => (state + 1, 0),
+            // A `\r` ends the line's marker like a space does (it's a line
+            // ending in CommonMark), so `#\r\n` is an empty heading and
+            // `#\r#` is no deeper than one `#`.
+            ' ' | '\t' | '\r' if hashes => (OTHER, state),
+            // Anything else, including a seventh `#`: not a heading.
+            _ => (OTHER, 0),
+        }
+    }
 
     pub fn step(state: u8, c: char) -> (u8, bool, bool) {
-        match (state, c) {
-            (_, '\n') => (LINE_START, state == HASHES, false),
-            (LINE_START | HASHES, '#') => (HASHES, false, false),
-            // A `\r` before the `\n` of a heading line changes nothing.
-            (HASHES, '\r') => (HASHES, false, false),
-            (HASHES, ' ' | '\t') => (OTHER, true, false),
-            _ => (OTHER, false, false),
-        }
+        let (next, level) = heading(state, c);
+        (next, level > 0, false)
+    }
+
+    /// The level of a heading still waiting for its space or newline when
+    /// the text ends in this state; at the very end, it counts.
+    pub fn pending(state: u8) -> Option<u8> {
+        (1..=6).contains(&state).then_some(state)
     }
 }
 
@@ -558,5 +580,10 @@ mod tests {
             "a heading still open at the end counts"
         );
         assert_eq!(pieces(Unit::Section, "a # b\n"), Vec::<&str>::new());
+        assert_eq!(
+            pieces(Unit::Section, "###### Six\n####### Seven\n"),
+            ["###### Six\n####### Seven\n"],
+            "seven `#` isn't a heading"
+        );
     }
 }

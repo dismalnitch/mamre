@@ -12,6 +12,7 @@
 //! by neighbour, near the cursor, whether it's counted or not; see
 //! [`Rope::next_boundary`](crate::Rope::next_boundary).
 
+use crate::outline::Sections;
 use crate::units::{Scan, Unit, UnitState};
 
 /// Something counted over text, built from one chunk and combined in order:
@@ -31,9 +32,15 @@ pub trait Measure: Copy + PartialEq + std::fmt::Debug {
         let _ = unit;
         None
     }
+
+    /// This measure's headings, if it keeps them. This is what lets a rope
+    /// answer outline questions; see [`Rope::address_at`](crate::Rope::address_at).
+    fn sections(&self) -> Option<&Sections> {
+        None
+    }
 }
 
-/// Both measures; a unit comes from whichever counts it.
+/// Both measures; a unit, or the headings, come from whichever keeps them.
 impl<A: Measure, B: Measure> Measure for (A, B) {
     fn empty() -> Self {
         (A::empty(), B::empty())
@@ -50,6 +57,10 @@ impl<A: Measure, B: Measure> Measure for (A, B) {
 
     fn unit(&self, unit: Unit) -> Option<UnitState> {
         self.0.unit(unit).or_else(|| self.1.unit(unit))
+    }
+
+    fn sections(&self) -> Option<&Sections> {
+        self.0.sections().or_else(|| self.1.sections())
     }
 }
 
@@ -117,42 +128,6 @@ impl Measure for Prose {
     }
 }
 
-/// Markdown headings, each starting a section; see [`Unit::Section`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Sections {
-    section: Scan<3>,
-}
-
-impl Sections {
-    /// Headings, each of which starts a section.
-    pub fn sections(&self) -> usize {
-        let s = self.section.from(Unit::Section.start_state());
-        s.starts + Unit::Section.pending(s.state) as usize
-    }
-}
-
-impl Measure for Sections {
-    fn empty() -> Self {
-        Sections {
-            section: Scan::identity(),
-        }
-    }
-
-    fn measure(text: &str) -> Self {
-        Sections {
-            section: Scan::of(text, Unit::Section),
-        }
-    }
-
-    fn concat(&mut self, next: &Self) {
-        self.section = self.section.then(&next.section);
-    }
-
-    fn unit(&self, unit: Unit) -> Option<UnitState> {
-        (unit == Unit::Section).then(|| self.section.from(unit.start_state()))
-    }
-}
-
 /// Prose and sections: the counts a markdown document's editor wants.
 pub type Markdown = (Prose, Sections);
 
@@ -173,8 +148,8 @@ pub(crate) mod tests {
         assert_eq!(md("日本 語").0.words(), 2);
         assert_eq!(md("a\n\nb\n c\n\n\n d").0.paragraphs(), 3);
         assert_eq!(md("a\r\n\r\nb").0.paragraphs(), 2, "a lone \\r is blank");
-        assert_eq!(md("# A\ntext\n## B\n#tag\n#").1.sections(), 3);
-        assert_eq!(md("# A\r\n## B").1.sections(), 2);
+        assert_eq!(md("# A\ntext\n## B\n#tag\n#").1.count(), 3);
+        assert_eq!(md("# A\r\n## B").1.count(), 2);
     }
 
     #[test]
@@ -231,7 +206,7 @@ pub(crate) mod tests {
             for unit in [Unit::Word, Unit::Paragraph] {
                 prop_assert_eq!(m.unit(unit).unwrap().starts, unit.ranges(&text).len(), "{:?}", unit);
             }
-            prop_assert_eq!(m.1.sections(), Unit::Section.ranges(&text).len());
+            prop_assert_eq!(m.1.count(), Unit::Section.ranges(&text).len());
         }
     }
 }

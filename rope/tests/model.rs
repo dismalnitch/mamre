@@ -3,7 +3,9 @@
 //! every edit cuts and joins chunks and trees are several levels tall, and
 //! with the default chunk size.
 
-use mamre_rope::{Edge, Markdown, Measure, Plain, Point, Prose, Rope, Sections, TextSummary, Unit};
+use mamre_rope::{
+    Address, Edge, Markdown, Measure, Plain, Point, Prose, Rope, Sections, TextSummary, Unit,
+};
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -107,7 +109,54 @@ fn verify<const N: usize>(rope: &Rope<Markdown, N>, text: &str) -> Result<(), St
         }
     }
     verify_units(rope, text)?;
-    verify_neighbours(rope, text)
+    verify_neighbours(rope, text)?;
+    verify_outline(rope, text)
+}
+
+/// Every heading's start and address, the slow way: fold over the section
+/// ranges, reading each heading's level off its `#`s.
+fn headings(text: &str) -> Vec<(usize, Address)> {
+    let mut levels = [0u32; 6];
+    Unit::Section
+        .ranges(text)
+        .into_iter()
+        .map(|r| {
+            let level = text[r.start..].bytes().take_while(|&b| b == b'#').count();
+            levels[level - 1] += 1;
+            levels[level..].fill(0);
+            (r.start, Address::new(&levels).unwrap())
+        })
+        .collect()
+}
+
+/// The address of a stride of positions, and where every heading's address
+/// leads, against the slow fold.
+fn verify_outline<const N: usize>(rope: &Rope<Markdown, N>, text: &str) -> Result<(), String> {
+    let headings = headings(text);
+    let stride = (text.len() / 60).max(1);
+    let offsets = text.char_indices().map(|(i, _)| i).chain([text.len()]);
+    for offset in offsets.step_by(stride) {
+        let want = headings
+            .iter()
+            .rfind(|(start, _)| *start <= offset)
+            .map_or(Address::default(), |(_, a)| *a);
+        let got = rope.address_at(offset);
+        if got != want {
+            return Err(format!("address_at({offset}) is {got}, want {want}"));
+        }
+    }
+    for (start, address) in &headings {
+        let got = rope.heading_at(*address);
+        if got != Some(*start) {
+            return Err(format!("heading_at({address}) is {got:?}, want {start}"));
+        }
+    }
+    for missing in [Address::default(), Address::new(&[9999]).unwrap()] {
+        if let Some(got) = rope.heading_at(missing) {
+            return Err(format!("heading_at({missing}) is {got}, want none"));
+        }
+    }
+    Ok(())
 }
 
 /// The units a `Markdown` rope counts, and so can find by number.
@@ -321,7 +370,7 @@ fn a_markdown_rope_counts_units() {
     // are words, and a heading with a line under it is one paragraph.
     assert_eq!(prose.words(), 8);
     assert_eq!(prose.paragraphs(), 3);
-    assert_eq!(sections.sections(), 2);
+    assert_eq!(sections.count(), 2);
     assert_eq!(rope.count(Unit::Word), 8);
     assert_eq!(rope.count(Unit::Section), 2);
 }
@@ -399,4 +448,24 @@ proptest! {
         let rope = Rope::<Plain, 4>::from(text.as_str());
         verify_neighbours(&rope, &text).map_err(TestCaseError::fail)?;
     }
+}
+
+#[test]
+fn the_outline_both_ways() {
+    let text = "Intro.\n# One\n## One.A\ntext\n## One.B\n# Two\n### Two.0.A\nend";
+    let rope: Rope<Markdown, 4> = Rope::from(text);
+    let at = |s: &str| text.find(s).unwrap();
+    let address = |levels: &[u32]| Address::new(levels).unwrap();
+
+    assert_eq!(rope.address_at(0).to_string(), "0", "before any heading");
+    assert_eq!(rope.address_at(at("text")).to_string(), "1.1");
+    assert_eq!(
+        rope.address_at(at("One.B")).to_string(),
+        "1.2",
+        "on the heading line itself"
+    );
+    assert_eq!(rope.address_at(at("end")).to_string(), "2.0.1");
+    assert_eq!(rope.heading_at(address(&[1, 2])), Some(at("## One.B")));
+    assert_eq!(rope.heading_at(address(&[2])), Some(at("# Two")));
+    assert_eq!(rope.heading_at(address(&[2, 1])), None, "Two has no 2.1");
 }

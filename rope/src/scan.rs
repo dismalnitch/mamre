@@ -220,7 +220,7 @@ impl<M: Measure, const N: usize> Rope<M, N> {
     }
 
     /// The `char`s from byte `pos` on, with their offsets.
-    fn chars_from(&self, pos: usize) -> impl Iterator<Item = (usize, char)> + '_ {
+    pub(crate) fn chars_from(&self, pos: usize) -> impl Iterator<Item = (usize, char)> + '_ {
         let mut cursor = self.tree.cursor::<ByteOffset>();
         cursor.seek(&ByteOffset(pos), Bias::Right);
         let mut first = true;

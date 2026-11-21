@@ -16,6 +16,11 @@
 //!   [`Rope::next_boundary`] and [`Rope::prev_boundary`], which is what
 //!   motions want.
 //!
+//! A rope that keeps [`Sections`] also knows its outline: the [`Address`]
+//! of any position (`3.2` is chapter 3, section 2), and where any address's
+//! heading is, both in O(log n). See [`Rope::address_at`] and
+//! [`Rope::heading_at`].
+//!
 //! Positions are byte offsets, as for `str`, and must fall on `char`
 //! boundaries. Lines are split on `\n` only; a `\r` is ordinary text, so
 //! turning `\r\n` into `\n` is up to whoever loads the file.
@@ -25,6 +30,7 @@
 //! it that way, so a rope of `n` bytes has fewer than `2n / N + 1` chunks.
 
 mod measure;
+mod outline;
 mod scan;
 mod seek;
 mod summary;
@@ -37,7 +43,8 @@ use std::ops::Range;
 use arrayvec::ArrayString;
 use mamre::{Item, SumTree, cursor::Bias};
 
-pub use measure::{Markdown, Measure, Plain, Prose, Sections};
+pub use measure::{Markdown, Measure, Plain, Prose};
+pub use outline::{Address, Sections};
 pub use scan::Edge;
 pub use summary::{ByteOffset, CharOffset, Point, TextSummary};
 pub use units::{Scan, Step, Unit, UnitState};
