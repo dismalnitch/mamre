@@ -37,6 +37,29 @@ impl<T: Item, const CAP: usize> SumTree<T, CAP> {
         })
     }
 
+    /// A tree whose root holds `children`, whose summaries are already
+    /// known: a slice of some node's children, shared, not copied. Any
+    /// number up to `CAP`: one is just that child, none an empty tree.
+    pub(crate) fn from_children(children: &[SumTree<T, CAP>], summaries: &[T::Summary]) -> Self {
+        debug_assert_eq!(children.len(), summaries.len());
+        let (first, only) = match children {
+            [] => return SumTree::new(),
+            [only] => (only, true),
+            [first, ..] => (first, false),
+        };
+        // An internal node has two children or more: one is just itself.
+        if only {
+            return first.clone();
+        }
+        let child_summaries: ArrayVec<T::Summary, CAP> = summaries.iter().cloned().collect();
+        Self::from_node(Node::Internal {
+            height: first.height() + 1,
+            summary: sum_all(&child_summaries),
+            children: children.iter().cloned().collect(),
+            child_summaries,
+        })
+    }
+
     pub fn summary(&self) -> &T::Summary {
         self.root.summary()
     }
@@ -215,30 +238,48 @@ fn extend_or_split<E, const CAP: usize>(
     incoming: impl ExactSizeIterator<Item = E>,
     side: Side,
 ) -> Option<ArrayVec<E, CAP>> {
-    let total = v.len() + incoming.len();
+    let n = incoming.len();
+    let total = v.len() + n;
     debug_assert!(total <= 2 * CAP, "{total} entries can't fill two nodes");
-    let keep = if total <= CAP { total } else { total / 2 };
+    let mut incoming = incoming;
 
-    // Lay everything out in order, then deal `keep` to `v` and the rest to
-    // the split-off half, from whichever end `side` says.
-    let old: ArrayVec<E, CAP> = v.drain(..).collect();
-    let split_off = match side {
+    // Only live entries move: no node-sized temporaries, which for big
+    // items (a rope's chunks) cost more than everything else an edit does.
+    if total <= CAP {
+        v.extend(incoming);
+        if side == Side::Front {
+            v.rotate_right(n);
+        }
+        return None;
+    }
+    let keep = total / 2;
+    let mut split_off = ArrayVec::new();
+    match side {
+        // In order, `v` then `incoming`: `v` keeps the first `keep`.
         Side::Back => {
-            let mut all = old.into_iter().chain(incoming);
-            v.extend(all.by_ref().take(keep));
-            all.collect::<ArrayVec<E, CAP>>()
+            if keep <= v.len() {
+                split_off.extend(v.drain(keep..));
+                split_off.extend(incoming);
+            } else {
+                v.extend(incoming.by_ref().take(keep - v.len()));
+                split_off.extend(incoming);
+            }
         }
+        // In order, `incoming` then `v`: `v` keeps the last `keep`.
         Side::Front => {
-            let mut all = incoming.chain(old);
-            let split_off = all
-                .by_ref()
-                .take(total - keep)
-                .collect::<ArrayVec<E, CAP>>();
-            v.extend(all);
-            split_off
+            let give = total - keep;
+            if give <= n {
+                split_off.extend(incoming.by_ref().take(give));
+                let rest = n - give;
+                v.extend(incoming);
+                v.rotate_right(rest);
+            } else {
+                split_off.extend(incoming);
+                split_off.extend(v.drain(..give - n));
+            }
         }
-    };
-    (total > CAP).then_some(split_off)
+    }
+    Some(split_off)
 }
 
 fn sum_all<S: Summary, const CAP: usize>(children: &ArrayVec<S, CAP>) -> S {
@@ -491,18 +532,37 @@ impl<T: Item, const CAP: usize> Node<T, CAP> {
         }
 
         // Same height: `other` is our sibling, so its entries join ours. Moves
-        // them if nothing else shares `other`'s root, clones them if something does.
-        match Arc::unwrap_or_clone(other.root) {
-            Node::Leaf {
+        // them if nothing else shares `other`'s root, clones them if something
+        // does. Entry by entry either way, never the node whole: a node is as
+        // big as a full leaf, which for big items is most of an edit's cost.
+        let mut root = other.root;
+        match Arc::get_mut(&mut root) {
+            Some(Node::Leaf {
                 items,
                 item_summaries,
                 ..
-            } => self.extend_leaf(items.into_iter(), item_summaries.into_iter(), side),
-            Node::Internal {
+            }) => self.extend_leaf(items.drain(..), item_summaries.drain(..), side),
+            Some(Node::Internal {
                 children,
                 child_summaries,
                 ..
-            } => self.extend_internal(children.into_iter(), child_summaries.into_iter(), side),
+            }) => self.extend_internal(children.drain(..), child_summaries.drain(..), side),
+            None => match &*root {
+                Node::Leaf {
+                    items,
+                    item_summaries,
+                    ..
+                } => self.extend_leaf(items.iter().cloned(), item_summaries.iter().cloned(), side),
+                Node::Internal {
+                    children,
+                    child_summaries,
+                    ..
+                } => self.extend_internal(
+                    children.iter().cloned(),
+                    child_summaries.iter().cloned(),
+                    side,
+                ),
+            },
         }
     }
 

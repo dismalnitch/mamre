@@ -188,6 +188,9 @@ impl<M: Measure, const N: usize> Rope<M, N> {
     /// boundaries.
     pub fn replace(&mut self, range: Range<usize>, text: &str) {
         self.check_range(&range);
+        if self.replace_in_chunk(&range, text) {
+            return;
+        }
         let mut out = self.prefix(range.start);
         out.push_str(text);
         out.append(self.suffix_from(range.end));
@@ -301,6 +304,49 @@ impl<M: Measure, const N: usize> Rope<M, N> {
             prev = Some(len);
         }
         Ok(())
+    }
+
+    /// Replaces `range` inside the one chunk holding it, in place, if the
+    /// result still fits there and keeps the chunks as full as they must be:
+    /// most edits, typing above all, which then copy only the path down to
+    /// the chunk. Whether it did.
+    fn replace_in_chunk(&mut self, range: &Range<usize>, text: &str) -> bool {
+        let mut cursor = self.tree.cursor::<ByteOffset>();
+        cursor.seek(&ByteOffset(range.start), Bias::Right);
+        let Some(chunk) = cursor.item() else {
+            return false;
+        };
+        let start = cursor.start().0;
+        let (a, b) = (range.start - start, range.end - start);
+        let len = chunk.text.len();
+        if b > len {
+            return false;
+        }
+        let new_len = len - (b - a) + text.len();
+        if new_len == 0 || new_len > N {
+            return false;
+        }
+        if new_len < len {
+            // Shrinking: each neighbour must still not fit alongside it.
+            let mut around = cursor.clone();
+            around.prev();
+            let before = around.item().map_or(0, |c| c.text.len());
+            let mut around = cursor.clone();
+            around.next();
+            let after = around.item().map_or(0, |c| c.text.len());
+            if (before > 0 && before + new_len <= N) || (after > 0 && new_len + after <= N) {
+                return false;
+            }
+        }
+        self.tree
+            .update_at::<ByteOffset, _>(&ByteOffset(range.start), Bias::Right, |chunk| {
+                let mut edited = ArrayString::new();
+                edited.push_str(&chunk.text[..a]);
+                edited.push_str(text);
+                edited.push_str(&chunk.text[b..]);
+                chunk.text = edited;
+            });
+        true
     }
 
     /// Everything before byte `end`.

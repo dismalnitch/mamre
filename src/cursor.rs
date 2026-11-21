@@ -403,12 +403,17 @@ impl<'a, T: Item, D: Dimension<T::Summary>, const CAP: usize> Cursor<'a, T, D, C
                 item_summaries,
                 ..
             } => SumTree::from_leaf(&items[i..j], &item_summaries[i..j]),
-            Node::Internal { children, .. } => {
+            Node::Internal {
+                children,
+                child_summaries,
+                ..
+            } => {
                 let mut out = SumTree::new();
                 append_right_of(&a[k + 1..], &mut out);
-                for child in &children[i + 1..j] {
-                    out.append(child.clone());
-                }
+                out.append(SumTree::from_children(
+                    &children[i + 1..j],
+                    &child_summaries[i + 1..j],
+                ));
                 append_left_of(&b[k + 1..], &mut out);
                 out
             }
@@ -432,11 +437,14 @@ fn append_right_of<T: Item, D, const CAP: usize>(
                 &items[entry.index..],
                 &item_summaries[entry.index..],
             )),
-            Node::Internal { children, .. } => {
-                for child in &children[entry.index + 1..] {
-                    out.append(child.clone());
-                }
-            }
+            Node::Internal {
+                children,
+                child_summaries,
+                ..
+            } => out.append(SumTree::from_children(
+                &children[entry.index + 1..],
+                &child_summaries[entry.index + 1..],
+            )),
         }
     }
 }
@@ -457,11 +465,14 @@ fn append_left_of<T: Item, D, const CAP: usize>(
                 &items[..entry.index],
                 &item_summaries[..entry.index],
             )),
-            Node::Internal { children, .. } => {
-                for child in &children[..entry.index] {
-                    out.append(child.clone());
-                }
-            }
+            Node::Internal {
+                children,
+                child_summaries,
+                ..
+            } => out.append(SumTree::from_children(
+                &children[..entry.index],
+                &child_summaries[..entry.index],
+            )),
         }
     }
 }
