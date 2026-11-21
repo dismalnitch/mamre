@@ -12,12 +12,14 @@
 //! by neighbour, near the cursor, whether it's counted or not; see
 //! [`Rope::next_boundary`](crate::Rope::next_boundary).
 
+use std::any::Any;
+
 use crate::outline::Sections;
 use crate::units::{Scan, Unit, UnitState};
 
 /// Something counted over text, built from one chunk and combined in order:
 /// measuring `a` and `b` and combining must equal measuring `a + b`.
-pub trait Measure: Copy + PartialEq + std::fmt::Debug {
+pub trait Measure: Copy + PartialEq + std::fmt::Debug + 'static {
     /// The measure of no text.
     fn empty() -> Self;
 
@@ -33,14 +35,15 @@ pub trait Measure: Copy + PartialEq + std::fmt::Debug {
         None
     }
 
-    /// This measure's headings, if it keeps them. This is what lets a rope
-    /// answer outline questions; see [`Rope::address_at`](crate::Rope::address_at).
-    fn sections(&self) -> Option<&Sections> {
-        None
+    /// The `T` this measure is or holds, if any: how a rope finds the parts
+    /// a question needs, like the headings for outline questions, wherever
+    /// they sit in a combined measure.
+    fn find<T: 'static>(&self) -> Option<&T> {
+        (self as &dyn Any).downcast_ref()
     }
 }
 
-/// Both measures; a unit, or the headings, come from whichever keeps them.
+/// Both measures; a unit, or any part, comes from whichever keeps it.
 impl<A: Measure, B: Measure> Measure for (A, B) {
     fn empty() -> Self {
         (A::empty(), B::empty())
@@ -59,8 +62,11 @@ impl<A: Measure, B: Measure> Measure for (A, B) {
         self.0.unit(unit).or_else(|| self.1.unit(unit))
     }
 
-    fn sections(&self) -> Option<&Sections> {
-        self.0.sections().or_else(|| self.1.sections())
+    fn find<T: 'static>(&self) -> Option<&T> {
+        (self as &dyn Any)
+            .downcast_ref()
+            .or_else(|| self.0.find())
+            .or_else(|| self.1.find())
     }
 }
 

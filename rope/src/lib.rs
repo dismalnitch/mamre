@@ -29,6 +29,7 @@
 //! one. Every cut and join merges small pieces into their neighbour to keep
 //! it that way, so a rope of `n` bytes has fewer than `2n / N + 1` chunks.
 
+mod angela;
 mod measure;
 mod outline;
 mod scan;
@@ -43,6 +44,7 @@ use std::ops::Range;
 use arrayvec::ArrayString;
 use mamre::{Item, SumTree, cursor::Bias};
 
+pub use angela::Angela;
 pub use measure::{Markdown, Measure, Plain, Prose};
 pub use outline::{Address, Sections};
 pub use scan::Edge;

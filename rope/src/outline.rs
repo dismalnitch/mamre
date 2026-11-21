@@ -258,14 +258,10 @@ impl Measure for Sections {
             }
         })
     }
-
-    fn sections(&self) -> Option<&Sections> {
-        Some(self)
-    }
 }
 
 fn sections<M: Measure>(summary: &TextSummary<M>) -> &Sections {
-    summary.units.sections().unwrap_or_else(|| {
+    summary.units.find::<Sections>().unwrap_or_else(|| {
         panic!("this rope's measure doesn't keep sections; use one that does, like Sections or Markdown")
     })
 }

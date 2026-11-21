@@ -133,6 +133,13 @@ impl<T: Item, const CAP: usize> SumTree<T, CAP> {
         self.root.edge_item(Side::Back)
     }
 
+    /// Whether `other` is the very same tree, not just an equal one: true
+    /// for a clone until either is changed. O(1), so it's the cheap way to
+    /// ask "has this changed since I last looked?" within one program.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.root, &other.root)
+    }
+
     /// Changes the item a seek for `target` lands on (see
     /// [`Cursor::seek_forward`](crate::cursor::Cursor::seek_forward) for
     /// `bias`), in place, and refreshes every summary above it. Returns what

@@ -4,7 +4,8 @@
 //! with the default chunk size.
 
 use mamre_rope::{
-    Address, Edge, Markdown, Measure, Plain, Point, Prose, Rope, Sections, TextSummary, Unit,
+    Address, Angela, Edge, Markdown, Measure, Plain, Point, Prose, Rope, Sections, TextSummary,
+    Unit,
 };
 use proptest::prelude::*;
 
@@ -54,8 +55,11 @@ fn offset_of(text: &str, point: Point) -> usize {
     text.len()
 }
 
+/// What the model test's ropes keep: everything, so everything's checked.
+type Doc = (Markdown, Angela);
+
 /// Everything that must hold between a rope and the string.
-fn verify<const N: usize>(rope: &Rope<Markdown, N>, text: &str) -> Result<(), String> {
+fn verify<const N: usize>(rope: &Rope<Doc, N>, text: &str) -> Result<(), String> {
     rope.check()?;
     if rope.to_string() != text {
         return Err(format!("text is {:?}, want {text:?}", rope.to_string()));
@@ -64,8 +68,25 @@ fn verify<const N: usize>(rope: &Rope<Markdown, N>, text: &str) -> Result<(), St
         return Err(format!(
             "summary is {:?}, want {:?}",
             rope.summary(),
-            TextSummary::<Markdown>::of(text)
+            TextSummary::<Doc>::of(text)
         ));
+    }
+    // The hash of the whole, and of a stride of ranges.
+    if rope.hash() != Angela::of(text) {
+        return Err("hash differs".into());
+    }
+    let bounds: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain([text.len()])
+        .collect();
+    let stride = (bounds.len() / 12).max(1);
+    for &a in bounds.iter().step_by(stride) {
+        for &b in bounds.iter().step_by(stride).filter(|&&b| b >= a) {
+            if rope.hash_range(a..b) != Angela::of(&text[a..b]) {
+                return Err(format!("hash_range({a}..{b}) differs"));
+            }
+        }
     }
     if rope.chars().ne(text.chars()) {
         return Err("chars() differ".into());
@@ -131,7 +152,7 @@ fn headings(text: &str) -> Vec<(usize, Address)> {
 
 /// The address of a stride of positions, and where every heading's address
 /// leads, against the slow fold.
-fn verify_outline<const N: usize>(rope: &Rope<Markdown, N>, text: &str) -> Result<(), String> {
+fn verify_outline<const N: usize>(rope: &Rope<Doc, N>, text: &str) -> Result<(), String> {
     let headings = headings(text);
     let stride = (text.len() / 60).max(1);
     let offsets = text.char_indices().map(|(i, _)| i).chain([text.len()]);
@@ -174,7 +195,7 @@ const ALL_UNITS: [Unit; 6] = [
 /// Every counted unit, against the slow one-pass `Unit::ranges`: the count
 /// and every unit's range, and for a small text, which units come before
 /// and hold every char boundary.
-fn verify_units<const N: usize>(rope: &Rope<Markdown, N>, text: &str) -> Result<(), String> {
+fn verify_units<const N: usize>(rope: &Rope<Doc, N>, text: &str) -> Result<(), String> {
     for unit in COUNTED {
         let want = unit.ranges(text);
         if rope.count(unit) != want.len() {
@@ -269,7 +290,7 @@ fn verify_neighbours<M: Measure, const N: usize>(
 }
 
 fn run<const N: usize>(start: &str, ops: &[Op]) -> Result<(), String> {
-    let mut rope = Rope::<Markdown, N>::from(start);
+    let mut rope = Rope::<Doc, N>::from(start);
     let mut text = start.to_string();
     verify(&rope, &text).map_err(|e| format!("after building: {e}"))?;
     for (step, op) in ops.iter().enumerate() {
