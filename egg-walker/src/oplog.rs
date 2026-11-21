@@ -14,7 +14,7 @@
 //! how a document's whole history stays small. Single events are rebuilt
 //! when asked for; nothing about their numbering changes.
 
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::ops::Range;
 
 /// A local version: an event's number in this log. Parents always have
@@ -91,10 +91,6 @@ pub struct OpLog<T> {
     spans: Vec<BTreeMap<u64, (Lv, usize)>>,
     /// The events nothing else came after: the version of everything.
     frontier: Vec<Lv>,
-    /// Critical events, in order: each has every earlier event among its
-    /// ancestors and every later one among its descendants, so the history
-    /// narrows to it. A merge can start from the latest one it holds.
-    critical: Vec<Lv>,
 }
 
 impl<T> Default for OpLog<T> {
@@ -106,7 +102,6 @@ impl<T> Default for OpLog<T> {
             runs: Vec::new(),
             spans: Vec::new(),
             frontier: Vec::new(),
-            critical: Vec::new(),
         }
     }
 }
@@ -232,30 +227,11 @@ impl<T: Clone> OpLog<T> {
         );
         let next = &mut self.next_seq[agent.0 as usize];
         *next = (*next).max(seq + 1);
-        // A critical event stays critical while every event after it
-        // descends from it: a new event does if any parent is it or after
-        // it. Critical events are a chain, so the ones this breaks are the
-        // latest.
-        let latest_parent = parents.iter().max().copied();
-        while let Some(&c) = self.critical.last()
-            && latest_parent.is_none_or(|p| p < c)
-        {
-            self.critical.pop();
-        }
-        // This event has every earlier one as an ancestor if its parents
-        // are the whole frontier.
-        let mut sorted = parents.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        let has_everything = sorted == self.frontier;
         // A frontier entry is a parent of this event or still a frontier
         // entry: it has nothing after it, so it can't be a deeper ancestor.
         self.frontier.retain(|f| !parents.contains(f));
         self.frontier.push(lv);
         self.frontier.sort_unstable();
-        if has_everything {
-            self.critical.push(lv);
-        }
 
         // Carry on the last run if this is its agent's next event, right
         // after it, doing the same thing one item on.
@@ -356,30 +332,116 @@ impl<T> OpLog<T> {
         matches!(self.run_of(lv).op, RunOp::Insert { .. })
     }
 
-    /// The latest critical event in `version`, if any: everything up to it
-    /// is in `version`, and everything after it descends from it.
-    pub(crate) fn critical_in(&self, version: &[Lv]) -> Option<Lv> {
-        // Everything after a critical event descends from it, so `version`
-        // holds it if any of its events is it or after it.
-        let latest = *version.iter().max()?;
-        let i = self.critical.partition_point(|&c| c <= latest);
-        i.checked_sub(1).map(|i| self.critical[i])
-    }
-
-    /// The events in `version` and before it, but after `floor`, in order.
-    /// The search stops at `floor`, which all of them descend from.
-    pub(crate) fn events_after(&self, version: &[Lv], floor: Option<Lv>) -> Vec<Lv> {
-        let above = |lv: Lv| floor.is_none_or(|f| lv > f);
-        let mut seen = HashSet::new();
-        let mut stack: Vec<Lv> = version.iter().copied().filter(|&lv| above(lv)).collect();
-        while let Some(lv) = stack.pop() {
-            if seen.insert(lv) {
-                stack.extend(self.parents(lv).filter(|&p| above(p)));
+    /// What a merge of `to` into `from` must replay, and the base it can
+    /// start from: `(old, new, base)`, where `old` is replayed events
+    /// `from` already holds, `new` the ones it doesn't (both in order), and
+    /// `base` a version every replayed event includes whole, so replaying
+    /// never retreats anything in it.
+    ///
+    /// Walks back from both versions at once, latest event first, marking
+    /// which side reached each. Once everything left to visit was reached
+    /// by both, what's left is a candidate base: it's taken if every event
+    /// visited includes all of it, and otherwise the walk goes one step
+    /// further and tries again. So it costs what's happened since the two
+    /// versions met, not the whole history; unmerged branches elsewhere
+    /// don't count, and the base can be several events (two people's work,
+    /// merged).
+    pub(crate) fn conflict(&self, from: &[Lv], to: &[Lv]) -> (Vec<Lv>, Vec<Lv>, Vec<Lv>) {
+        const FROM: u8 = 1;
+        const TO: u8 = 2;
+        const BOTH: u8 = FROM | TO;
+        // What's left to visit, latest first, with which sides reached it:
+        // an event reached by both is queued once.
+        let mut queue: BTreeMap<Lv, u8> = BTreeMap::new();
+        // How many queued events one side alone has reached.
+        let mut one_sided = 0usize;
+        fn reach(queue: &mut BTreeMap<Lv, u8>, one_sided: &mut usize, lv: Lv, side: u8) {
+            let sides = queue.entry(lv).or_insert(0);
+            let was = *sides;
+            *sides |= side;
+            match (was, *sides) {
+                (0, BOTH) | (BOTH, _) => {}
+                (0, _) => *one_sided += 1,
+                (_, BOTH) => *one_sided -= 1,
+                _ => {}
             }
         }
-        let mut out: Vec<Lv> = seen.into_iter().collect();
-        out.sort_unstable();
-        out
+        for &lv in from {
+            reach(&mut queue, &mut one_sided, lv, FROM);
+        }
+        for &lv in to {
+            reach(&mut queue, &mut one_sided, lv, TO);
+        }
+        let mut visited: Vec<(Lv, u8)> = Vec::new();
+        loop {
+            if one_sided == 0 {
+                let base: Vec<Lv> = queue.keys().copied().collect();
+                let mut replayed: Vec<Lv> = visited.iter().map(|&(lv, _)| lv).collect();
+                replayed.sort_unstable();
+                if self.all_include(&replayed, &base) {
+                    let mut old = Vec::new();
+                    let mut new = Vec::new();
+                    for &(lv, side) in &visited {
+                        if side & FROM != 0 {
+                            old.push(lv);
+                        } else {
+                            new.push(lv);
+                        }
+                    }
+                    old.sort_unstable();
+                    new.sort_unstable();
+                    return (old, new, base);
+                }
+            }
+            let Some((lv, side)) = queue.pop_last() else {
+                unreachable!("an empty base is included by everything")
+            };
+            if side != BOTH {
+                one_sided -= 1;
+            }
+            visited.push((lv, side));
+            for p in self.parents(lv) {
+                reach(&mut queue, &mut one_sided, p, side);
+            }
+        }
+    }
+
+    /// Whether every event in `events` (in order, parents first) includes
+    /// every event in `base`. Each event's share of `base` is what its
+    /// parents include, so one pass in order settles it.
+    fn all_include(&self, events: &[Lv], base: &[Lv]) -> bool {
+        let words = base.len().div_ceil(64);
+        let full: Vec<u64> = (0..words)
+            .map(|w| {
+                let bits = (base.len() - w * 64).min(64);
+                if bits == 64 {
+                    u64::MAX
+                } else {
+                    (1 << bits) - 1
+                }
+            })
+            .collect();
+        let index: HashMap<Lv, usize> = base.iter().enumerate().map(|(i, &lv)| (lv, i)).collect();
+        let mut includes: HashMap<Lv, Vec<u64>> = HashMap::new();
+        for &lv in events {
+            let mut set = vec![0u64; words];
+            for p in self.parents(lv) {
+                // Every parent of a visited event was reached when it was
+                // visited: it's still queued, so in the base, or visited too.
+                if let Some(&i) = index.get(&p) {
+                    set[i / 64] |= 1 << (i % 64);
+                } else {
+                    for (s, t) in set.iter_mut().zip(&includes[&p]) {
+                        *s |= t;
+                    }
+                }
+            }
+            if set != full {
+                return false;
+            }
+            includes.insert(lv, set);
+        }
+        true
     }
 
     /// What's in `a` but not `b`, and in `b` but not `a`, latest first.

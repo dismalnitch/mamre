@@ -15,10 +15,10 @@
 //! either side of it (its origins); the shared ordering rule places it
 //! among concurrent inserts; its effect position is where that lands now.
 //!
-//! A merge only replays what it has to. Its *base* is everything up to the
-//! latest critical event `from` holds: a point the whole history narrows
-//! to, with every later event descending from it, so nothing in the base is
-//! ever retreated. The document at the base needs no records, only a
+//! A merge only replays what it has to: what happened since the two
+//! versions met, found by walking back from both. Its *base* is a version
+//! every replayed event includes whole, so nothing in the base is ever
+//! retreated; branches neither version holds don't count. The document at the base needs no records, only a
 //! placeholder run of anonymous items standing for it, split wherever an
 //! edit touches it. The placeholder is longer than any real document, so
 //! the base's length never needs knowing; edits only ever touch its front.
@@ -34,7 +34,7 @@
 //! back only as far as the two versions differ: for typing, nothing.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use mamre::cursor::Bias;
 use mamre::{Item, SeekTarget, SumTree, Summary};
@@ -231,17 +231,9 @@ impl<T: Clone> OpLog<T> {
 
     /// The changes, and what finding them cost.
     pub(crate) fn walk(&self, from: &[Lv], to: &[Lv]) -> (Vec<Change<T>>, Stats) {
-        // The base: everything up to the latest critical event `from`
-        // holds. Every event after a critical one descends from it, so none
-        // of them ever retreats anything in the base.
-        let floor = self.critical_in(from);
-        let old = self.events_after(from, floor);
-        let known: HashSet<Lv> = old.iter().copied().collect();
-        let new: Vec<Lv> = self
-            .events_after(to, floor)
-            .into_iter()
-            .filter(|lv| !known.contains(lv))
-            .collect();
+        // What to replay, and the base: a version every replayed event
+        // includes whole, so none of it is ever retreated.
+        let (old, new, base) = self.conflict(from, to);
         if new.is_empty() {
             return (Vec::new(), Stats::default());
         }
@@ -250,7 +242,7 @@ impl<T: Clone> OpLog<T> {
         let mut walk = Walk {
             log: self,
             records,
-            prepared: floor.into_iter().collect(),
+            prepared: base,
             starts: BTreeMap::new(),
             targets: HashMap::new(),
             replayed: 0,
@@ -670,6 +662,88 @@ mod tests {
             change.apply(&mut doc);
         }
         assert_eq!(doc, log.checkout(&log.union(&a, &b)));
+    }
+
+    /// A draft branch forked early and never merged: merges on the main
+    /// line don't involve it, so they shouldn't replay what happened since
+    /// it forked.
+    #[test]
+    fn an_unmerged_branch_doesnt_slow_other_merges() {
+        let mut log: OpLog<u32> = OpLog::new();
+        let (alice, bob, carol) = (log.agent("alice"), log.agent("bob"), log.agent("carol"));
+        let mut v = Vec::new();
+        for i in 0..100 {
+            v = log.add_insert(alice, &v, i, [i as u32]);
+        }
+        // Bob's draft, forked from early on, never merged by anyone.
+        log.add_insert(bob, &[10], 3, [900, 901, 902]);
+        for i in 100..200 {
+            v = log.add_insert(alice, &v, i, [i as u32]);
+        }
+        let a = log.add_insert(alice, &v, 50, [1000, 1001]);
+        let c = log.add_delete(carol, &v, 20..21);
+        let (changes, stats) = log.walk(&a, &c);
+        assert_eq!(stats.replayed, 3, "Alice's two inserts and Carol's delete");
+        let mut doc = log.checkout(&a);
+        for change in changes {
+            change.apply(&mut doc);
+        }
+        assert_eq!(doc, log.checkout(&log.union(&a, &c)));
+    }
+
+    /// Two people typing at once, each merging the other's work now and
+    /// then: each merge replays only what's happened since they last met.
+    #[test]
+    fn live_co_editing_merges_stay_small() {
+        let mut log: OpLog<u32> = OpLog::new();
+        let (alice, bob) = (log.agent("alice"), log.agent("bob"));
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let mut worst = 0;
+        for round in 0..50u32 {
+            // Each types three items at the start of their own copy.
+            a = log.add_insert(alice, &a, 0, [round * 10, round * 10 + 1, round * 10 + 2]);
+            b = log.add_insert(
+                bob,
+                &b,
+                0,
+                [5000 + round * 10, 5001 + round * 10, 5002 + round * 10],
+            );
+            // Alice merges Bob's work; Bob merges what Alice had before.
+            let (_, stats) = log.walk(&a, &b);
+            worst = worst.max(stats.replayed);
+            let merged = log.union(&a, &b);
+            if round % 2 == 0 {
+                b = merged.clone();
+            }
+            a = merged;
+        }
+        // Never more than the last couple of rounds' typing.
+        assert!(worst <= 12, "a merge replayed {worst} events");
+        eprintln!("live co-editing: worst merge replayed {worst} events");
+    }
+
+    /// Where the obvious base is wrong: two roots `a` and `b`, then `c`
+    /// after `a` and `d` after `b`; merging `n` (after `c` only) into
+    /// `{c, d}` leaves `{a, b}` as what both reached, but `c` doesn't
+    /// include `b`, so it can't be the base. The walk must go further.
+    #[test]
+    fn a_base_every_replayed_event_includes() {
+        let mut log: OpLog<u32> = OpLog::new();
+        let (alice, bob) = (log.agent("alice"), log.agent("bob"));
+        let a = log.add_insert(alice, &[], 0, [1]);
+        let b = log.add_insert(bob, &[], 0, [2]);
+        let c = log.add_insert(alice, &a, 1, [3]);
+        let d = log.add_insert(bob, &b, 1, [4]);
+        let from = log.union(&c, &d);
+        let n = log.add_insert(alice, &c, 0, [5]);
+        let (old, new, base) = log.conflict(&from, &n);
+        assert!(base.is_empty(), "nothing is under every replayed event");
+        assert_eq!((old.len(), new.len()), (4, 1));
+        let mut doc = log.checkout(&from);
+        for change in log.changes(&from, &n) {
+            change.apply(&mut doc);
+        }
+        assert_eq!(doc, log.checkout(&log.union(&from, &n)));
     }
 
     /// Typing makes runs: a document typed in a few stretches, with the
