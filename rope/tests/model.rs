@@ -297,7 +297,8 @@ proptest! {
         run::<9>(&start, &ops).map_err(TestCaseError::fail)?;
     }
 
-    /// The default size, and texts long enough for several levels.
+    /// The default size, on texts spanning a couple of levels of chunks.
+    /// Deep trees are the tiny- and small-chunk tests' job.
     #[test]
     fn matches_a_string_with_default_chunks(start in text(4000), ops in prop::collection::vec(op(), 1..16)) {
         run::<{ mamre_rope::CHUNK }>(&start, &ops).map_err(TestCaseError::fail)?;

@@ -42,8 +42,10 @@ pub use scan::Edge;
 pub use summary::{ByteOffset, CharOffset, Point, TextSummary};
 pub use units::{Scan, Step, Unit, UnitState};
 
-/// The default chunk size, in bytes.
-pub const CHUNK: usize = 128;
+/// The default chunk size, in bytes. Large enough that a `Markdown` rope's
+/// summaries cost about a quarter of its text; an edit re-measures one
+/// chunk, which at this size takes microseconds.
+pub const CHUNK: usize = 512;
 
 /// Up to `N` bytes of text: one item of the tree.
 pub struct Chunk<M, const N: usize> {
