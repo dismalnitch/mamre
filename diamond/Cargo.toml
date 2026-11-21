@@ -1,0 +1,17 @@
+[package]
+name = "mamre-diamond"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Plays diamond-types' merged edits onto a mamre rope"
+repository = "https://github.com/dismalnitch/mamre"
+publish = false
+
+[dependencies]
+# Default features: 1.0.0 doesn't build without `lz4` (its encoder uses
+# lz4_flex unconditionally), though the adapter itself never encodes.
+diamond-types = "1.0.0"
+mamre-rope = { path = "../rope" }
+
+[dev-dependencies]
+proptest = "1.12"

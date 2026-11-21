@@ -178,6 +178,44 @@ impl<M: Measure, const N: usize> Rope<M, N> {
         self.replace(range, "");
     }
 
+    /// How many `char`s come before byte `offset`.
+    pub fn offset_to_char(&self, offset: usize) -> usize {
+        self.check_range(&(offset..offset));
+        let mut cursor = self.tree.cursor::<(ByteOffset, CharOffset)>();
+        cursor.seek(&ByteOffset(offset), Bias::Right);
+        let (ByteOffset(start), CharOffset(chars)) = *cursor.start();
+        match cursor.item() {
+            Some(chunk) => chars + chunk.as_str()[..offset - start].chars().count(),
+            None => chars,
+        }
+    }
+
+    /// The byte offset of `char` number `chars`, or the end if it's
+    /// exactly the number of chars.
+    ///
+    /// Panics if there are fewer `char`s than that.
+    pub fn char_to_offset(&self, chars: usize) -> usize {
+        let total = self.summary().chars;
+        assert!(
+            chars <= total,
+            "char {chars} is out of bounds for a rope of {total} chars"
+        );
+        let mut cursor = self.tree.cursor::<(CharOffset, ByteOffset)>();
+        cursor.seek(&CharOffset(chars), Bias::Right);
+        let (CharOffset(before), ByteOffset(start)) = *cursor.start();
+        match cursor.item() {
+            Some(chunk) => {
+                let (i, _) = chunk
+                    .as_str()
+                    .char_indices()
+                    .nth(chars - before)
+                    .expect("the seek lands on the chunk holding the char");
+                start + i
+            }
+            None => self.len(),
+        }
+    }
+
     /// The row and column of byte `offset`.
     pub fn offset_to_point(&self, offset: usize) -> Point {
         self.check_range(&(offset..offset));

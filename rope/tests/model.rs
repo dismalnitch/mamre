@@ -68,9 +68,17 @@ fn verify<const N: usize>(rope: &Rope<Markdown, N>, text: &str) -> Result<(), St
     if rope.chars().ne(text.chars()) {
         return Err("chars() differ".into());
     }
-    // Points both ways, at every char boundary of a small text.
+    // Chars and points both ways, at every char boundary of a small text.
     if text.len() <= 300 {
-        for (offset, _) in text.char_indices().chain([(text.len(), ' ')]) {
+        for (chars, (offset, _)) in text.char_indices().chain([(text.len(), ' ')]).enumerate() {
+            let got = rope.offset_to_char(offset);
+            if got != chars {
+                return Err(format!("offset_to_char({offset}) is {got}, want {chars}"));
+            }
+            let got = rope.char_to_offset(chars);
+            if got != offset {
+                return Err(format!("char_to_offset({chars}) is {got}, want {offset}"));
+            }
             let want = point_of(text, offset);
             let got = rope.offset_to_point(offset);
             if got != want {
