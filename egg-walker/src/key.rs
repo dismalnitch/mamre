@@ -34,6 +34,15 @@ impl Key {
         Key(Arc::from([1, k as u64 + 1]))
     }
 
+    /// The key of the item `n` places after this one in the same run:
+    /// this key with `n` appended. Only used when it falls before whatever
+    /// comes next, which the walk checks.
+    pub fn extended(&self, n: usize) -> Key {
+        let mut digits = self.0.to_vec();
+        digits.push(n as u64);
+        Key(digits.into())
+    }
+
     /// A key strictly between `a` and `b`; `None` for `a` is before every
     /// key, and for `b` after every key. Needs `a < b`.
     pub fn between(a: Option<&Key>, b: Option<&Key>) -> Key {

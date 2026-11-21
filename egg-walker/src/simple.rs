@@ -112,7 +112,7 @@ impl<T: Clone> OpLog<T> {
         loop {
             let mut next = base.clone();
             for lv in (0..self.len()).filter(|&lv| want[lv] && !base[lv]) {
-                let parents = self.closure(&self.events()[lv].parents);
+                let parents = self.closure(&self.parents(lv).collect::<Vec<_>>());
                 for (b, p) in next.iter_mut().zip(parents) {
                     *b &= p;
                 }
@@ -127,7 +127,7 @@ impl<T: Clone> OpLog<T> {
 
 impl<T: Clone> Walk<'_, T> {
     fn step(&mut self, lv: Lv, out: Option<&mut Vec<Change<T>>>) {
-        let event = &self.log.events()[lv];
+        let event = self.log.event(lv);
         let parents = self.log.closure(&event.parents);
         // Move the prepare version to this event's parents: take back what
         // it shouldn't hold, latest first, then add what it's missing,
@@ -160,12 +160,14 @@ impl<T: Clone> Walk<'_, T> {
     }
 
     fn retreat(&mut self, x: Lv) {
-        let i = match self.log.events()[x].op {
-            Op::Insert { .. } => self.index_of(x),
-            Op::Delete { .. } => self.index_of(self.targets[&x]),
+        let insert = self.log.is_insert(x);
+        let i = if insert {
+            self.index_of(x)
+        } else {
+            self.index_of(self.targets[&x])
         };
         let record = &mut self.records[i];
-        record.prepare = match (self.log.events()[x].op.is_insert(), record.prepare) {
+        record.prepare = match (insert, record.prepare) {
             (true, Prepare::Inserted) => Prepare::NotYet,
             (false, Prepare::Deleted(1)) => Prepare::Inserted,
             (false, Prepare::Deleted(n)) => Prepare::Deleted(n - 1),
@@ -174,12 +176,14 @@ impl<T: Clone> Walk<'_, T> {
     }
 
     fn advance(&mut self, x: Lv) {
-        let i = match self.log.events()[x].op {
-            Op::Insert { .. } => self.index_of(x),
-            Op::Delete { .. } => self.index_of(self.targets[&x]),
+        let insert = self.log.is_insert(x);
+        let i = if insert {
+            self.index_of(x)
+        } else {
+            self.index_of(self.targets[&x])
         };
         let record = &mut self.records[i];
-        record.prepare = match (self.log.events()[x].op.is_insert(), record.prepare) {
+        record.prepare = match (insert, record.prepare) {
             (true, Prepare::NotYet) => Prepare::Inserted,
             (false, Prepare::Inserted) => Prepare::Deleted(1),
             (false, Prepare::Deleted(n)) => Prepare::Deleted(n + 1),

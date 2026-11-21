@@ -50,6 +50,10 @@ fn run(acts: &[Act]) -> Result<(), String> {
         .map(|n| theirs.get_or_create_agent_id(n))
         .collect();
     let mut versions: Vec<Vec<Lv>> = vec![Vec::new(); AGENTS];
+    // Each agent's document, kept up to date by applying merges' changes:
+    // other agents' events are numbered among this one's, so merges replay
+    // new events interleaved with old ones.
+    let mut docs: Vec<Vec<char>> = vec![Vec::new(); AGENTS];
 
     for act in acts {
         match act {
@@ -60,6 +64,7 @@ fn run(acts: &[Act]) -> Result<(), String> {
                 let len = ours.checkout(&versions[*a]).len();
                 let pos = frac(len, *at);
                 let v = ours.add_insert(agents[*a], &versions[*a], pos, t.chars());
+                docs[*a].splice(pos..pos, t.chars());
                 let d = theirs.add_insert_at(dagents[*a], &versions[*a], pos, t);
                 if v != [d] {
                     return Err(format!("numbering differs: ours {v:?}, theirs {d}"));
@@ -74,6 +79,7 @@ fn run(acts: &[Act]) -> Result<(), String> {
                     continue;
                 }
                 let v = ours.add_delete(agents[*a], &versions[*a], range.clone());
+                docs[*a].drain(range.clone());
                 let d = theirs.add_delete_at(dagents[*a], &versions[*a], range);
                 if v != [d] {
                     return Err(format!("numbering differs: ours {v:?}, theirs {d}"));
@@ -81,7 +87,19 @@ fn run(acts: &[Act]) -> Result<(), String> {
                 versions[*a] = v;
             }
             Act::Merge { a, from } => {
-                versions[*a] = ours.union(&versions[*a], &versions[*from]);
+                let merged = ours.union(&versions[*a], &versions[*from]);
+                for change in ours.changes(&versions[*a], &merged) {
+                    change.apply(&mut docs[*a]);
+                }
+                versions[*a] = merged;
+                let fresh = ours.checkout(&versions[*a]);
+                if docs[*a] != fresh {
+                    return Err(format!(
+                        "agent {a}'s merged document {:?} isn't a fresh checkout {:?}",
+                        docs[*a].iter().collect::<String>(),
+                        fresh.iter().collect::<String>()
+                    ));
+                }
             }
         }
     }

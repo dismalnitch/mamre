@@ -26,12 +26,15 @@
 //! Records live in a mamre `SumTree`, summed by how many items each version
 //! shows, so finding the nth visible item and an item's effect position are
 //! seeks. Every record has an order key (see `key.rs`), so a record is
-//! found by key, and the ordering rule compares origins by key. The prepare
+//! found by key, and the ordering rule compares origins by key. A record
+//! is a run: items inserted one after another (or the base document's),
+//! split wherever an edit, an origin or a state change lands inside it, so
+//! typing is a handful of records, not one per item. The prepare
 //! version is kept as its latest events and moved by walking the graph
 //! back only as far as the two versions differ: for typing, nothing.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use mamre::cursor::Bias;
 use mamre::{Item, SeekTarget, SumTree, Summary};
@@ -72,17 +75,30 @@ enum Prepare {
     Deleted(u32),
 }
 
-/// One inserted item, or a run of the base document's items.
+/// How a record's items get their keys.
+#[derive(Clone, Debug)]
+enum Keys {
+    /// Base items, by position: see `Key::base_item`.
+    Base,
+    /// Items inserted one after another: the item numbered `first` has
+    /// `key`, and the one `n` after it has `key` with `n` appended.
+    Run { first: Lv, key: Key },
+}
+
+/// A run of consecutive items: inserted one after another, or the base
+/// document's.
 #[derive(Clone, Debug)]
 struct Record {
-    /// The key of its first item.
+    /// The keys of its first and last items.
     key: Key,
-    /// The insert's local version, or `BASE_ITEM` plus the first base
-    /// item's position.
+    last: Key,
+    /// Its first item's local version, or `BASE_ITEM` plus its position.
     id: usize,
-    /// 1, except for a run of base items.
     len: usize,
-    /// The keys of the items either side of where it was put.
+    keys: Keys,
+    /// The keys of the items either side of where its first item was put.
+    /// Each later item has the one before it on its left and the same
+    /// item on its right.
     left: Option<Key>,
     right: Option<Key>,
     prepare: Prepare,
@@ -94,8 +110,10 @@ impl Record {
     fn base_run(start: usize, len: usize) -> Self {
         Record {
             key: Key::base_item(start),
+            last: Key::base_item(start + len - 1),
             id: BASE_ITEM + start,
             len,
+            keys: Keys::Base,
             left: None,
             right: None,
             prepare: Prepare::Inserted,
@@ -103,12 +121,12 @@ impl Record {
         }
     }
 
-    /// The key of its last item.
-    fn last_key(&self) -> Key {
-        if self.len == 1 {
-            self.key.clone()
-        } else {
-            Key::base_item(self.id - BASE_ITEM + self.len - 1)
+    fn item_key(&self, id: usize) -> Key {
+        debug_assert!(id >= self.id && id < self.id + self.len);
+        match &self.keys {
+            Keys::Base => Key::base_item(id - BASE_ITEM),
+            Keys::Run { first, key } if id == *first => key.clone(),
+            Keys::Run { first, key } => key.extended(id - first),
         }
     }
 }
@@ -148,7 +166,7 @@ impl Item for Record {
                 0
             },
             effect: if self.gone { 0 } else { self.len },
-            last: Some(self.last_key()),
+            last: Some(self.last.clone()),
         }
     }
 }
@@ -175,14 +193,22 @@ impl SeekTarget<Counts, Counts> for At<'_> {
     }
 }
 
+/// What a walk cost: events replayed, and records it ended with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Stats {
+    pub replayed: usize,
+    pub records: usize,
+}
+
 struct Walk<'a, T> {
     log: &'a OpLog<T>,
     records: SumTree<Record>,
     /// The prepare version, as its latest events.
     prepared: Vec<Lv>,
-    /// Each replayed insert's key, and each delete's target's.
-    keys: HashMap<Lv, Key>,
-    targets: HashMap<Lv, Key>,
+    /// Where each run of inserts begins, its first key, and how far it's
+    /// got; and each delete's target, by key and id.
+    starts: BTreeMap<Lv, (Key, usize)>,
+    targets: HashMap<Lv, (Key, usize)>,
     /// How many events were replayed: what a merge cost.
     replayed: usize,
 }
@@ -203,8 +229,8 @@ impl<T: Clone> OpLog<T> {
         doc
     }
 
-    /// The changes, and how many events the walk replayed to find them.
-    pub(crate) fn walk(&self, from: &[Lv], to: &[Lv]) -> (Vec<Change<T>>, usize) {
+    /// The changes, and what finding them cost.
+    pub(crate) fn walk(&self, from: &[Lv], to: &[Lv]) -> (Vec<Change<T>>, Stats) {
         // The base: everything up to the latest critical event `from`
         // holds. Every event after a critical one descends from it, so none
         // of them ever retreats anything in the base.
@@ -217,7 +243,7 @@ impl<T: Clone> OpLog<T> {
             .filter(|lv| !known.contains(lv))
             .collect();
         if new.is_empty() {
-            return (Vec::new(), 0);
+            return (Vec::new(), Stats::default());
         }
         let mut records = SumTree::new();
         records.push(Record::base_run(0, UNDERWATER));
@@ -225,7 +251,7 @@ impl<T: Clone> OpLog<T> {
             log: self,
             records,
             prepared: floor.into_iter().collect(),
-            keys: HashMap::new(),
+            starts: BTreeMap::new(),
             targets: HashMap::new(),
             replayed: 0,
         };
@@ -239,14 +265,18 @@ impl<T: Clone> OpLog<T> {
         for &lv in &new {
             walk.step(lv, Some(&mut out));
         }
-        (out, walk.replayed)
+        let stats = Stats {
+            replayed: walk.replayed,
+            records: walk.records.iter().count(),
+        };
+        (out, stats)
     }
 }
 
 impl<T: Clone> Walk<'_, T> {
     fn step(&mut self, lv: Lv, out: Option<&mut Vec<Change<T>>>) {
         self.replayed += 1;
-        let event = &self.log.events()[lv];
+        let event = self.log.event(lv);
         // Move the prepare version to this event's parents: take back what
         // it shouldn't hold, latest first, then add what it's missing,
         // earliest first, so a delete is never undone before its insert.
@@ -261,22 +291,46 @@ impl<T: Clone> Walk<'_, T> {
         for x in advance {
             self.shift(x, true);
         }
-        match &event.op {
-            Op::Insert { pos, item } => self.insert(lv, *pos, item.clone(), out),
-            Op::Delete { pos } => self.delete(lv, *pos, out),
+        match event.op {
+            Op::Insert { pos, item } => self.insert(lv, pos, item, out),
+            Op::Delete { pos } => self.delete(lv, pos, out),
         }
         self.prepared = vec![lv];
     }
 
+    /// The key of insert `lv`'s item.
+    fn key_of(&self, lv: Lv) -> Key {
+        let (&first, (key, len)) = self
+            .starts
+            .range(..=lv)
+            .next_back()
+            .expect("every replayed insert started or carried on a run");
+        debug_assert!(lv < first + len, "insert {lv} isn't in its run");
+        if lv == first {
+            key.clone()
+        } else {
+            key.extended(lv - first)
+        }
+    }
+
+    /// The record holding the item with this key.
+    fn record_at(&self, key: &Key) -> (Record, Counts) {
+        let mut cursor = self.records.cursor::<Counts>();
+        cursor.seek(&At(key), Bias::Left);
+        let record = cursor.item().expect("the key is in the tree").clone();
+        (record, cursor.start().clone())
+    }
+
     /// Advances (`forward`) or retreats event `x` in the prepare version.
     fn shift(&mut self, x: Lv, forward: bool) {
-        let insert = self.log.events()[x].op.is_insert();
-        let key = if insert {
-            &self.keys[&x]
+        let insert = self.log.is_insert(x);
+        let (key, id) = if insert {
+            (self.key_of(x), x)
         } else {
-            &self.targets[&x]
+            self.targets[&x].clone()
         };
-        self.records.update_at(&At(key), Bias::Left, |r| {
+        self.isolate(&key, id);
+        self.records.update_at(&At(&key), Bias::Left, |r| {
             r.prepare = match (insert, forward, r.prepare) {
                 (true, true, Prepare::NotYet) => Prepare::Inserted,
                 (true, false, Prepare::Inserted) => Prepare::NotYet,
@@ -289,10 +343,23 @@ impl<T: Clone> Walk<'_, T> {
         });
     }
 
-    /// The key of the `pos`th item the prepare version shows, split into a
-    /// record of its own if `alone`, or else made the last of its record.
-    /// The placeholder never runs out, so there always is one.
-    fn prepared_item(&mut self, pos: usize, alone: bool) -> Key {
+    /// Splits item `id` (whose key is `key`) out of its record, so its state
+    /// can change alone.
+    fn isolate(&mut self, key: &Key, id: usize) {
+        let (record, _) = self.record_at(key);
+        let offset = id - record.id;
+        if offset + 1 < record.len {
+            self.split(&record, offset + 1);
+        }
+        if offset > 0 {
+            self.split(&record, offset);
+        }
+    }
+
+    /// The key and id of the `pos`th item the prepare version shows, split
+    /// into a record of its own if `alone`, or else made the last of its
+    /// record. The placeholder never runs out, so there always is one.
+    fn prepared_item(&mut self, pos: usize, alone: bool) -> (Key, usize) {
         let (record, offset) = {
             let mut cursor = self.records.cursor::<Counts>();
             cursor.seek(&Prepared(pos), Bias::Right);
@@ -302,42 +369,43 @@ impl<T: Clone> Walk<'_, T> {
                 .clone();
             (record, pos - cursor.start().prepared)
         };
-        if record.len == 1 {
-            return record.key;
-        }
-        // A run of base items: split off what's after this item, and, if it
-        // must stand alone, what's before it.
-        let item = record.id - BASE_ITEM + offset;
+        let id = record.id + offset;
         if offset + 1 < record.len {
             self.split(&record, offset + 1);
         }
         if alone && offset > 0 {
             self.split(&record, offset);
         }
-        Key::base_item(item)
+        (record.item_key(id), id)
     }
 
-    /// Splits the base run starting with `record`'s first item at `at`,
-    /// counted from its start.
+    /// Splits the record starting with `record`'s first item at `at`,
+    /// counted from that item. (The record may have shrunk since `record`
+    /// was read, but never from its front.)
     fn split(&mut self, record: &Record, at: usize) {
-        let start = record.id - BASE_ITEM;
         let mut rest = None;
         self.records.update_at(&At(&record.key), Bias::Left, |r| {
-            debug_assert!(r.id >= BASE_ITEM && at < r.len, "only base runs split");
-            let end = r.id - BASE_ITEM + r.len;
-            r.len = start + at - (r.id - BASE_ITEM);
-            rest = Some(Record::base_run(start + at, end - (start + at)));
+            debug_assert!(r.id == record.id && at < r.len, "splitting inside a record");
+            let mut tail = r.clone();
+            tail.id = r.id + at;
+            tail.len = r.len - at;
+            tail.key = r.item_key(tail.id);
+            if let Keys::Run { .. } = r.keys {
+                tail.left = Some(r.item_key(tail.id - 1));
+            }
+            r.len = at;
+            r.last = r.item_key(r.id + at - 1);
+            rest = Some(tail);
         });
-        let before = Key::base_item(start + at - 1);
+        let before = record.item_key(record.id + at - 1);
         self.records.insert(&At(&before), Bias::Right, rest);
     }
 
-    /// How many items the effect version shows before the record with
-    /// this key.
-    fn effect_pos(&self, key: &Key) -> usize {
-        let mut cursor = self.records.cursor::<Counts>();
-        cursor.seek(&At(key), Bias::Left);
-        cursor.start().effect
+    /// How many items the effect version shows before item `id`, whose key
+    /// is `key`.
+    fn effect_pos(&self, key: &Key, id: usize) -> usize {
+        let (record, before) = self.record_at(key);
+        before.effect + if record.gone { 0 } else { id - record.id }
     }
 
     fn insert(&mut self, lv: Lv, pos: usize, item: T, out: Option<&mut Vec<Change<T>>>) {
@@ -348,29 +416,99 @@ impl<T: Clone> Walk<'_, T> {
         // the version, don't count. (diamond-types' convention, and the
         // intent: "at the start" stays at the start, wherever tombstones
         // lie.)
-        let left = pos.checked_sub(1).map(|p| self.prepared_item(p, false));
+        let left = pos.checked_sub(1).map(|p| self.prepared_item(p, false).0);
         let (prev, next, right) = self.place(lv, left.as_ref());
-        let key = Key::between(prev.as_ref(), next.as_ref());
-        let record = Record {
-            key: key.clone(),
-            id: lv,
-            len: 1,
-            left,
-            right,
-            prepare: Prepare::Inserted,
-            gone: false,
+        let key = match self.extend(
+            lv,
+            left.as_ref(),
+            prev.as_ref(),
+            next.as_ref(),
+            right.as_ref(),
+        ) {
+            Some(key) => key,
+            None => {
+                let key = Key::between(prev.as_ref(), next.as_ref());
+                let record = Record {
+                    key: key.clone(),
+                    last: key.clone(),
+                    id: lv,
+                    len: 1,
+                    keys: Keys::Run {
+                        first: lv,
+                        key: key.clone(),
+                    },
+                    left,
+                    right,
+                    prepare: Prepare::Inserted,
+                    gone: false,
+                };
+                match &next {
+                    Some(n) => self.records.insert(&At(n), Bias::Left, [record]),
+                    None => self.records.push(record),
+                }
+                self.starts.insert(lv, (key.clone(), 1));
+                key
+            }
         };
-        match &next {
-            Some(n) => self.records.insert(&At(n), Bias::Left, [record]),
-            None => self.records.push(record),
-        }
-        self.keys.insert(lv, key.clone());
         if let Some(out) = out {
             out.push(Change::Insert {
-                pos: self.effect_pos(&key),
+                pos: self.effect_pos(&key, lv),
                 item,
             });
         }
+    }
+
+    /// Carries on the run of the item just before `lv`, if `lv` goes right
+    /// after it, as its author saw it, with the same right origin, and the
+    /// key it would get falls before what's next. Returns that key.
+    ///
+    /// When events replay in number order these all hold whenever `lv`'s
+    /// left origin ends the run: nothing can be put between two
+    /// consecutive events. They don't when a merge replays new events
+    /// numbered among old ones (fetched before, merged after, with local
+    /// edits between): an old event may have landed right after the run,
+    /// on its right, or deleted its end.
+    fn extend(
+        &mut self,
+        lv: Lv,
+        left: Option<&Key>,
+        prev: Option<&Key>,
+        next: Option<&Key>,
+        right: Option<&Key>,
+    ) -> Option<Key> {
+        let before = lv.checked_sub(1)?;
+        let (&first, (run_key, len)) = self.starts.range(..=before).next_back()?;
+        if first + len != lv {
+            return None;
+        }
+        let before_key = if before == first {
+            run_key.clone()
+        } else {
+            run_key.extended(before - first)
+        };
+        if left != Some(&before_key) || prev != Some(&before_key) {
+            return None;
+        }
+        let key = run_key.extended(lv - first);
+        // Defensive: the way `between` picks digits, no record gets a key
+        // here, but the tree's order depends on keys never colliding.
+        if next.is_some_and(|n| *n <= key) {
+            return None;
+        }
+        let (record, _) = self.record_at(&before_key);
+        let carries_on = record.last == before_key
+            && record.right.as_ref() == right
+            && record.prepare == Prepare::Inserted
+            && !record.gone;
+        if !carries_on {
+            return None;
+        }
+        self.records.update_at(&At(&before_key), Bias::Left, |r| {
+            r.len += 1;
+            r.last = key.clone();
+        });
+        self.starts.get_mut(&first).expect("found above").1 += 1;
+        Some(key)
     }
 
     /// Where an insert by `lv` with left origin `left` goes: the key of the
@@ -436,14 +574,14 @@ impl<T: Clone> Walk<'_, T> {
                     nearer => scanning = nearer == Ordering::Less,
                 }
             }
-            last = Some(other.last_key());
+            last = Some(other.last.clone());
             cursor.next();
         }
         (prev, next, right)
     }
 
     fn delete(&mut self, lv: Lv, pos: usize, out: Option<&mut Vec<Change<T>>>) {
-        let key = self.prepared_item(pos, true);
+        let (key, id) = self.prepared_item(pos, true);
         let was_gone = self
             .records
             .update_at(&At(&key), Bias::Left, |r| {
@@ -451,20 +589,14 @@ impl<T: Clone> Walk<'_, T> {
                 std::mem::replace(&mut r.gone, true)
             })
             .expect("the item is in the tree");
-        self.targets.insert(lv, key.clone());
+        self.targets.insert(lv, (key.clone(), id));
         // Already deleted in the effect version by a concurrent delete:
         // nothing more to do to the document.
         if !was_gone && let Some(out) = out {
             out.push(Change::Delete {
-                pos: self.effect_pos(&key),
+                pos: self.effect_pos(&key, id),
             });
         }
-    }
-}
-
-impl<T> Op<T> {
-    pub(crate) fn is_insert(&self) -> bool {
-        matches!(self, Op::Insert { .. })
     }
 }
 
@@ -500,7 +632,8 @@ mod tests {
         }
         let a = log.add_insert(alice, &v, 50, [1000, 1001]);
         let b = log.add_delete(bob, &v, 10..13);
-        let (changes, replayed) = log.walk(&a, &b);
+        let (changes, stats) = log.walk(&a, &b);
+        let replayed = stats.replayed;
         // Bob's three deletes are new, and Alice's two inserts are
         // concurrent with them, so replayed too; the 200 before are the base.
         assert_eq!(replayed, 5);
@@ -529,12 +662,38 @@ mod tests {
             a = log.add_insert(alice, &a, k * 3, [500 + k as u32]);
             b = log.add_delete(bob, &b, 100..101);
         }
-        let (changes, replayed) = log.walk(&a, &b);
+        let (changes, stats) = log.walk(&a, &b);
+        let replayed = stats.replayed;
         assert_eq!(replayed, 10, "five events each side, none before the fork");
         let mut doc = log.checkout(&a);
         for change in changes {
             change.apply(&mut doc);
         }
         assert_eq!(doc, log.checkout(&log.union(&a, &b)));
+    }
+
+    /// Typing makes runs: a document typed in a few stretches, with the
+    /// cursor moved between them, is a few records, not one per item.
+    #[test]
+    fn typing_makes_few_records() {
+        let mut log: OpLog<char> = OpLog::new();
+        let alice = log.agent("alice");
+        let mut v = Vec::new();
+        let mut len = 0;
+        for (at, text) in [(0, "hello world"), (5, ", dear"), (0, "Oh, "), (21, "!")] {
+            for (k, c) in text.chars().enumerate() {
+                v = log.add_insert(alice, &v, at + k, [c]);
+            }
+            len += text.len();
+        }
+        let (changes, stats) = log.walk(&[], &v);
+        assert_eq!(changes.len(), len);
+        assert_eq!(
+            log.checkout(&v).into_iter().collect::<String>(),
+            "Oh, hello, dear world!"
+        );
+        // Four stretches typed, two of them splitting what was there, plus
+        // the placeholder: a handful of records for 22 items.
+        assert!(stats.records <= 8, "{} records", stats.records);
     }
 }

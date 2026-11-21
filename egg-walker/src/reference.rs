@@ -34,7 +34,8 @@ impl<T> Placed for Item<T> {
 /// The document at `version`, the slow way.
 pub fn checkout<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<T> {
     let mut list: Vec<Item<T>> = Vec::new();
-    for (lv, event) in log.events().iter().enumerate() {
+    for lv in 0..log.len() {
+        let event = log.event(lv);
         let at = log.closure(&event.parents);
         // The document this event saw: items its parents inserted, in
         // order, each with whether its parents also deleted it.

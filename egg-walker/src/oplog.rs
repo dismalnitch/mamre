@@ -7,8 +7,14 @@
 //! log learned them, which is always a topological order: parents first.
 //!
 //! Across replicas an event is named by its agent and sequence number.
+//!
+//! Events are stored as runs: one agent's consecutive events, each right
+//! after the last, typing forward or deleting forward, are one entry with
+//! their items, not one event (and one list of parents) per item. That's
+//! how a document's whole history stays small. Single events are rebuilt
+//! when asked for; nothing about their numbering changes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ops::Range;
 
 /// A local version: an event's number in this log. Parents always have
@@ -29,6 +35,7 @@ pub enum Op<T> {
     Delete { pos: usize },
 }
 
+/// One event, as a log hands it out.
 #[derive(Clone, Debug)]
 pub struct Event<T> {
     pub agent: AgentId,
@@ -39,15 +46,49 @@ pub struct Event<T> {
     pub op: Op<T>,
 }
 
+/// One agent's consecutive events, each right after the last: the first
+/// has `parents`, every other has the one before it.
+#[derive(Clone, Debug)]
+struct Run<T> {
+    agent: AgentId,
+    seq: u64,
+    start: Lv,
+    parents: Vec<Lv>,
+    op: RunOp<T>,
+}
+
+#[derive(Clone, Debug)]
+enum RunOp<T> {
+    /// Item `k` goes in at `pos + k`: typing forward.
+    Insert { pos: usize, items: Vec<T> },
+    /// `len` items each removed at `pos`: deleting forward.
+    Delete { pos: usize, len: usize },
+}
+
+impl<T> Run<T> {
+    fn len(&self) -> usize {
+        match &self.op {
+            RunOp::Insert { items, .. } => items.len(),
+            RunOp::Delete { len, .. } => *len,
+        }
+    }
+
+    fn end(&self) -> Lv {
+        self.start + self.len()
+    }
+}
+
 /// Every event a replica knows, in a graph.
 #[derive(Clone, Debug)]
 pub struct OpLog<T> {
     agents: Vec<String>,
     by_name: HashMap<String, AgentId>,
     next_seq: Vec<u64>,
-    events: Vec<Event<T>>,
-    /// `(agent, seq)` to local version.
-    ids: HashMap<(AgentId, u64), Lv>,
+    /// In local-version order, covering every event.
+    runs: Vec<Run<T>>,
+    /// Per agent, by the seq each stretch starts at: where in this log the
+    /// agent's events are, as `(first local version, how many)`.
+    spans: Vec<BTreeMap<u64, (Lv, usize)>>,
     /// The events nothing else came after: the version of everything.
     frontier: Vec<Lv>,
     /// Critical events, in order: each has every earlier event among its
@@ -62,8 +103,8 @@ impl<T> Default for OpLog<T> {
             agents: Vec::new(),
             by_name: HashMap::new(),
             next_seq: Vec::new(),
-            events: Vec::new(),
-            ids: HashMap::new(),
+            runs: Vec::new(),
+            spans: Vec::new(),
             frontier: Vec::new(),
             critical: Vec::new(),
         }
@@ -84,29 +125,26 @@ impl<T: Clone> OpLog<T> {
         self.agents.push(name.to_string());
         self.by_name.insert(name.to_string(), id);
         self.next_seq.push(0);
+        self.spans.push(BTreeMap::new());
         id
     }
 
-    pub fn agent_name(&self, agent: AgentId) -> &str {
-        &self.agents[agent.0 as usize]
-    }
-
-    /// How many events this log knows.
-    pub fn len(&self) -> usize {
-        self.events.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.events.is_empty()
-    }
-
-    pub fn events(&self) -> &[Event<T>] {
-        &self.events
-    }
-
-    /// The version holding every event this log knows.
-    pub fn version(&self) -> &[Lv] {
-        &self.frontier
+    /// Event `lv`.
+    pub fn event(&self, lv: Lv) -> Event<T> {
+        let run = self.run_of(lv);
+        let k = lv - run.start;
+        Event {
+            agent: run.agent,
+            seq: run.seq + k as u64,
+            parents: self.parents(lv).collect(),
+            op: match &run.op {
+                RunOp::Insert { pos, items } => Op::Insert {
+                    pos: pos + k,
+                    item: items[k].clone(),
+                },
+                RunOp::Delete { pos, .. } => Op::Delete { pos: *pos },
+            },
+        }
     }
 
     /// Puts `items` in at `pos`, in a document at `parents`, as `agent`:
@@ -144,11 +182,12 @@ impl<T: Clone> OpLog<T> {
     /// order (so parents first). Returns how many were new.
     pub fn pull(&mut self, other: &OpLog<T>) -> usize {
         let mut added = 0;
-        for event in &other.events {
-            let agent = self.agent(other.agent_name(event.agent));
-            if self.ids.contains_key(&(agent, event.seq)) {
+        for lv in 0..other.len() {
+            if self.local(other, lv).is_some() {
                 continue;
             }
+            let event = other.event(lv);
+            let agent = self.agent(other.agent_name(event.agent));
             let parents = event
                 .parents
                 .iter()
@@ -157,7 +196,7 @@ impl<T: Clone> OpLog<T> {
                         .expect("parents arrive before children")
                 })
                 .collect();
-            self.push(agent, event.seq, parents, event.op.clone());
+            self.push(agent, event.seq, parents, event.op);
             added += 1;
         }
         added
@@ -175,20 +214,20 @@ impl<T: Clone> OpLog<T> {
 
     /// This log's number for `other`'s event `lv`.
     fn local(&self, other: &OpLog<T>, lv: Lv) -> Option<Lv> {
-        let event = &other.events[lv];
-        let agent = *self.by_name.get(other.agent_name(event.agent))?;
-        self.ids.get(&(agent, event.seq)).copied()
+        let run = other.run_of(lv);
+        let seq = run.seq + (lv - run.start) as u64;
+        let agent = *self.by_name.get(other.agent_name(run.agent))?;
+        self.find(agent, seq)
     }
 
     fn push(&mut self, agent: AgentId, seq: u64, parents: Vec<Lv>, op: Op<T>) -> Lv {
-        let lv = self.events.len();
+        let lv = self.len();
         assert!(
             parents.iter().all(|&p| p < lv),
             "an event's parents must already be known"
         );
-        let previous = self.ids.insert((agent, seq), lv);
         assert!(
-            previous.is_none(),
+            self.find(agent, seq).is_none(),
             "two events can't share an agent and seq"
         );
         let next = &mut self.next_seq[agent.0 as usize];
@@ -217,17 +256,106 @@ impl<T: Clone> OpLog<T> {
         if has_everything {
             self.critical.push(lv);
         }
-        self.events.push(Event {
-            agent,
-            seq,
-            parents,
-            op,
+
+        // Carry on the last run if this is its agent's next event, right
+        // after it, doing the same thing one item on.
+        let extends = self.runs.last().is_some_and(|run| {
+            run.agent == agent
+                && run.seq + run.len() as u64 == seq
+                && parents == [lv - 1]
+                && match (&run.op, &op) {
+                    (RunOp::Insert { pos: p, items }, Op::Insert { pos, .. }) => {
+                        *pos == p + items.len()
+                    }
+                    (RunOp::Delete { pos: p, .. }, Op::Delete { pos }) => pos == p,
+                    _ => false,
+                }
         });
+        if extends {
+            let run = self.runs.last_mut().expect("checked above");
+            match (&mut run.op, op) {
+                (RunOp::Insert { items, .. }, Op::Insert { item, .. }) => items.push(item),
+                (RunOp::Delete { len, .. }, Op::Delete { .. }) => *len += 1,
+                _ => unreachable!("checked above"),
+            }
+            let span = self.spans[agent.0 as usize]
+                .get_mut(&run.seq)
+                .expect("a run's agent has a span for it");
+            span.1 += 1;
+        } else {
+            self.runs.push(Run {
+                agent,
+                seq,
+                start: lv,
+                parents,
+                op: match op {
+                    Op::Insert { pos, item } => RunOp::Insert {
+                        pos,
+                        items: vec![item],
+                    },
+                    Op::Delete { pos } => RunOp::Delete { pos, len: 1 },
+                },
+            });
+            self.spans[agent.0 as usize].insert(seq, (lv, 1));
+        }
         lv
     }
 }
 
 impl<T> OpLog<T> {
+    pub fn agent_name(&self, agent: AgentId) -> &str {
+        &self.agents[agent.0 as usize]
+    }
+
+    /// How many events this log knows.
+    pub fn len(&self) -> usize {
+        self.runs.last().map_or(0, Run::end)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// How many runs the events are stored as.
+    pub fn runs(&self) -> usize {
+        self.runs.len()
+    }
+
+    /// The version holding every event this log knows.
+    pub fn version(&self) -> &[Lv] {
+        &self.frontier
+    }
+
+    fn run_of(&self, lv: Lv) -> &Run<T> {
+        let i = self.runs.partition_point(|r| r.start <= lv);
+        let run = &self.runs[i - 1];
+        debug_assert!(lv < run.end(), "event {lv} isn't in the log");
+        run
+    }
+
+    /// This log's number for the event `agent` numbered `seq`.
+    fn find(&self, agent: AgentId, seq: u64) -> Option<Lv> {
+        let (&first, &(lv, len)) = self.spans[agent.0 as usize].range(..=seq).next_back()?;
+        let k = (seq - first) as usize;
+        (k < len).then_some(lv + k)
+    }
+
+    /// Event `lv`'s parents.
+    pub(crate) fn parents(&self, lv: Lv) -> impl Iterator<Item = Lv> + '_ {
+        let run = self.run_of(lv);
+        let (first, previous) = if lv == run.start {
+            (&run.parents[..], None)
+        } else {
+            (&[][..], Some(lv - 1))
+        };
+        first.iter().copied().chain(previous)
+    }
+
+    /// Whether event `lv` is an insert.
+    pub(crate) fn is_insert(&self, lv: Lv) -> bool {
+        matches!(self.run_of(lv).op, RunOp::Insert { .. })
+    }
+
     /// The latest critical event in `version`, if any: everything up to it
     /// is in `version`, and everything after it descends from it.
     pub(crate) fn critical_in(&self, version: &[Lv]) -> Option<Lv> {
@@ -242,17 +370,11 @@ impl<T> OpLog<T> {
     /// The search stops at `floor`, which all of them descend from.
     pub(crate) fn events_after(&self, version: &[Lv], floor: Option<Lv>) -> Vec<Lv> {
         let above = |lv: Lv| floor.is_none_or(|f| lv > f);
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut stack: Vec<Lv> = version.iter().copied().filter(|&lv| above(lv)).collect();
         while let Some(lv) = stack.pop() {
             if seen.insert(lv) {
-                stack.extend(
-                    self.events[lv]
-                        .parents
-                        .iter()
-                        .copied()
-                        .filter(|&p| above(p)),
-                );
+                stack.extend(self.parents(lv).filter(|&p| above(p)));
             }
         }
         let mut out: Vec<Lv> = seen.into_iter().collect();
@@ -268,7 +390,7 @@ impl<T> OpLog<T> {
     pub(crate) fn diff(&self, a: &[Lv], b: &[Lv]) -> (Vec<Lv>, Vec<Lv>) {
         const A: u8 = 1;
         const B: u8 = 2;
-        let mut queue: std::collections::BinaryHeap<(Lv, u8)> = a
+        let mut queue: BinaryHeap<(Lv, u8)> = a
             .iter()
             .map(|&lv| (lv, A))
             .chain(b.iter().map(|&lv| (lv, B)))
@@ -295,7 +417,7 @@ impl<T> OpLog<T> {
                 B => only_b.push(lv),
                 _ => {}
             }
-            for &p in &self.events[lv].parents {
+            for p in self.parents(lv) {
                 if side != A | B {
                     one_sided += 1;
                 }
@@ -307,12 +429,12 @@ impl<T> OpLog<T> {
 
     /// Every event in `version` and before it, as a set by local version.
     pub(crate) fn closure(&self, version: &[Lv]) -> Vec<bool> {
-        let mut seen = vec![false; self.events.len()];
+        let mut seen = vec![false; self.len()];
         let mut stack: Vec<Lv> = version.to_vec();
         while let Some(lv) = stack.pop() {
             if !seen[lv] {
                 seen[lv] = true;
-                stack.extend(&self.events[lv].parents);
+                stack.extend(self.parents(lv));
             }
         }
         seen
@@ -341,8 +463,11 @@ impl<T> OpLog<T> {
     /// How an event's inserts are ordered against concurrent ones at the
     /// same place: by agent name, then sequence number.
     pub(crate) fn order_key(&self, lv: Lv) -> (&str, u64) {
-        let event = &self.events[lv];
-        (&self.agents[event.agent.0 as usize], event.seq)
+        let run = self.run_of(lv);
+        (
+            &self.agents[run.agent.0 as usize],
+            run.seq + (lv - run.start) as u64,
+        )
     }
 }
 
@@ -350,4 +475,53 @@ fn normalize(mut version: Vec<Lv>) -> Vec<Lv> {
     version.sort_unstable();
     version.dedup();
     version
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typing_is_one_run() {
+        let mut log: OpLog<char> = OpLog::new();
+        let alice = log.agent("alice");
+        let mut v = Vec::new();
+        for (i, c) in "hello world".chars().enumerate() {
+            v = log.add_insert(alice, &v, i, [c]);
+        }
+        v = log.add_delete(alice, &v, 0..6);
+        assert_eq!(log.len(), 17);
+        assert_eq!(log.runs(), 2, "one run of typing, one of deleting");
+        assert_eq!(log.event(4).op, Op::Insert { pos: 4, item: 'o' });
+        assert_eq!(log.event(4).parents, [3]);
+        assert_eq!(log.event(11).parents, [10]);
+        assert_eq!(log.event(12).op, Op::Delete { pos: 0 });
+        assert_eq!(log.checkout(&v).into_iter().collect::<String>(), "world");
+    }
+
+    #[test]
+    fn a_jump_or_another_agent_starts_a_run() {
+        let mut log: OpLog<char> = OpLog::new();
+        let (alice, bob) = (log.agent("alice"), log.agent("bob"));
+        let v = log.add_insert(alice, &[], 0, "abc".chars());
+        let v = log.add_insert(alice, &v, 0, "x".chars()); // jumped back
+        let v = log.add_insert(bob, &v, 4, "yz".chars());
+        assert_eq!(log.runs(), 3);
+        assert_eq!(log.checkout(&v).into_iter().collect::<String>(), "xabcyz");
+    }
+
+    #[test]
+    fn pulling_keeps_runs() {
+        let mut a: OpLog<char> = OpLog::new();
+        let alice = a.agent("alice");
+        let mut v = Vec::new();
+        for (i, c) in "hello".chars().enumerate() {
+            v = a.add_insert(alice, &v, i, [c]);
+        }
+        let mut b: OpLog<char> = OpLog::new();
+        b.pull(&a);
+        assert_eq!(b.runs(), 1);
+        let v = b.translate(&a, &v).unwrap();
+        assert_eq!(b.checkout(&v).into_iter().collect::<String>(), "hello");
+    }
 }

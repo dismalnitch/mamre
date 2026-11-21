@@ -18,6 +18,10 @@ enum Act {
     Delete { r: usize, a: u16, b: u16 },
     /// Replica `r` takes in everything replica `from` knows.
     Sync { r: usize, from: usize },
+    /// Replica `r` takes in replica `from`'s events but doesn't merge them
+    /// yet: its later edits get later numbers than events it merges after,
+    /// so a merge replays new events numbered among old ones.
+    Fetch { r: usize, from: usize },
 }
 
 struct Replica {
@@ -110,6 +114,13 @@ fn run(replicas: usize, acts: &[Act]) -> Result<(), String> {
                 sync(&mut reps, r, from);
                 r
             }
+            Act::Fetch { r, from } => {
+                if r != from {
+                    let theirs = reps[from].log.clone();
+                    reps[r].log.pull(&theirs);
+                }
+                r
+            }
         };
         verify(&reps[r]).map_err(|e| format!("step {step}, {act:?}: {e}"))?;
     }
@@ -139,7 +150,8 @@ fn acts(replicas: usize) -> impl Strategy<Value = Vec<Act>> {
     let act = prop_oneof![
         4 => (r.clone(), any::<u16>(), 1usize..4).prop_map(|(r, at, n)| Act::Insert { r, at, n }),
         2 => (r.clone(), any::<u16>(), any::<u16>()).prop_map(|(r, a, b)| Act::Delete { r, a, b }),
-        2 => (r.clone(), r).prop_map(|(r, from)| Act::Sync { r, from }),
+        2 => (r.clone(), r.clone()).prop_map(|(r, from)| Act::Sync { r, from }),
+        1 => (r.clone(), r).prop_map(|(r, from)| Act::Fetch { r, from }),
     ];
     prop::collection::vec(act, 1..50)
 }
