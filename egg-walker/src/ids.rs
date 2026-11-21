@@ -7,9 +7,12 @@
 //!
 //! The walk only knows identities for events since the versions it merges
 //! met; older items are anonymous, by position. When it needs one (an undo
-//! bringing back an older item), it asks here.
+//! bringing back an older item), it asks here: a replica keeps its
+//! document's `Identities` beside the document.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use mamre::cursor::Bias;
 use mamre::{Item, SumTree, Summary};
@@ -40,6 +43,95 @@ impl Item for Run {
     type Summary = Count;
     fn summary(&self) -> Count {
         Count(self.len)
+    }
+}
+
+/// What a replica knows about who its document's items are: which insert
+/// each item came from, and which item each recent delete removed. Kept
+/// beside the document, at its version, by the same edits: local ones with
+/// [`insert`](Self::insert) and [`delete`](Self::delete), merges with
+/// [`OpLog::changes_with`](crate::OpLog::changes_with).
+///
+/// An undo that brings back an item a merge doesn't otherwise know (one
+/// from before the versions met) finds it here, so it costs what the merge
+/// does. Deletes older than the window are forgotten: undoing one of those
+/// still works, by a checkout of the history, but slower.
+#[derive(Clone)]
+pub struct Identities {
+    pub(crate) ids: Ids,
+    /// Delete to the insert of the item it removed, for the latest deletes.
+    pub(crate) removed: Arc<BTreeMap<Lv, Lv>>,
+    window: usize,
+}
+
+impl Default for Identities {
+    fn default() -> Self {
+        Self::with_window(Self::WINDOW)
+    }
+}
+
+impl Identities {
+    /// How many deletes are remembered by default: days to weeks of heavy
+    /// editing, at a few dozen bytes each.
+    pub const WINDOW: usize = 50_000;
+
+    /// An empty document's.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// An empty document's, remembering the latest `window` deletes.
+    pub fn with_window(window: usize) -> Self {
+        Identities {
+            ids: Ids::default(),
+            removed: Arc::new(BTreeMap::new()),
+            window,
+        }
+    }
+
+    /// How many items the document has.
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The insert the item at `pos` came from.
+    pub fn item(&self, pos: usize) -> Lv {
+        self.ids.get(pos)
+    }
+
+    /// The item delete `delete` removed, if it's remembered.
+    pub fn removed(&self, delete: Lv) -> Option<Lv> {
+        self.removed.get(&delete).copied()
+    }
+
+    /// A local insert: events `first..first + len`, typed forward from
+    /// `pos`, as [`OpLog::add_insert`](crate::OpLog::add_insert) makes.
+    pub fn insert(&mut self, pos: usize, first: Lv, len: usize) {
+        self.ids.insert(pos, first, len);
+    }
+
+    /// A local delete: events `first..first + len`, each removing the item
+    /// at `pos`, as [`OpLog::add_delete`](crate::OpLog::add_delete) makes.
+    pub fn delete(&mut self, pos: usize, first: Lv, len: usize) {
+        let gone: Vec<(Lv, Lv)> = (0..len)
+            .map(|k| (first + k, self.ids.get(pos + k)))
+            .collect();
+        self.ids.remove(pos..pos + len);
+        self.learn(gone);
+    }
+
+    /// Remembers what deletes removed, forgetting the oldest past the
+    /// window.
+    pub(crate) fn learn(&mut self, removed: impl IntoIterator<Item = (Lv, Lv)>) {
+        let map = Arc::make_mut(&mut self.removed);
+        map.extend(removed);
+        while map.len() > self.window {
+            map.pop_first();
+        }
     }
 }
 

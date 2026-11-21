@@ -43,6 +43,13 @@ pub fn checkout<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<T> {
         .collect()
 }
 
+/// Which insert each item visible at `version` came from, in order: the
+/// identities a replica's [`Identities`](crate::Identities) must hold.
+#[doc(hidden)]
+pub fn identities<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<Lv> {
+    visible_ids(log, &log.closure(version))
+}
+
 /// Which insert each item visible at `at` (a version, as a set) came
 /// from, in order: their identities.
 pub(crate) fn visible_ids<T: Clone>(log: &OpLog<T>, at: &[bool]) -> Vec<Lv> {

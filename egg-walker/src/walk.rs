@@ -44,11 +44,12 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 
 use mamre::cursor::Bias;
 use mamre::{Item, SeekTarget, SumTree, Summary};
 
-use crate::ids::Ids;
+use crate::ids::{Identities, Ids};
 use crate::key::Key;
 use crate::oplog::{Kind, Lv, Op, OpLog};
 
@@ -108,9 +109,10 @@ impl<T: Clone> Change<'_, T> {
 pub(crate) struct Changes<'a, T> {
     log: &'a OpLog<T>,
     pub(crate) out: Vec<Change<'a, T>>,
-    /// The identities of the document the changes make, if it started
-    /// empty and they're being kept.
+    /// The identities of the document the changes make, if they're being
+    /// kept, and which item each new delete removed, where known.
     pub(crate) ids: Option<Ids>,
+    pub(crate) learned: Vec<(Lv, Lv)>,
 }
 
 impl<'a, T: Clone> Changes<'a, T> {
@@ -119,6 +121,7 @@ impl<'a, T: Clone> Changes<'a, T> {
             log,
             out: Vec::new(),
             ids: None,
+            learned: Vec::new(),
         }
     }
 
@@ -227,6 +230,9 @@ struct Record {
     /// How many deletes replayed so far removed it, not undone: it shows in
     /// the effect version if none.
     dead: u32,
+    /// It shows in the document the merge started from: set once the
+    /// events that document already has are replayed.
+    in_from: bool,
 }
 
 impl Record {
@@ -241,6 +247,7 @@ impl Record {
             right: None,
             prepare: Prepare::Inserted,
             dead: 0,
+            in_from: true,
         }
     }
 
@@ -261,6 +268,8 @@ struct Counts {
     items: usize,
     prepared: usize,
     effect: usize,
+    /// Shown in the document the merge started from.
+    from: usize,
     last: Option<Key>,
 }
 
@@ -272,6 +281,7 @@ impl Summary for Counts {
         self.items += other.items;
         self.prepared += other.prepared;
         self.effect += other.effect;
+        self.from += other.from;
         if other.last.is_some() {
             self.last.clone_from(&other.last);
         }
@@ -289,6 +299,7 @@ impl Item for Record {
                 0
             },
             effect: if self.dead > 0 { 0 } else { self.len },
+            from: if self.in_from { self.len } else { 0 },
             last: Some(self.last.clone()),
         }
     }
@@ -323,6 +334,8 @@ pub(crate) struct Stats {
     pub replayed: usize,
     pub stepped: usize,
     pub records: usize,
+    /// Checkouts made to find an item's identity, for want of knowing it.
+    pub checkouts: usize,
 }
 
 struct Walk<'a, T> {
@@ -342,10 +355,17 @@ struct Walk<'a, T> {
     /// items came from, once known.
     base: Vec<Lv>,
     base_ids: Option<Ids>,
+    /// The identities of the document the merge started from, once each
+    /// record knows whether it shows there; and which old delete removed
+    /// each base item it did.
+    known: Option<(Ids, Arc<BTreeMap<Lv, Lv>>)>,
+    marked: bool,
+    killers: HashMap<usize, Lv>,
     /// How many events were replayed, and stepped in full: what a merge
     /// cost.
     replayed: usize,
     stepped: usize,
+    checkouts: usize,
     /// Nothing has touched the records since they were made.
     fresh: bool,
 }
@@ -368,21 +388,40 @@ impl<T: Clone> OpLog<T> {
 
     /// The changes, and what finding them cost.
     pub(crate) fn walk(&self, from: &[Lv], to: &[Lv]) -> (Vec<Change<'_, T>>, Stats) {
-        let (out, stats) = self.walk_into(from, to, false);
+        let (out, stats) = self.walk_into(from, to, false, None);
         (out.out, stats)
+    }
+
+    /// The changes, as [`changes`](Self::changes), for a replica that keeps
+    /// its document's [`Identities`], at `from`: they're used to bring back
+    /// items an undo revives, and brought up to date with the changes.
+    pub fn changes_with(&self, from: &[Lv], to: &[Lv], ids: &mut Identities) -> Vec<Change<'_, T>> {
+        let (out, _) = self.walk_into(from, to, true, Some(ids));
+        if let Some(new) = out.ids {
+            ids.ids = new;
+        }
+        ids.learn(out.learned);
+        out.out
     }
 
     /// Which insert each item at `version` came from.
     pub(crate) fn ids_at(&self, version: &[Lv]) -> Ids {
-        self.walk_into(&[], version, true)
+        self.walk_into(&[], version, true, None)
             .0
             .ids
             .expect("a walk from nothing keeps identities")
     }
 
     /// The walk, keeping the identities of the document it makes if
-    /// `keep_ids` (and it starts from nothing).
-    fn walk_into(&self, from: &[Lv], to: &[Lv], keep_ids: bool) -> (Changes<'_, T>, Stats) {
+    /// `keep_ids` and it starts from nothing, or from a document whose
+    /// identities are `known`.
+    fn walk_into(
+        &self,
+        from: &[Lv],
+        to: &[Lv],
+        keep_ids: bool,
+        known: Option<&Identities>,
+    ) -> (Changes<'_, T>, Stats) {
         let mut out = Changes::new(self);
         // What to replay, and the base: a version every replayed event
         // includes whole, so none of it is ever retreated.
@@ -394,7 +433,9 @@ impl<T: Clone> OpLog<T> {
         let undoes = new
             .iter()
             .any(|span| self.kind(span.start) == Kind::Undelete);
-        if from.is_empty() && (keep_ids || undoes) {
+        if let Some(known) = known {
+            out.ids = Some(known.ids.clone());
+        } else if from.is_empty() && (keep_ids || undoes) {
             out.ids = Some(Ids::default());
         }
         if new.is_empty() {
@@ -411,12 +452,20 @@ impl<T: Clone> OpLog<T> {
             .collect();
         let critical = self.critical_points(&order, &old, &new, &base);
         let mut critical = critical.iter().peekable();
-        let mut walk = Walk::new(self, base, out.ids.clone());
+        // With nothing old to replay, the base is the document the changes
+        // start from, whose identities are known.
+        let old_len: usize = old.iter().map(|span| span.len()).sum();
+        let base_ids = if old_len == 0 { out.ids.clone() } else { None };
+        let mut walk = Walk::new(self, base, base_ids);
+        walk.known = known.map(|k| (k.ids.clone(), k.removed.clone()));
         // How many events have been replayed: where the next is in `order`.
         let mut at = 0;
         for (span, output) in order {
             let mut lv = span.start;
             while lv < span.end {
+                if at == old_len && !walk.marked && walk.known.is_some() {
+                    walk.mark_from();
+                }
                 // The stretch from here that's all critical, or none of it.
                 while critical.next_if(|c| c.end <= at).is_some() {}
                 let (is_critical, until) = match critical.peek() {
@@ -434,21 +483,43 @@ impl<T: Clone> OpLog<T> {
                     if output {
                         match self.op(lv) {
                             Op::Insert { pos, .. } => out.insert_run(pos, lv, n),
-                            Op::Delete { pos } => out.delete_run(pos, n),
+                            Op::Delete { pos } => {
+                                // Applied as they stand, to the document
+                                // whose identities are being kept.
+                                if let Some(ids) = &out.ids {
+                                    let gone: Vec<(Lv, Lv)> =
+                                        (0..n).map(|k| (lv + k, ids.get(pos + k))).collect();
+                                    out.learned.extend(gone);
+                                }
+                                out.delete_run(pos, n)
+                            }
                             Op::Undelete { .. } => unreachable!("an undelete is never critical"),
                         }
                     }
                     let last = lv + n - 1;
+                    // Past the old events, the document the changes make is
+                    // the effect version, so its identities are the base's.
+                    // (Among the old events there's no fresh start before an
+                    // undone delete: the base would have been taken there,
+                    // or the range up to its undo forbids one. So the
+                    // condition is defensive.)
+                    let base_ids = if at + n > old_len {
+                        out.ids.clone()
+                    } else {
+                        None
+                    };
                     if walk.fresh {
                         // The placeholder now stands for the document here.
                         walk.prepared.clear();
                         walk.prepared.push(last);
                         walk.base.clone_from(&walk.prepared);
-                        walk.base_ids.clone_from(&out.ids);
+                        walk.base_ids = base_ids;
                     } else {
-                        let (replayed, stepped) = (walk.replayed, walk.stepped);
-                        walk = Walk::new(self, vec![last], out.ids.clone());
-                        (walk.replayed, walk.stepped) = (replayed, stepped);
+                        let counts = (walk.replayed, walk.stepped, walk.checkouts);
+                        let (known, marked) = (walk.known.take(), walk.marked);
+                        walk = Walk::new(self, vec![last], base_ids);
+                        (walk.replayed, walk.stepped, walk.checkouts) = counts;
+                        (walk.known, walk.marked) = (known, marked);
                     }
                 } else {
                     // Each the last one's only child, carrying on what it
@@ -462,6 +533,7 @@ impl<T: Clone> OpLog<T> {
         let stats = Stats {
             replayed: walk.replayed,
             stepped: walk.stepped,
+            checkouts: walk.checkouts,
             records: walk.records.iter().count(),
         };
         (out, stats)
@@ -588,8 +660,12 @@ impl<'a, T: Clone> Walk<'a, T> {
             undone: HashSet::new(),
             base,
             base_ids,
+            known: None,
+            marked: false,
+            killers: HashMap::new(),
             replayed: 0,
             stepped: 0,
+            checkouts: 0,
             fresh: true,
         }
     }
@@ -669,6 +745,11 @@ impl<'a, T: Clone> Walk<'a, T> {
         debug_assert!(
             record.last == key && record.prepare == Prepare::Inserted && record.dead == 0
         );
+        // New items aren't in the document the merge started from: they
+        // can't join a record that is.
+        if self.marked && record.in_from {
+            return false;
+        }
         cursor.next();
         // Defensive, as in `extend`.
         if cursor.item().is_some_and(|next| next.key <= last) {
@@ -722,6 +803,7 @@ impl<'a, T: Clone> Walk<'a, T> {
                 .expect("the items are in the tree");
             for k in 0..m {
                 self.targets.insert(x + k, id + k);
+                self.note_delete(x + k, id + k, out.as_deref_mut());
             }
             if !was_dead && let Some(out) = out.as_deref_mut() {
                 out.delete_run(self.effect_pos(&key, id), m);
@@ -921,6 +1003,7 @@ impl<'a, T: Clone> Walk<'a, T> {
                     right,
                     prepare: Prepare::Inserted,
                     dead: 0,
+                    in_from: false,
                 };
                 match &next {
                     // In front of `next`: swap in, and it goes after.
@@ -981,7 +1064,9 @@ impl<'a, T: Clone> Walk<'a, T> {
         let carries_on = record.last == before_key
             && record.right.as_ref() == right
             && record.prepare == Prepare::Inserted
-            && record.dead == 0;
+            && record.dead == 0
+            // A new item isn't in the document the merge started from.
+            && !(self.marked && record.in_from);
         if !carries_on {
             return None;
         }
@@ -1073,6 +1158,8 @@ impl<'a, T: Clone> Walk<'a, T> {
             })
             .expect("the item is in the tree");
         self.targets.insert(lv, id);
+        let mut out = out;
+        self.note_delete(lv, id, out.as_deref_mut());
         // Already deleted in the effect version by a concurrent delete:
         // nothing more to do to the document.
         if !was_dead && let Some(out) = out {
@@ -1148,16 +1235,68 @@ impl<'a, T: Clone> Walk<'a, T> {
     /// The insert item `id` came from: a base item's is found by its place
     /// in the base document.
     fn identity(&mut self, id: usize) -> Lv {
+        if let Some(lv) = self.known_identity(id) {
+            return lv;
+        }
+        // Not known: from the history, by a checkout of the base.
+        self.checkouts += 1;
+        let ids = self.log.ids_at(&self.base);
+        let lv = ids.get(id - BASE_ITEM);
+        self.base_ids = Some(ids);
+        lv
+    }
+
+    /// The insert item `id` came from, if it's known without a checkout:
+    /// a replayed insert's own, or a base item's from the identities of
+    /// the base document, or of the document the merge started from.
+    fn known_identity(&self, id: usize) -> Option<Lv> {
         if id < BASE_ITEM {
-            return id;
+            return Some(id);
         }
-        if self.base_ids.is_none() {
-            self.base_ids = Some(self.log.ids_at(&self.base));
+        if let Some(ids) = &self.base_ids {
+            return Some(ids.get(id - BASE_ITEM));
         }
-        self.base_ids
-            .as_ref()
-            .expect("just made")
-            .get(id - BASE_ITEM)
+        let (ids, removed) = self.known.as_ref().filter(|_| self.marked)?;
+        let (record, before) = self.record_at(&self.item_key(id));
+        if record.in_from {
+            Some(ids.get(before.from + (id - record.id)))
+        } else {
+            // Removed by a delete the document already had.
+            removed.get(self.killers.get(&id)?).copied()
+        }
+    }
+
+    /// From here on, records know whether they show in the document the
+    /// merge started from: it's the effect version now.
+    fn mark_from(&mut self) {
+        if !self.fresh {
+            self.records = self
+                .records
+                .iter()
+                .map(|r| Record {
+                    in_from: r.dead == 0,
+                    ..r.clone()
+                })
+                .collect();
+        }
+        self.marked = true;
+    }
+
+    /// Notes what delete `lv` removed: item `id`. A new delete's item is
+    /// learned for the replica's identities; an old one's base item, for
+    /// finding it again here.
+    fn note_delete(&mut self, lv: Lv, id: usize, out: Option<&mut Changes<'a, T>>) {
+        match out {
+            Some(out) => {
+                if let Some(item) = self.known_identity(id) {
+                    out.learned.push((lv, item));
+                }
+            }
+            None if id >= BASE_ITEM => {
+                self.killers.insert(id, lv);
+            }
+            None => {}
+        }
     }
 }
 
@@ -1406,6 +1545,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A replica that keeps its identities never needs a checkout to undo:
+    /// not for its own undo, not for one from elsewhere of a delete it
+    /// already has, and not after many fresh starts. Without them, the
+    /// remote undo needs one.
+    #[test]
+    fn identities_spare_checkouts() {
+        let mut log: OpLog<char> = OpLog::new();
+        let (alice, bob) = (log.agent("alice"), log.agent("bob"));
+        let mut ids = Identities::new();
+        let typed = log.add_insert(alice, &[], 0, "hello world".chars());
+        ids.insert(0, 0, 11);
+        // Bob types at the end meanwhile, so merges have old events.
+        let theirs = log.add_insert(bob, &typed, 11, "!".chars());
+        let gone = log.add_delete(alice, &typed, 1..4);
+        ids.delete(1, gone[0] - 2, 3);
+        // Alice's replica: her own undo.
+        let undone = log.add_undelete(alice, &gone, gone[0] - 2..=gone[0]);
+        let mut mine = ids.clone();
+        let (out, stats) = log.walk_into(&gone, &undone, true, Some(&mine));
+        assert_eq!(stats.checkouts, 0, "local undo");
+        drop(out);
+        log.changes_with(&gone, &undone, &mut mine);
+
+        // Bob's replica: has the delete, merged with his "!"; the undo
+        // arrives.
+        let mut bobs = Identities::new();
+        log.changes_with(&[], &theirs, &mut bobs);
+        let both = log.union(&theirs, &gone);
+        log.changes_with(&theirs, &both, &mut bobs);
+        let all = log.union(&both, &undone);
+        let (_, stats) = log.walk_into(&both, &all, true, Some(&bobs));
+        assert_eq!(stats.checkouts, 0, "remote undo");
+        let (_, stats) = log.walk_into(&both, &all, false, None);
+        assert!(stats.checkouts > 0, "without identities, a checkout");
+        let mut doc = log.checkout(&both);
+        for change in log.changes_with(&both, &all, &mut bobs) {
+            change.apply(&mut doc);
+        }
+        assert_eq!(doc.into_iter().collect::<String>(), "hello world!");
+
+        // Many fresh starts later, undoing the same text again.
+        let again = log.add_delete(alice, &all, 1..4);
+        let mut v = again.clone();
+        let mut ids = Identities::new();
+        log.changes_with(&[], &v, &mut ids);
+        for k in 0..40 {
+            let len = ids.len();
+            v = log.add_insert(alice, &v, len, [char::from(b'a' + k % 26)]);
+            ids.insert(len, v[0], 1);
+        }
+        let back = log.add_undelete(alice, &v, again[0] - 2..=again[0]);
+        let (_, stats) = log.walk_into(&v, &back, true, Some(&ids));
+        assert_eq!(stats.checkouts, 0, "undo after fresh starts");
     }
 
     /// Typing makes runs: a document typed in a few stretches, with the

@@ -7,7 +7,7 @@
 //! everyone, and every replica must hold the same document, though each
 //! log numbered the events differently.
 
-use mamre_egg_walker::{Lv, Op, OpLog, reference};
+use mamre_egg_walker::{Identities, Lv, Op, OpLog, reference};
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -33,6 +33,8 @@ struct Replica {
     /// The version this replica's document is at.
     version: Vec<Lv>,
     doc: Vec<u32>,
+    /// Who the document's items are, kept beside it.
+    ids: Identities,
 }
 
 fn frac(len: usize, f: u16) -> usize {
@@ -52,6 +54,14 @@ fn verify(r: &Replica) -> Result<(), String> {
     if r.doc != slow {
         return Err(format!("{}: walk {:?}, reference {slow:?}", r.name, r.doc));
     }
+    let kept: Vec<Lv> = (0..r.ids.len()).map(|k| r.ids.item(k)).collect();
+    let truth = reference::identities(&r.log, &r.version);
+    if kept != truth {
+        return Err(format!(
+            "{}: identities {kept:?}, reference {truth:?}",
+            r.name
+        ));
+    }
     Ok(())
 }
 
@@ -68,13 +78,19 @@ fn sync(replicas: &mut [Replica], r: usize, from: usize) {
         .expect("just pulled");
     let before = me.version.clone();
     me.version = me.log.union(&before, &theirs_here);
-    let changes = me.log.changes(&before, &me.version);
+    let changes = me.log.changes_with(&before, &me.version, &mut me.ids);
     // The fast walk and the simple one must agree change for change, not
-    // just on the document they lead to.
+    // just on the document they lead to; and knowing identities changes
+    // nothing but the cost.
     assert_eq!(
         changes,
         me.log.changes_simple(&before, &me.version),
         "the tree walk and the list walk differ"
+    );
+    assert_eq!(
+        changes,
+        me.log.changes(&before, &me.version),
+        "identities changed the changes"
     );
     for change in changes {
         change.apply(&mut me.doc);
@@ -89,6 +105,7 @@ fn run(replicas: usize, acts: &[Act]) -> Result<(), String> {
             name: format!("r{i}"),
             version: Vec::new(),
             doc: Vec::new(),
+            ids: Identities::new(),
         })
         .collect();
 
@@ -101,6 +118,7 @@ fn run(replicas: usize, acts: &[Act]) -> Result<(), String> {
                 let items: Vec<u32> = (0..n as u32).map(|k| next_item + k).collect();
                 next_item += n as u32;
                 rep.version = rep.log.add_insert(agent, &rep.version, pos, items.clone());
+                rep.ids.insert(pos, rep.version[0] + 1 - n, n);
                 rep.doc.splice(pos..pos, items);
                 r
             }
@@ -109,8 +127,12 @@ fn run(replicas: usize, acts: &[Act]) -> Result<(), String> {
                 let agent = rep.log.agent(&rep.name.clone());
                 let (a, b) = (frac(rep.doc.len(), a), frac(rep.doc.len(), b));
                 let range = a.min(b)..a.max(b);
-                rep.version = rep.log.add_delete(agent, &rep.version, range.clone());
-                rep.doc.drain(range);
+                if !range.is_empty() {
+                    rep.version = rep.log.add_delete(agent, &rep.version, range.clone());
+                    rep.ids
+                        .delete(range.start, rep.version[0] + 1 - range.len(), range.len());
+                    rep.doc.drain(range);
+                }
                 r
             }
             Act::Sync { r, from } => {
@@ -145,12 +167,13 @@ fn run(replicas: usize, acts: &[Act]) -> Result<(), String> {
                     rep.version = rep.log.add_undelete(agent, &before, targets);
                     // The editor doesn't know where undone text goes: the
                     // walk does.
-                    let changes = rep.log.changes(&before, &rep.version);
+                    let changes = rep.log.changes_with(&before, &rep.version, &mut rep.ids);
                     assert_eq!(
                         changes,
                         rep.log.changes_simple(&before, &rep.version),
                         "the tree walk and the list walk differ on an undo"
                     );
+                    assert_eq!(changes, rep.log.changes(&before, &rep.version));
                     for change in changes {
                         change.apply(&mut rep.doc);
                     }
@@ -166,6 +189,7 @@ fn run(replicas: usize, acts: &[Act]) -> Result<(), String> {
         for r in 0..replicas {
             for from in 0..replicas {
                 sync(&mut reps, r, from);
+                verify(&reps[r]).map_err(|e| format!("final sync {r} <- {from}: {e}"))?;
             }
         }
     }
@@ -375,4 +399,48 @@ fn undo_of_old_text_keeps_identity() {
             .into_iter()
             .collect::<String>()
     );
+}
+
+/// Found by proptest: someone's typing run, part of it a replica already
+/// had and part new, merged by a replica keeping identities. The new items
+/// must not count as being in the document the merge started from.
+#[test]
+fn a_run_split_across_a_merge_keeps_identities() {
+    use Act::*;
+    let acts = vec![
+        Insert { r: 0, at: 0, n: 2 },
+        Sync { r: 1, from: 0 },
+        Delete {
+            r: 1,
+            a: 0,
+            b: 32768,
+        },
+        Insert { r: 0, at: 0, n: 2 },
+        Insert { r: 0, at: 0, n: 3 },
+        Delete { r: 0, a: 0, b: 0 },
+        Insert { r: 0, at: 0, n: 1 },
+        Insert { r: 0, at: 0, n: 2 },
+        Undo {
+            r: 1,
+            pick: 0,
+            n: 1,
+        },
+        Insert {
+            r: 0,
+            at: 6554,
+            n: 1,
+        },
+        Sync { r: 1, from: 0 },
+        Insert {
+            r: 0,
+            at: 11916,
+            n: 2,
+        },
+        Delete {
+            r: 0,
+            a: 60494,
+            b: 0,
+        },
+    ];
+    run(2, &acts).unwrap();
 }

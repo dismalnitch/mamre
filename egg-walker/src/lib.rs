@@ -32,5 +32,6 @@ pub mod reference;
 mod simple;
 mod walk;
 
+pub use ids::Identities;
 pub use oplog::{AgentId, Event, Lv, Op, OpLog};
 pub use walk::Change;
