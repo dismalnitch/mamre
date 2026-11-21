@@ -14,8 +14,17 @@
 //! the walk replays events into a temporary list that tracks each item in
 //! two versions at once, and comes out with plain changes to apply.
 //!
+//! Undo and redo never make new items: an undelete names the delete it
+//! undoes, and the item comes back as itself. So anything pinned to an item
+//! (ink, a comment) finds it again, here or on any other replica.
+//!
 //! - [`OpLog`]: every event a replica knows, and syncing them between logs.
 //! - [`OpLog::changes`]: the walk, from one version to another.
+//! - [`Identities`]: kept beside a replica's document, which insert each item
+//!   came from; [`OpLog::changes_with`] uses it so an undo of old text costs
+//!   what the merge does.
+//! - [`Anchors`]: kept beside it too, where watched items are; deleted ones
+//!   wait, and come back with their item.
 //! - [`reference`](mod@reference): the slow, obviously-correct version the walk is tested
 //!   against.
 //!
@@ -24,6 +33,7 @@
 //! prepare version by walking only as far back as it changes. A simpler walk
 //! over a plain list is kept to check it against, change for change.
 
+mod anchors;
 mod ids;
 mod key;
 mod oplog;
@@ -32,6 +42,7 @@ pub mod reference;
 mod simple;
 mod walk;
 
+pub use anchors::Anchors;
 pub use ids::Identities;
 pub use oplog::{AgentId, Event, Lv, Op, OpLog};
 pub use walk::Change;

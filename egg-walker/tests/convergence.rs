@@ -7,7 +7,7 @@
 //! everyone, and every replica must hold the same document, though each
 //! log numbered the events differently.
 
-use mamre_egg_walker::{Identities, Lv, Op, OpLog, reference};
+use mamre_egg_walker::{Anchors, Identities, Lv, Op, OpLog, reference};
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -25,6 +25,9 @@ enum Act {
     /// Replica `r` undoes one of the deletes it has (maybe one already
     /// undone), and up to `n` more after it: undoing a run.
     Undo { r: usize, pick: u16, n: usize },
+    /// Replica `r` starts watching the item about this far in, or stops if
+    /// it already is.
+    Watch { r: usize, at: u16 },
 }
 
 struct Replica {
@@ -33,8 +36,11 @@ struct Replica {
     /// The version this replica's document is at.
     version: Vec<Lv>,
     doc: Vec<u32>,
-    /// Who the document's items are, kept beside it.
+    /// Who the document's items are, and where the watched ones are, kept
+    /// beside it.
     ids: Identities,
+    anchors: Anchors,
+    watched: Vec<Lv>,
 }
 
 fn frac(len: usize, f: u16) -> usize {
@@ -61,6 +67,24 @@ fn verify(r: &Replica) -> Result<(), String> {
             "{}: identities {kept:?}, reference {truth:?}",
             r.name
         ));
+    }
+    if r.anchors.len() != r.doc.len() {
+        return Err(format!(
+            "{}: anchors count {} items, doc {}",
+            r.name,
+            r.anchors.len(),
+            r.doc.len()
+        ));
+    }
+    for &item in &r.watched {
+        let want = truth.iter().position(|&lv| lv == item);
+        let got = r.anchors.position(item);
+        if got != want || r.anchors.is_parked(item) != want.is_none() {
+            return Err(format!(
+                "{}: anchor on {item} at {got:?}, reference {want:?}",
+                r.name
+            ));
+        }
     }
     Ok(())
 }
@@ -93,6 +117,7 @@ fn sync(replicas: &mut [Replica], r: usize, from: usize) {
         "identities changed the changes"
     );
     for change in changes {
+        me.anchors.apply(&change);
         change.apply(&mut me.doc);
     }
 }
@@ -106,6 +131,8 @@ fn run(replicas: usize, acts: &[Act]) -> Result<(), String> {
             version: Vec::new(),
             doc: Vec::new(),
             ids: Identities::new(),
+            anchors: Anchors::new(0),
+            watched: Vec::new(),
         })
         .collect();
 
@@ -119,6 +146,7 @@ fn run(replicas: usize, acts: &[Act]) -> Result<(), String> {
                 next_item += n as u32;
                 rep.version = rep.log.add_insert(agent, &rep.version, pos, items.clone());
                 rep.ids.insert(pos, rep.version[0] + 1 - n, n);
+                rep.anchors.insert(pos, n);
                 rep.doc.splice(pos..pos, items);
                 r
             }
@@ -131,6 +159,7 @@ fn run(replicas: usize, acts: &[Act]) -> Result<(), String> {
                     rep.version = rep.log.add_delete(agent, &rep.version, range.clone());
                     rep.ids
                         .delete(range.start, rep.version[0] + 1 - range.len(), range.len());
+                    rep.anchors.delete(range.clone());
                     rep.doc.drain(range);
                 }
                 r
@@ -143,6 +172,22 @@ fn run(replicas: usize, acts: &[Act]) -> Result<(), String> {
                 if r != from {
                     let theirs = reps[from].log.clone();
                     reps[r].log.pull(&theirs);
+                }
+                r
+            }
+            Act::Watch { r, at } => {
+                let rep = &mut reps[r];
+                if !rep.doc.is_empty() {
+                    let pos = frac(rep.doc.len() - 1, at);
+                    let item = rep.ids.item(pos);
+                    // Watching one already watched stops watching it.
+                    if let Some(k) = rep.watched.iter().position(|&w| w == item) {
+                        rep.anchors.unwatch(item);
+                        rep.watched.swap_remove(k);
+                    } else {
+                        rep.anchors.watch(pos, item);
+                        rep.watched.push(item);
+                    }
                 }
                 r
             }
@@ -175,6 +220,7 @@ fn run(replicas: usize, acts: &[Act]) -> Result<(), String> {
                     );
                     assert_eq!(changes, rep.log.changes(&before, &rep.version));
                     for change in changes {
+                        rep.anchors.apply(&change);
                         change.apply(&mut rep.doc);
                     }
                 }
@@ -212,7 +258,8 @@ fn acts(replicas: usize) -> impl Strategy<Value = Vec<Act>> {
         2 => (r.clone(), any::<u16>(), any::<u16>()).prop_map(|(r, a, b)| Act::Delete { r, a, b }),
         2 => (r.clone(), r.clone()).prop_map(|(r, from)| Act::Sync { r, from }),
         1 => (r.clone(), r.clone()).prop_map(|(r, from)| Act::Fetch { r, from }),
-        2 => (r, any::<u16>(), 1usize..4).prop_map(|(r, pick, n)| Act::Undo { r, pick, n }),
+        2 => (r.clone(), any::<u16>(), 1usize..4).prop_map(|(r, pick, n)| Act::Undo { r, pick, n }),
+        2 => (r, any::<u16>()).prop_map(|(r, at)| Act::Watch { r, at }),
     ];
     prop::collection::vec(act, 1..50)
 }
