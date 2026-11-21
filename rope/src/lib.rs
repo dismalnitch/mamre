@@ -4,7 +4,10 @@
 //! held as items of a `SumTree`. Every node knows its subtree's
 //! [`TextSummary`]: bytes, chars and lines, plus whatever the rope's
 //! [`Measure`] counts. `Rope<Plain>` counts nothing more, `Rope<Prose>` adds
-//! words and paragraphs, and `Rope<Markdown>` adds sections.
+//! words, sentences and paragraphs (each in the variants vim and prose
+//! disagree on), and `Rope<Markdown>` adds sections. Every [`Unit`] a rope
+//! counts is also one it can seek by, in O(log n): see [`Rope::unit_start`]
+//! and friends.
 //!
 //! Positions are byte offsets, as for `str`, and must fall on `char`
 //! boundaries. Lines are split on `\n` only; a `\r` is ordinary text, so
@@ -15,7 +18,9 @@
 //! it that way, so a rope of `n` bytes has fewer than `2n / N + 1` chunks.
 
 mod measure;
+mod seek;
 mod summary;
+mod units;
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -24,8 +29,9 @@ use std::ops::Range;
 use arrayvec::ArrayString;
 use mamre::{Item, SumTree, cursor::Bias};
 
-pub use measure::{Markdown, Measure, Plain, Prose, Scan, Step};
+pub use measure::{Markdown, Measure, Plain, Prose};
 pub use summary::{ByteOffset, CharOffset, Point, TextSummary};
+pub use units::{Scan, Step, Unit, UnitState};
 
 /// The default chunk size, in bytes.
 pub const CHUNK: usize = 128;

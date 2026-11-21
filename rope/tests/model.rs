@@ -3,7 +3,7 @@
 //! every edit cuts and joins chunks and trees are several levels tall, and
 //! with the default chunk size.
 
-use mamre_rope::{Markdown, Plain, Point, Rope, TextSummary};
+use mamre_rope::{Markdown, Plain, Point, Prose, Rope, TextSummary, Unit};
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -106,6 +106,74 @@ fn verify<const N: usize>(rope: &Rope<Markdown, N>, text: &str) -> Result<(), St
             }
         }
     }
+    verify_units(rope, text)
+}
+
+const UNITS: [Unit; 6] = [
+    Unit::Word,
+    Unit::VimWord,
+    Unit::Sentence,
+    Unit::Paragraph,
+    Unit::VimParagraph,
+    Unit::Section,
+];
+
+/// Every unit, against the slow one-pass `Unit::ranges`: the count and
+/// every unit's range, and for a small text, which units come before and
+/// hold every char boundary.
+fn verify_units<const N: usize>(rope: &Rope<Markdown, N>, text: &str) -> Result<(), String> {
+    for unit in UNITS {
+        let want = unit.ranges(text);
+        if rope.count(unit) != want.len() {
+            return Err(format!(
+                "{unit:?}: count is {}, want {}",
+                rope.count(unit),
+                want.len()
+            ));
+        }
+        // Every unit of a short text; a stride through a long one, and
+        // always the last.
+        let stride = (want.len() / 50).max(1);
+        let picks = (0..want.len())
+            .step_by(stride)
+            .chain(want.len().checked_sub(1));
+        for n in picks {
+            let range = &want[n];
+            let got = rope.unit_range(n, unit);
+            if got.as_ref() != Some(range) {
+                return Err(format!(
+                    "{unit:?}: unit_range({n}) is {got:?}, want {range:?}"
+                ));
+            }
+        }
+        if let Some(extra) = rope.unit_range(want.len(), unit) {
+            return Err(format!(
+                "{unit:?}: unit_range({}) is {extra:?}, want none",
+                want.len()
+            ));
+        }
+        // Every boundary of a short text; a stride through a long one.
+        let stride = (text.len() / 60).max(1);
+        {
+            let offsets = text.char_indices().map(|(i, _)| i).chain([text.len()]);
+            for offset in offsets.step_by(stride) {
+                let before = want.iter().filter(|r| r.start < offset).count();
+                let got = rope.units_before(offset, unit);
+                if got != before {
+                    return Err(format!(
+                        "{unit:?}: units_before({offset}) is {got}, want {before}"
+                    ));
+                }
+                let at = want.iter().position(|r| r.contains(&offset));
+                let got = rope.unit_at(offset, unit);
+                if got != at {
+                    return Err(format!(
+                        "{unit:?}: unit_at({offset}) is {got:?}, want {at:?}"
+                    ));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -154,8 +222,11 @@ fn run<const N: usize>(start: &str, ops: &[Op]) -> Result<(), String> {
 }
 
 fn text(max: usize) -> impl Strategy<Value = String> {
+    // Word characters, punctuation that ends sentences and closes them, and
+    // plenty of whitespace and newlines, so every unit has boundaries.
     let pool = vec![
-        'a', 'b', 'c', 'd', ' ', ' ', '\n', '\n', '\t', '\r', '#', '#', 'é', '日', '🦀',
+        'a', 'b', 'c', '_', ' ', ' ', '\n', '\n', '\t', '\r', '#', '#', '.', '!', '"', ')', 'é',
+        '日', '🦀',
     ];
     prop::collection::vec(prop::sample::select(pool), 0..=max)
         .prop_map(|cs| cs.into_iter().collect())
@@ -215,4 +286,39 @@ fn a_markdown_rope_counts_units() {
 fn cutting_inside_a_char_panics() {
     let mut rope: Rope = Rope::from("日本");
     rope.remove(1..3);
+}
+
+#[test]
+fn seeking_by_unit() {
+    let text = "# One\nHi there. Bye!\n\n## Two\nfoo.bar baz\n";
+    let rope: Rope<Markdown, 4> = Rope::from(text);
+    let piece = |r: Option<std::ops::Range<usize>>| r.map(|r| &text[r]);
+
+    assert_eq!(rope.count(Unit::Section), 2);
+    assert_eq!(
+        piece(rope.unit_range(1, Unit::Section)),
+        Some("## Two\nfoo.bar baz\n")
+    );
+    // Vim's rule: a heading has no full stop, so it runs into the sentence
+    // after it.
+    assert_eq!(
+        piece(rope.unit_range(0, Unit::Sentence)),
+        Some("# One\nHi there.")
+    );
+    assert_eq!(piece(rope.unit_range(1, Unit::Sentence)), Some("Bye!"));
+    assert_eq!(piece(rope.unit_range(4, Unit::VimWord)), Some("."));
+
+    // The word under the cursor, and where `w` goes from there.
+    let cursor = text.find("bar").unwrap() + 1;
+    let n = rope.unit_at(cursor, Unit::VimWord).unwrap();
+    assert_eq!(piece(rope.unit_range(n, Unit::VimWord)), Some("bar"));
+    assert_eq!(piece(rope.unit_range(n + 1, Unit::VimWord)), Some("baz"));
+    assert_eq!(rope.units_before(cursor, Unit::Section), 2);
+}
+
+#[test]
+#[should_panic(expected = "doesn't count Section")]
+fn a_prose_rope_has_no_sections() {
+    let rope: Rope<Prose> = Rope::from("# Heading");
+    rope.count(Unit::Section);
 }

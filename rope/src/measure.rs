@@ -1,17 +1,22 @@
 //! What a rope counts beyond bytes, chars and lines: a [`Measure`], chosen
 //! with the rope's type, so `Rope<Plain>`, `Rope<Prose>` and
 //! `Rope<Markdown>` each say what they keep track of.
-//!
-//! Counts of things that can straddle a chunk edge (a word split across two
-//! chunks is still one word) are kept as a [`Scan`]: a tiny state machine's
-//! results for every state it could start in, which compose.
 
 use mamre::Summary;
+
+use crate::units::{Scan, Unit, UnitState};
 
 /// Something counted over text, built from one chunk and combined like any
 /// summary: measuring `a` and `b` and combining must equal measuring `a + b`.
 pub trait Measure: Summary + Copy + PartialEq + std::fmt::Debug {
     fn measure(text: &str) -> Self;
+
+    /// Where `unit`'s machine stands after this text, if this measure
+    /// counts it. This is what lets a rope seek by `unit`.
+    fn unit(&self, unit: Unit) -> Option<UnitState> {
+        let _ = unit;
+        None
+    }
 }
 
 /// Counts nothing extra: bytes, chars and lines only.
@@ -31,44 +36,73 @@ impl Measure for Plain {
     }
 }
 
-/// Words and paragraphs, for any prose.
+/// Prose units, in every variant: words and vim words, sentences, and
+/// paragraphs with either rule for blank lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Prose {
-    words: Scan<2>,
-    paragraphs: Scan<4>,
+    word: Scan<2>,
+    vim_word: Scan<3>,
+    sentence: Scan<4>,
+    paragraph: Scan<4>,
+    vim_paragraph: Scan<4>,
 }
 
 impl Prose {
     /// Runs of non-whitespace.
     pub fn words(&self) -> usize {
-        self.words.count_from(words::START)
+        self.count(Unit::Word)
     }
 
     /// Runs of non-blank lines, where a blank line holds only whitespace.
     pub fn paragraphs(&self) -> usize {
-        self.paragraphs.count_from(paragraphs::START)
+        self.count(Unit::Paragraph)
+    }
+
+    fn count(&self, unit: Unit) -> usize {
+        self.unit(unit).map_or(0, |s| s.starts)
     }
 }
 
 impl Summary for Prose {
     fn empty() -> Self {
         Prose {
-            words: Scan::identity(),
-            paragraphs: Scan::identity(),
+            word: Scan::identity(),
+            vim_word: Scan::identity(),
+            sentence: Scan::identity(),
+            paragraph: Scan::identity(),
+            vim_paragraph: Scan::identity(),
         }
     }
     fn concat(&mut self, next: &Self) {
-        self.words = self.words.then(&next.words);
-        self.paragraphs = self.paragraphs.then(&next.paragraphs);
+        self.word = self.word.then(&next.word);
+        self.vim_word = self.vim_word.then(&next.vim_word);
+        self.sentence = self.sentence.then(&next.sentence);
+        self.paragraph = self.paragraph.then(&next.paragraph);
+        self.vim_paragraph = self.vim_paragraph.then(&next.vim_paragraph);
     }
 }
 
 impl Measure for Prose {
     fn measure(text: &str) -> Self {
         Prose {
-            words: Scan::run(text, words::step),
-            paragraphs: Scan::run(text, paragraphs::step),
+            word: Scan::of(text, Unit::Word),
+            vim_word: Scan::of(text, Unit::VimWord),
+            sentence: Scan::of(text, Unit::Sentence),
+            paragraph: Scan::of(text, Unit::Paragraph),
+            vim_paragraph: Scan::of(text, Unit::VimParagraph),
         }
+    }
+
+    fn unit(&self, unit: Unit) -> Option<UnitState> {
+        let start = unit.start_state();
+        Some(match unit {
+            Unit::Word => self.word.from(start),
+            Unit::VimWord => self.vim_word.from(start),
+            Unit::Sentence => self.sentence.from(start),
+            Unit::Paragraph => self.paragraph.from(start),
+            Unit::VimParagraph => self.vim_paragraph.from(start),
+            Unit::Section => return None,
+        })
     }
 }
 
@@ -76,7 +110,7 @@ impl Measure for Prose {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Markdown {
     prose: Prose,
-    sections: Scan<3>,
+    section: Scan<3>,
 }
 
 impl Markdown {
@@ -90,11 +124,10 @@ impl Markdown {
         self.prose.paragraphs()
     }
 
-    /// Headings, each of which starts a section. See [`sections`] for what
-    /// counts as one.
+    /// Headings, each of which starts a section; see [`Unit::Section`].
     pub fn sections(&self) -> usize {
-        let open = self.sections.end_from(sections::START) == sections::HASHES;
-        self.sections.count_from(sections::START) + open as usize
+        let s = self.section.from(Unit::Section.start_state());
+        s.starts + Unit::Section.pending(s.state) as usize
     }
 }
 
@@ -102,12 +135,12 @@ impl Summary for Markdown {
     fn empty() -> Self {
         Markdown {
             prose: Prose::empty(),
-            sections: Scan::identity(),
+            section: Scan::identity(),
         }
     }
     fn concat(&mut self, next: &Self) {
         self.prose.concat(&next.prose);
-        self.sections = self.sections.then(&next.sections);
+        self.section = self.section.then(&next.section);
     }
 }
 
@@ -115,134 +148,14 @@ impl Measure for Markdown {
     fn measure(text: &str) -> Self {
         Markdown {
             prose: Prose::measure(text),
-            sections: Scan::run(text, sections::step),
+            section: Scan::of(text, Unit::Section),
         }
     }
-}
 
-/// A state machine with `S` states, run over some text, kept as a table:
-/// for each state it could start in, the state it ends in and how many times
-/// it counted. The tables for `a` and for `b` give the table for `a` then
-/// `b` without looking at the text again, which is what makes it a summary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Scan<const S: usize> {
-    end: [u8; S],
-    count: [usize; S],
-}
-
-/// One step of a machine: the next state, and whether this step counts.
-pub type Step = fn(u8, char) -> (u8, bool);
-
-impl<const S: usize> Scan<S> {
-    /// The table for no text: every state stays put, nothing counted.
-    pub fn identity() -> Self {
-        let mut end = [0; S];
-        for (state, e) in end.iter_mut().enumerate() {
-            *e = state as u8;
-        }
-        Scan { end, count: [0; S] }
-    }
-
-    /// Runs `step` over `text` from every state.
-    pub fn run(text: &str, step: Step) -> Self {
-        let mut out = Self::identity();
-        for start in 0..S {
-            let mut state = start as u8;
-            for c in text.chars() {
-                let (next, counts) = step(state, c);
-                out.count[start] += counts as usize;
-                state = next;
-            }
-            out.end[start] = state;
-        }
-        out
-    }
-
-    /// This, then `next`.
-    pub fn then(&self, next: &Self) -> Self {
-        let mut out = *self;
-        for start in 0..S {
-            let mid = self.end[start] as usize;
-            out.end[start] = next.end[mid];
-            out.count[start] = self.count[start] + next.count[mid];
-        }
-        out
-    }
-
-    /// How many times it counted, starting in `state`.
-    pub fn count_from(&self, state: u8) -> usize {
-        self.count[state as usize]
-    }
-
-    /// The state it ends in, starting in `state`.
-    pub fn end_from(&self, state: u8) -> u8 {
-        self.end[state as usize]
-    }
-}
-
-/// Words: maximal runs of non-whitespace. Counts on entering one.
-mod words {
-    pub const START: u8 = GAP;
-    const GAP: u8 = 0;
-    const IN_WORD: u8 = 1;
-
-    pub fn step(state: u8, c: char) -> (u8, bool) {
-        if c.is_whitespace() {
-            (GAP, false)
-        } else {
-            (IN_WORD, state == GAP)
-        }
-    }
-}
-
-/// Paragraphs: maximal runs of non-blank lines, where a blank line holds
-/// only whitespace (so a lone `\r` is blank too). Counts on the first
-/// non-blank character of a line that follows a blank one, or the start.
-///
-/// The state is two bits: whether the previous line was blank, and whether
-/// the current line is blank so far.
-mod paragraphs {
-    const PREV_BLANK: u8 = 0b10;
-    const CUR_BLANK: u8 = 0b01;
-    /// The start of the text counts as following a blank line.
-    pub const START: u8 = PREV_BLANK | CUR_BLANK;
-
-    pub fn step(state: u8, c: char) -> (u8, bool) {
-        if c == '\n' {
-            let prev = if state & CUR_BLANK != 0 {
-                PREV_BLANK
-            } else {
-                0
-            };
-            (prev | CUR_BLANK, false)
-        } else if c.is_whitespace() {
-            (state, false)
-        } else {
-            let starts = state & CUR_BLANK != 0 && state & PREV_BLANK != 0;
-            (state & PREV_BLANK, starts)
-        }
-    }
-}
-
-/// Markdown sections: ATX headings, simplified to a line that starts with
-/// one or more `#` followed by a space, a tab or the end of the line. No
-/// leading indentation, and no limit of six. Counts when the heading is
-/// confirmed; one still open at the end of the text is added by
-/// [`Markdown::sections`].
-pub mod sections {
-    pub const START: u8 = LINE_START;
-    const LINE_START: u8 = 0;
-    pub const HASHES: u8 = 1;
-    const OTHER: u8 = 2;
-
-    pub fn step(state: u8, c: char) -> (u8, bool) {
-        match (state, c) {
-            (_, '\n') => (LINE_START, state == HASHES),
-            (LINE_START | HASHES, '#') => (HASHES, false),
-            // A `\r` before the `\n` of a heading line changes nothing.
-            (HASHES, '\r') => (HASHES, false),
-            (HASHES, ' ' | '\t') => (OTHER, true),
-            _ => (OTHER, false),
+    fn unit(&self, unit: Unit) -> Option<UnitState> {
+        match unit {
+            Unit::Section => Some(self.section.from(unit.start_state())),
+            _ => self.prose.unit(unit),
         }
     }
 }
@@ -258,39 +171,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn words() {
+    fn counts() {
         assert_eq!(md("").words(), 0);
-        assert_eq!(md("   ").words(), 0);
-        assert_eq!(md("hello").words(), 1);
         assert_eq!(md("  hello  world\n").words(), 2);
-        assert_eq!(md("a\tb\nc").words(), 3);
         assert_eq!(md("日本 語").words(), 2);
-    }
-
-    #[test]
-    fn paragraphs() {
-        assert_eq!(md("").paragraphs(), 0);
-        assert_eq!(md("\n\n").paragraphs(), 0);
-        assert_eq!(md("one line").paragraphs(), 1);
-        assert_eq!(md("a\nb\nc").paragraphs(), 1, "no blank line between");
         assert_eq!(md("a\n\nb\n c\n\n\n d").paragraphs(), 3);
-        assert_eq!(md("a\n  \t\nb").paragraphs(), 2, "whitespace-only is blank");
-        assert_eq!(md("a\r\n\r\nb").paragraphs(), 2, "so is a lone \\r");
-    }
-
-    #[test]
-    fn sections() {
-        assert_eq!(md("").sections(), 0);
+        assert_eq!(md("a\r\n\r\nb").paragraphs(), 2, "a lone \\r is blank");
         assert_eq!(md("# A\ntext\n## B\n#tag\n#").sections(), 3);
-        assert_eq!(md("#\n").sections(), 1, "an empty heading");
-        assert_eq!(md("a # b\n").sections(), 0, "not at a line start");
-        assert_eq!(md(" # indented").sections(), 0);
         assert_eq!(md("# A\r\n## B").sections(), 2);
     }
 
     pub fn text() -> impl Strategy<Value = String> {
         let pool = vec![
-            'a', 'b', ' ', ' ', '\n', '\n', '\t', '\r', '#', '#', 'é', '日', '🦀',
+            'a', 'b', '_', ' ', ' ', '\n', '\n', '\t', '\r', '#', '#', '.', '!', '"', ')', 'é',
+            '日', '🦀',
         ];
         prop::collection::vec(prop::sample::select(pool), 0..120)
             .prop_map(|cs| cs.into_iter().collect())
@@ -324,6 +218,16 @@ pub(crate) mod tests {
                 sum.concat(&md(&text[range]));
             }
             prop_assert_eq!(sum, md(&text));
+        }
+
+        /// The summary's counts agree with the slow, one-pass ranges.
+        #[test]
+        fn counts_match_the_slow_ranges(text in text()) {
+            let m = md(&text);
+            for unit in [Unit::Word, Unit::VimWord, Unit::Sentence, Unit::Paragraph, Unit::VimParagraph] {
+                prop_assert_eq!(m.unit(unit).unwrap().starts, unit.ranges(&text).len(), "{:?}", unit);
+            }
+            prop_assert_eq!(m.sections(), Unit::Section.ranges(&text).len());
         }
     }
 }

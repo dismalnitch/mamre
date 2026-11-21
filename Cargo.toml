@@ -16,3 +16,8 @@ proptest = "1.12"
 
 [dependencies]
 arrayvec = "0.7.8"
+
+# The property tests check every operation against slow models; unoptimized,
+# they take minutes. Debug assertions and overflow checks stay on.
+[profile.test]
+opt-level = 1
