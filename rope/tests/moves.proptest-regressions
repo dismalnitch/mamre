@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f48fe41be57a3b3704f747f78c690a778f3950c432e36d12ea64d6a6fffd44f9 # shrinks to text = "# Chapter\n# Chapter", pick = Index(0), dest = Index(12297829382473034411)
+cc 832b9aefd196cc61c01fbe45819bb19c0a6ac98b1f74aeb33b507e33f9cf9d25 # shrinks to text = "aaéa aéé\naééa\né   \n## Section\nééaé aaé\n## Section\n## Section\n## Section\n## Section\n## Section\naa a aa aé\n é éé \n## Section", a = Index(0), b = Index(149973529054549201), to = Index(899841174327295201)
+cc 6f298476db0a8c4e744c0b957252a93e365d435fa65fa65ea4e834ebe6d4d044 # shrinks to text = "# Chapter", pick = Index(0), dest = Index(9223372036854775808)
+cc 3ac2254740e22b86ab18ec97a5f6e0a6fc2ef205d905fe3c62c3a0c7128baeb0 # shrinks to text = "\n\n# Chapter", pick = Index(0), dest = Index(9223372036854775808)

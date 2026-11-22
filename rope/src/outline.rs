@@ -9,6 +9,7 @@
 
 use std::cmp::Ordering;
 use std::fmt;
+use std::ops::Range;
 
 use mamre::SeekTarget;
 use mamre::cursor::Bias;
@@ -39,6 +40,21 @@ impl Address {
     pub fn levels(&self) -> &[u32] {
         let depth = self.0.iter().rposition(|&n| n > 0).map_or(0, |i| i + 1);
         &self.0[..depth]
+    }
+
+    /// The next sibling: the first address past this one's section (`3.3`
+    /// after `3.2`, and so before `4`). `None` before any heading.
+    pub fn next_sibling(&self) -> Option<Address> {
+        let depth = self.levels().len();
+        let mut next = self.0;
+        *next.get_mut(depth.checked_sub(1)?)? += 1;
+        Some(Address(next))
+    }
+
+    /// Whether `other` is in this address's section: it, or under it.
+    pub fn contains(&self, other: &Address) -> bool {
+        let depth = self.levels().len();
+        depth > 0 && other.0[..depth] == self.0[..depth]
     }
 }
 
@@ -307,6 +323,24 @@ impl<M: Measure, const N: usize> Rope<M, N> {
     /// Where the heading at `address` starts, if there is one: where "go to
     /// 3.2" goes.
     pub fn heading_at(&self, address: Address) -> Option<usize> {
+        self.find_heading(address, true)
+    }
+
+    /// Where the section at `address` is: its heading's line through to
+    /// the next heading that isn't under it (or the end). `None` if there's
+    /// no such heading.
+    pub fn section_range(&self, address: Address) -> Option<Range<usize>> {
+        let start = self.heading_at(address)?;
+        let end = address
+            .next_sibling()
+            .and_then(|next| self.find_heading(next, false))
+            .unwrap_or(self.len());
+        Some(start..end)
+    }
+
+    /// Where the heading at `address` starts, or, unless `exact`, the first
+    /// one past it.
+    fn find_heading(&self, address: Address, exact: bool) -> Option<usize> {
         if address == Address::default() {
             return None;
         }
@@ -316,7 +350,8 @@ impl<M: Measure, const N: usize> Rope<M, N> {
         let Some(chunk) = cursor.item() else {
             // Not reached by any confirmed heading; maybe by one still open
             // at the very end.
-            let found = sections(self.summary()).address() == address
+            let last = sections(self.summary()).address();
+            let found = (last == address || !exact && last > address)
                 && section::pending(sections(self.summary()).from(section::START).1).is_some();
             return found.then(|| self.line_start_of(self.len()));
         };
@@ -328,7 +363,7 @@ impl<M: Measure, const N: usize> Rope<M, N> {
             if level > 0 {
                 here = Headings::one(level).apply(here);
                 if here >= address {
-                    return (here == address).then(|| self.line_start_of(start + i));
+                    return (here == address || !exact).then(|| self.line_start_of(start + i));
                 }
             }
             state = next;
