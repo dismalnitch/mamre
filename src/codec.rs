@@ -237,6 +237,35 @@ impl<T: Item + Codec, const CAP: usize> SumTree<T, CAP> {
     }
 }
 
+/// Appends a frame: a kind byte, the body's length, the body, and a
+/// CRC-32C of all before it (4 bytes, little-endian). A frame that's cut
+/// off or damaged is caught on reading, not read.
+pub fn put_frame(out: &mut Vec<u8>, kind: u8, body: &[u8]) {
+    let start = out.len();
+    out.push(kind);
+    put_usize(out, body.len());
+    out.extend_from_slice(body);
+    let crc = crc32c(&out[start..]);
+    out.extend_from_slice(&crc.to_le_bytes());
+}
+
+/// Reads a frame [`put_frame`] wrote from the front of `input`: its kind
+/// and body, if it's whole and its checksum matches.
+pub fn get_frame<'a>(input: &mut &'a [u8]) -> Result<(u8, &'a [u8]), DecodeError> {
+    let all = *input;
+    let mut rest = all;
+    let kind = get_bytes(&mut rest, 1)?[0];
+    let len = get_usize(&mut rest)?;
+    let body = get_bytes(&mut rest, len)?;
+    let crc = u32::from_le_bytes(get_bytes(&mut rest, 4)?.try_into().expect("four bytes"));
+    let total = all.len() - rest.len();
+    if crc32c(&all[..total - 4]) != crc {
+        return Err(DecodeError::Invalid("a frame's checksum doesn't match"));
+    }
+    *input = rest;
+    Ok((kind, body))
+}
+
 /// The CRC-32C (Castagnoli) checksum of `bytes`.
 pub fn crc32c(bytes: &[u8]) -> u32 {
     const TABLE: [u32; 256] = {

@@ -37,6 +37,12 @@ pub type Lv = usize;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AgentId(u32);
 
+impl AgentId {
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// What an event does, to one item.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op<T> {
@@ -99,14 +105,14 @@ impl<T> Run<T> {
 /// Every event a replica knows, in a graph.
 #[derive(Clone, Debug)]
 pub struct OpLog<T> {
-    agents: Vec<String>,
+    pub(crate) agents: Vec<String>,
     by_name: HashMap<String, AgentId>,
-    next_seq: Vec<u64>,
+    pub(crate) next_seq: Vec<u64>,
     /// In local-version order, covering every event.
     pub(crate) runs: Vec<Run<T>>,
     /// Per agent, by the seq each stretch starts at: where in this log the
     /// agent's events are, as `(first local version, how many)`.
-    spans: Vec<BTreeMap<u64, (Lv, usize)>>,
+    pub(crate) spans: Vec<BTreeMap<u64, (Lv, usize)>>,
     /// The events nothing else came after: the version of everything.
     frontier: Vec<Lv>,
 }

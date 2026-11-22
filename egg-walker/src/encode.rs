@@ -86,23 +86,50 @@ impl<T: Clone + Codec> OpLog<T> {
     /// Events before `events.start` are referred to by agent and sequence
     /// number, so whoever reads it needs to have them already.
     pub fn encode_chunk(&self, events: Range<Lv>, out: &mut Vec<u8>) {
+        self.encode_events(&[events], out);
+    }
+
+    /// Appends the events in `spans` (sorted, apart, in this log's order)
+    /// as one chunk: what a replica that has everything else is missing,
+    /// say. Events outside the spans are referred to by agent and sequence
+    /// number. For one span, the same bytes as
+    /// [`encode_chunk`](Self::encode_chunk).
+    pub fn encode_events(&self, spans: &[Range<Lv>], out: &mut Vec<u8>) {
+        let spans: Vec<Range<Lv>> = spans.iter().filter(|s| !s.is_empty()).cloned().collect();
         assert!(
-            events.end <= self.len(),
-            "events {events:?} aren't all in the log"
+            spans.windows(2).all(|w| w[0].end <= w[1].start)
+                && spans.last().is_none_or(|s| s.end <= self.len()),
+            "spans {spans:?} aren't sorted, apart and in the log"
         );
-        // The stretches of runs in range.
+        // Where each span starts in the chunk's own order.
+        let offsets: Vec<usize> = spans
+            .iter()
+            .scan(0, |n, s| {
+                let at = *n;
+                *n += s.len();
+                Some(at)
+            })
+            .collect();
+        let chunk_index = |lv: Lv| -> Option<usize> {
+            let k = spans.partition_point(|s| s.end <= lv);
+            spans
+                .get(k)
+                .filter(|s| s.start <= lv)
+                .map(|s| offsets[k] + lv - s.start)
+        };
+        // The stretches of runs in the spans.
         let mut pieces = Vec::new();
-        if !events.is_empty() {
-            let mut r = self.run_index(events.start);
+        for span in &spans {
+            let mut r = self.run_index(span.start);
             while let Some(run) = self.runs.get(r)
-                && run.start < events.end
+                && run.start < span.end
             {
-                pieces.push((r, run.start.max(events.start)..run.end().min(events.end)));
+                pieces.push((r, run.start.max(span.start)..run.end().min(span.end)));
                 r += 1;
             }
         }
         // The agents it names: its own, and those of events it refers to
-        // from before.
+        // from outside.
         let mut agents: Vec<AgentId> = Vec::new();
         let mut index: HashMap<AgentId, usize> = HashMap::new();
         let mut name = |agent: AgentId, agents: &mut Vec<AgentId>| {
@@ -115,13 +142,13 @@ impl<T: Clone + Codec> OpLog<T> {
             let run = &self.runs[*r];
             name(run.agent, &mut agents);
             for p in self.piece_parents(*r, range.start) {
-                if p < events.start {
+                if chunk_index(p).is_none() {
                     name(self.run_of(p).agent, &mut agents);
                 }
             }
             if let RunOp::Undelete { target, .. } = run.op {
                 for t in target + (range.start - run.start)..target + (range.end - run.start) {
-                    if t < events.start {
+                    if chunk_index(t).is_none() {
                         name(self.run_of(t).agent, &mut agents);
                     }
                 }
@@ -140,16 +167,16 @@ impl<T: Clone + Codec> OpLog<T> {
         for (r, range) in &pieces {
             let run = &self.runs[*r];
             let k = range.start - run.start;
-            let first = range.start;
+            let first = chunk_index(range.start).expect("a piece is in the chunk");
             put_usize(out, index[&run.agent]);
             let seq = run.seq + k as u64;
             let expected = next_seq.get(&run.agent).copied().unwrap_or(0);
             (seq as i64 - expected as i64).encode(out);
             next_seq.insert(run.agent, seq + range.len() as u64);
-            let parents = self.piece_parents(*r, first);
+            let parents = self.piece_parents(*r, range.start);
             put_usize(out, parents.len());
             for p in parents {
-                self.put_ref(out, p, first, events.start, &index);
+                self.put_ref(out, p, first, chunk_index(p), &index);
             }
             match &run.op {
                 RunOp::Insert { pos, items } => {
@@ -167,7 +194,8 @@ impl<T: Clone + Codec> OpLog<T> {
                     put_varint(out, UNDELETE);
                     put_usize(out, range.len());
                     for i in 0..range.len() {
-                        self.put_ref(out, target + k + i, first, events.start, &index);
+                        let t = target + k + i;
+                        self.put_ref(out, t, first, chunk_index(t), &index);
                     }
                 }
             }
@@ -184,21 +212,27 @@ impl<T: Clone + Codec> OpLog<T> {
         }
     }
 
+    /// Writes a reference to `lv` from a run whose first event is `first`
+    /// in the chunk: by distance if `lv` is in the chunk too (at `inside`),
+    /// by agent and seq if not.
     fn put_ref(
         &self,
         out: &mut Vec<u8>,
         lv: Lv,
-        first: Lv,
-        start: Lv,
+        first: usize,
+        inside: Option<usize>,
         index: &HashMap<AgentId, usize>,
     ) {
-        if lv >= start {
-            debug_assert!(lv < first, "a reference is to an earlier event");
-            put_usize(out, (first - lv) << 1);
-        } else {
-            let run = self.run_of(lv);
-            put_usize(out, (index[&run.agent] << 1) | 1);
-            put_varint(out, run.seq + (lv - run.start) as u64);
+        match inside {
+            Some(at) => {
+                debug_assert!(at < first, "a reference is to an earlier event");
+                put_usize(out, (first - at) << 1);
+            }
+            None => {
+                let run = self.run_of(lv);
+                put_usize(out, (index[&run.agent] << 1) | 1);
+                put_varint(out, run.seq + (lv - run.start) as u64);
+            }
         }
     }
 
@@ -218,6 +252,8 @@ impl<T: Clone + Codec> OpLog<T> {
         // Plan: each event's number here, found or new, and its parents.
         let agents: Vec<Option<AgentId>> = names.iter().map(|n| self.agent_by_name(n)).collect();
         let mut seen: HashSet<(usize, u64)> = HashSet::new();
+        // How many new events each agent has in the chunk so far.
+        let mut new_from: Vec<u64> = vec![0; names.len()];
         let mut lvs: Vec<Lv> = Vec::new();
         let mut kinds_new: Vec<Kind> = Vec::new();
         let mut next = self.len();
@@ -258,6 +294,17 @@ impl<T: Clone + Codec> OpLog<T> {
                     return Err(DecodeError::Invalid("an event twice in one chunk"));
                 }
                 let known = agents[run.agent].and_then(|a| self.find(a, seq));
+                // A new event carries on its agent's events with no gap:
+                // every one includes the one before, so a replica always
+                // has a prefix of each agent's, and a summary says so.
+                if known.is_none() {
+                    let have = agents[run.agent].map_or(0, |a| self.next_seq[a.index()]);
+                    let expected = have + new_from[run.agent];
+                    if seq != expected {
+                        return Err(DecodeError::Invalid("a gap in an agent's events"));
+                    }
+                    new_from[run.agent] += 1;
+                }
                 let lv = known.unwrap_or(next);
                 let event_parents = if k == 0 {
                     parents.clone()
