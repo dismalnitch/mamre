@@ -370,7 +370,68 @@ impl<T: Clone> OpLog<T> {
 }
 
 impl<T> OpLog<T> {
-    /// The agent named `name`, if this log knows it.
+    /// Adds a run of `agent`'s events from `seq` on, each the only child of
+    /// the one before (inserts typing forward, or deletes deleting
+    /// forward); the first has `parents`. For a decoded chunk, which has
+    /// checked them: parents known, seqs new. Returns the first's number.
+    pub(crate) fn push_run(
+        &mut self,
+        agent: AgentId,
+        seq: u64,
+        parents: Vec<Lv>,
+        op: RunOp<T>,
+    ) -> Lv {
+        let lv = self.len();
+        let len = match &op {
+            RunOp::Insert { items, .. } => items.len(),
+            RunOp::Delete { len, .. } => *len,
+            RunOp::Undelete { .. } => unreachable!("undeletes go one at a time"),
+        };
+        debug_assert!(len > 0 && parents.iter().all(|&p| p < lv));
+        debug_assert!(self.find(agent, seq).is_none(), "new events");
+        let next = &mut self.next_seq[agent.index()];
+        *next = (*next).max(seq + len as u64);
+        self.frontier.retain(|f| !parents.contains(f));
+        self.frontier.push(lv + len - 1);
+        self.frontier.sort_unstable();
+        let extends = self.runs.last().is_some_and(|run| {
+            run.agent == agent
+                && run.seq + run.len() as u64 == seq
+                && parents == [lv - 1]
+                && match (&run.op, &op) {
+                    (RunOp::Insert { pos: p, items }, RunOp::Insert { pos, .. }) => {
+                        *pos == p + items.len()
+                    }
+                    (RunOp::Delete { pos: p, .. }, RunOp::Delete { pos, .. }) => pos == p,
+                    _ => false,
+                }
+        });
+        if extends {
+            let run = self.runs.last_mut().expect("checked above");
+            match (&mut run.op, op) {
+                (RunOp::Insert { items, .. }, RunOp::Insert { items: more, .. }) => {
+                    items.extend(more)
+                }
+                (RunOp::Delete { len: l, .. }, RunOp::Delete { .. }) => *l += len,
+                _ => unreachable!("checked above"),
+            }
+            let span = self.spans[agent.index()]
+                .get_mut(&run.seq)
+                .expect("a run's agent has a span for it");
+            span.1 += len;
+        } else {
+            self.runs.push(Run {
+                agent,
+                seq,
+                start: lv,
+                parents,
+                op,
+            });
+            self.spans[agent.index()].insert(seq, (lv, len));
+        }
+        lv
+    }
+
     pub(crate) fn agent_by_name(&self, name: &str) -> Option<AgentId> {
         self.by_name.get(name).copied()
     }
@@ -721,7 +782,7 @@ impl<T> OpLog<T> {
     }
 }
 
-fn normalize(mut version: Vec<Lv>) -> Vec<Lv> {
+pub(crate) fn normalize(mut version: Vec<Lv>) -> Vec<Lv> {
     version.sort_unstable();
     version.dedup();
     version
