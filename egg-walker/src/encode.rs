@@ -11,11 +11,18 @@
 //!             seq   (zigzag: this run's first seq minus where the agent's
 //!                    last run in the chunk ended, or 0)
 //!             parents (count, then each a ref)
+//!             tag   (varint: the op's kind times 2, plus 1 if a target follows)
+//!             target (only if the tag says so: which structure the run edits)
 //!             op
 //! op        = 0 insert:   pos, count, items (as a run: text is one UTF-8 string)
 //!             1 delete:   pos, count          (each removes the item at pos)
 //!             2 undelete: count, then each target delete, a ref
-//!             (other tags are reserved for other kinds of event)
+//!             (other kinds are reserved for other kinds of event)
+//! target    = varint, never 0. With no target, a run edits the document's
+//!             text, so text costs nothing for this. Other structures (ink,
+//!             comments) share the log, so they share its one order and one
+//!             undo history; this version knows none, and refuses a chunk
+//!             that edits one, since a later event could depend on it.
 //! ref       = varint v:
 //!             v even: an event in this chunk, v / 2 events before this
 //!                     run's first
@@ -183,18 +190,18 @@ impl<T: Clone + Codec> OpLog<T> {
             }
             match &run.op {
                 RunOp::Insert { pos, items } => {
-                    put_varint(out, INSERT);
+                    put_varint(out, INSERT << 1);
                     put_usize(out, pos + k);
                     put_usize(out, range.len());
                     T::encode_run(&items[k..k + range.len()], out);
                 }
                 RunOp::Delete { pos, .. } => {
-                    put_varint(out, DELETE);
+                    put_varint(out, DELETE << 1);
                     put_usize(out, *pos);
                     put_usize(out, range.len());
                 }
                 RunOp::Undelete { target, .. } => {
-                    put_varint(out, UNDELETE);
+                    put_varint(out, UNDELETE << 1);
                     put_usize(out, range.len());
                     for i in 0..range.len() {
                         let t = target + k + i;
@@ -425,7 +432,14 @@ impl<T: Clone + Codec> OpLog<T> {
             for _ in 0..n_parents {
                 parents.push(get_ref(input)?);
             }
-            let op = match get_varint(input)? {
+            let tag = get_varint(input)?;
+            if tag & 1 == 1 {
+                return Err(match get_varint(input)? {
+                    0 => DecodeError::Invalid("a target of 0, which is written as none"),
+                    _ => DecodeError::Invalid("a structure this version doesn't know"),
+                });
+            }
+            let op = match tag >> 1 {
                 INSERT => {
                     let pos = get_usize(input)?;
                     let len = get_usize(input)?;
@@ -469,5 +483,57 @@ impl<T: Clone + Codec> OpLog<T> {
             runs.push(run);
         }
         Ok((names, runs))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One insert of "x" by "a": the chunk byte for byte, so the tests below
+    /// can change exactly the tag.
+    fn one_insert() -> Vec<u8> {
+        let mut log = OpLog::<char>::new();
+        let a = log.agent("a");
+        log.add_insert(a, &[], 0, "x".chars());
+        let mut out = Vec::new();
+        log.encode_chunk(0..1, &mut out);
+        // compression, agents, "a", runs, agent, seq, parents, tag, pos, count, "x"
+        assert_eq!(out, [0, 1, 1, b'a', 1, 0, 0, 0, 0, 0, 1, 1, b'x']);
+        out
+    }
+
+    const TAG: usize = 8;
+
+    #[test]
+    fn text_runs_carry_no_target() {
+        let bytes = one_insert();
+        let mut log = OpLog::<char>::new();
+        assert_eq!(log.decode_chunk(&bytes), Ok(1));
+    }
+
+    #[test]
+    fn a_run_editing_another_structure_is_refused() {
+        let mut bytes = one_insert();
+        bytes[TAG] = 1; // insert, with a target
+        bytes.insert(TAG + 1, 5);
+        let mut log = OpLog::<char>::new();
+        assert_eq!(
+            log.decode_chunk(&bytes),
+            Err(DecodeError::Invalid(
+                "a structure this version doesn't know"
+            ))
+        );
+        assert_eq!(log.len(), 0);
+    }
+
+    #[test]
+    fn a_target_of_zero_is_refused() {
+        let mut bytes = one_insert();
+        bytes[TAG] = 1;
+        bytes.insert(TAG + 1, 0);
+        let mut log = OpLog::<char>::new();
+        assert!(log.decode_chunk(&bytes).is_err());
+        assert_eq!(log.len(), 0);
     }
 }
