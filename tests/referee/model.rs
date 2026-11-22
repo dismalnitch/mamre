@@ -46,7 +46,9 @@ impl Lines {
 }
 
 pub fn summarize(lines: &[Line]) -> Lines {
-    lines.iter().fold(Lines::default(), |sum, line| sum.add(&Lines::of(line)))
+    lines
+        .iter()
+        .fold(Lines::default(), |sum, line| sum.add(&Lines::of(line)))
 }
 
 /// Which dimension to seek by, and to where.
@@ -139,7 +141,11 @@ pub enum Step {
 /// Before the first item, there's no item and nothing before it. Past the
 /// last, there's no item and everything is before it. A step off either end
 /// lands there, and a step further the same way stays.
-pub fn walk(lines: &[Line], start: Option<(Target, Bias)>, steps: &[Step]) -> Vec<(Option<Line>, Lines)> {
+pub fn walk(
+    lines: &[Line],
+    start: Option<(Target, Bias)>,
+    steps: &[Step],
+) -> Vec<(Option<Line>, Lines)> {
     // `None` is before the first item; `Some(lines.len())` is past the last.
     let mut at = start.map(|(target, bias)| seek(lines, target, bias));
     let here = |at: Option<usize>| match at {

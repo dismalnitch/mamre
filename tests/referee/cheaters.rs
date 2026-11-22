@@ -19,7 +19,11 @@ fn caught<S: Subject>() {
     let result = runner.run(&(ops::lines(80), ops::ops()), |(start, ops)| {
         ops::run::<S>(start, &ops).map_err(TestCaseError::fail)
     });
-    assert!(result.is_err(), "the referee let {} through", std::any::type_name::<S>());
+    assert!(
+        result.is_err(),
+        "the referee let {} through",
+        std::any::type_name::<S>()
+    );
 }
 
 /// Ignores bias: always leans right.

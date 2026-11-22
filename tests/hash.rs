@@ -82,14 +82,20 @@ fn a_base_at_or_past_the_prime_is_an_error() {
 
 #[test]
 fn order_matters() {
-    assert_ne!(poly_hash(&[1, 2], 31).unwrap(), poly_hash(&[2, 1], 31).unwrap());
+    assert_ne!(
+        poly_hash(&[1, 2], 31).unwrap(),
+        poly_hash(&[2, 1], 31).unwrap()
+    );
 }
 
 /// Known, and why the tree adds 1 to every digit before hashing: a zero at
 /// the front is invisible, so [0, 5] and [5] collide.
 #[test]
 fn a_leading_zero_vanishes() {
-    assert_eq!(poly_hash(&[0, 5], 31).unwrap(), poly_hash(&[5], 31).unwrap());
+    assert_eq!(
+        poly_hash(&[0, 5], 31).unwrap(),
+        poly_hash(&[5], 31).unwrap()
+    );
 }
 
 proptest! {
