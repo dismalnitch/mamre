@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use mamre::codec::{Codec, DecodeError, get_usize, put_usize};
 use mamre::cursor::Bias;
 use mamre::{Item, SumTree, Summary};
 
@@ -36,6 +37,19 @@ impl Summary for Count {
     }
     fn concat(&mut self, other: &Self) {
         self.0 += other.0;
+    }
+}
+
+impl Codec for Run {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_usize(out, self.first);
+        put_usize(out, self.len);
+    }
+    fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        Ok(Run {
+            first: get_usize(input)?,
+            len: get_usize(input)?,
+        })
     }
 }
 
@@ -122,6 +136,54 @@ impl Identities {
             .collect();
         self.ids.remove(pos..pos + len);
         self.learn(gone);
+    }
+
+    /// Appends these identities' bytes: the window, the runs (a sum tree,
+    /// saved as its items), and the remembered deletes, by how far each is
+    /// past the one before.
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        put_usize(out, self.window);
+        self.ids.runs.encode(out);
+        put_usize(out, self.removed.len());
+        let mut prev = 0;
+        for (&delete, &item) in self.removed.iter() {
+            put_usize(out, delete - prev);
+            put_usize(out, item);
+            prev = delete;
+        }
+    }
+
+    /// Reads identities [`encode`](Self::encode) wrote, for a log of
+    /// `events` events.
+    pub(crate) fn decode(input: &mut &[u8], events: usize) -> Result<Self, DecodeError> {
+        let window = get_usize(input)?;
+        let runs = SumTree::<Run>::decode(input)?;
+        if runs
+            .items()
+            .iter()
+            .any(|r| r.len == 0 || r.first.checked_add(r.len).is_none_or(|end| end > events))
+        {
+            return Err(DecodeError::Invalid("an identity this log doesn't have"));
+        }
+        let n = get_usize(input)?;
+        let mut removed = BTreeMap::new();
+        let mut prev: usize = 0;
+        for _ in 0..n {
+            let delete = prev
+                .checked_add(get_usize(input)?)
+                .ok_or(DecodeError::Overflow)?;
+            let item = get_usize(input)?;
+            if delete >= events || item >= events {
+                return Err(DecodeError::Invalid("a delete this log doesn't have"));
+            }
+            removed.insert(delete, item);
+            prev = delete;
+        }
+        Ok(Identities {
+            ids: Ids { runs },
+            removed: Arc::new(removed),
+            window,
+        })
     }
 
     /// Remembers what deletes removed, forgetting the oldest past the

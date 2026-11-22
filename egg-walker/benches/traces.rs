@@ -158,6 +158,31 @@ fn main() {
             }
             continue;
         }
+        if std::env::var("SIZES").is_ok() {
+            // The whole history as one chunk, against diamond-types' file
+            // of the same trace; and back again, checked.
+            let start = Instant::now();
+            let mut chunk = Vec::new();
+            ours.encode_chunk(0..ours.len(), &mut chunk);
+            let encode = start.elapsed();
+            let start = Instant::now();
+            let mut back: OpLog<char> = OpLog::new();
+            back.decode_chunk(&chunk).expect("our own chunk decodes");
+            let decode = start.elapsed();
+            assert_eq!(back.len(), ours.len());
+            let again: String = checkout(&back).chars().collect();
+            assert_eq!(again, mine, "{name}: a decoded log checks out the same");
+            if let Ok(dir) = std::env::var("DUMP") {
+                std::fs::write(Path::new(&dir).join(format!("{name}.chunk")), &chunk).unwrap();
+            }
+            eprintln!(
+                "{name}: history {:>7} bytes ({:.2} per event), diamond-types file {:>7} bytes; encode {encode:.2?}, decode {decode:.2?}",
+                chunk.len(),
+                chunk.len() as f64 / ours.len() as f64,
+                bytes.len()
+            );
+            continue;
+        }
         if std::env::var("SPLIT").is_ok() {
             let start = Instant::now();
             let changes = ours.changes(&[], ours.version());

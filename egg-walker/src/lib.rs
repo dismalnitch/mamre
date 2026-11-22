@@ -25,6 +25,10 @@
 //!   what the merge does.
 //! - [`Anchors`]: kept beside it too, where watched items are; deleted ones
 //!   wait, and come back with their item.
+//! - [`file`](mod@file): a document's file, one append-only container of its history
+//!   and the state to open it with; and [`OpLog::encode_chunk`] /
+//!   [`OpLog::decode_chunk`], a stretch of history as bytes, for saving and
+//!   for sync.
 //! - [`reference`](mod@reference): the slow, obviously-correct version the walk is tested
 //!   against.
 //!
@@ -34,6 +38,8 @@
 //! over a plain list is kept to check it against, change for change.
 
 mod anchors;
+mod encode;
+pub mod file;
 mod ids;
 mod key;
 mod oplog;
