@@ -720,3 +720,31 @@ proptest! {
         }
     }
 }
+
+/// U1 moves a run to the end while U2 deletes its last two items: each
+/// takes in the other's, and both end the same. The deleted items are
+/// still the run's end, as tombstones, so the move needs nothing from them.
+#[test]
+fn a_move_whose_end_is_deleted_meanwhile() {
+    let mut log = OpLog::new();
+    // a1 a2 a3 b1 b2 b3 c1 c2, one char each.
+    let base = typed(&mut log, "u", "ABCDEFGH");
+    let (u1, u2) = (log.agent("u1"), log.agent("u2"));
+    let moved = log.add_move(u1, &base, 0..6, 8);
+    let deleted = log.add_delete(u2, &base, 4..6);
+    assert_eq!(text_at(&log, &moved), "GHABCDEF");
+    assert_eq!(text_at(&log, &deleted), "ABCDGH");
+    let both = merged(&log, &moved, &deleted);
+    assert_eq!(text_at(&log, &both), "GHABCD");
+    // And each replica gets there by taking in the other's edit.
+    let mut doc = reference::checkout(&log, &moved);
+    for c in log.changes(&moved, &deleted) {
+        c.apply(&mut doc);
+    }
+    assert_eq!(doc.iter().collect::<String>(), "GHABCD");
+    let mut doc = reference::checkout(&log, &deleted);
+    for c in log.changes(&deleted, &moved) {
+        c.apply(&mut doc);
+    }
+    assert_eq!(doc.iter().collect::<String>(), "GHABCD");
+}
