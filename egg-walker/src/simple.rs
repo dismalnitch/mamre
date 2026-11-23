@@ -173,6 +173,7 @@ impl<'a, T: Clone> Walk<'a, T> {
             Op::Insert { pos, .. } => self.insert(lv, *pos, out),
             Op::Delete { pos } => self.delete(lv, *pos, out),
             Op::Undelete { target } => self.undelete(*target, out),
+            Op::Move { .. } => unimplemented!("moves aren't in the simple walk yet"),
         }
         self.prepared[lv] = true;
     }

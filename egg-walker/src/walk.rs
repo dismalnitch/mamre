@@ -494,6 +494,7 @@ impl<T: Clone> OpLog<T> {
                                 out.delete_run(pos, n)
                             }
                             Op::Undelete { .. } => unreachable!("an undelete is never critical"),
+                            Op::Move { .. } => unimplemented!("moves aren't in the walk yet"),
                         }
                     }
                     let last = lv + n - 1;
@@ -691,6 +692,7 @@ impl<'a, T: Clone> Walk<'a, T> {
             Op::Insert { pos, .. } => self.insert(lv, pos, out),
             Op::Delete { pos } => self.delete(lv, pos, out),
             Op::Undelete { target } => self.undelete(target, out),
+            Op::Move { .. } => unimplemented!("moves aren't in the walk yet"),
         }
         self.prepared = vec![lv];
     }
@@ -715,7 +717,7 @@ impl<'a, T: Clone> Walk<'a, T> {
                 true
             }
             // One at a time.
-            Kind::Undelete => false,
+            Kind::Undelete | Kind::Move => false,
         };
         if done {
             self.replayed += n - 1;

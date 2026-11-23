@@ -17,6 +17,7 @@
 //! op        = 0 insert:   pos, count, items (as a run: text is one UTF-8 string)
 //!             1 delete:   pos, count          (each removes the item at pos)
 //!             2 undelete: count, then each target delete, a ref
+//!             3 move:     pos, count, to   (one event: moves don't run)
 //!             (other kinds are reserved for other kinds of event)
 //! target    = varint, never 0. With no target, a run edits the document's
 //!             text, so text costs nothing for this. Other structures (ink,
@@ -60,6 +61,7 @@ enum PlannedOp<T> {
 const INSERT: u64 = 0;
 const DELETE: u64 = 1;
 const UNDELETE: u64 = 2;
+const MOVE: u64 = 3;
 
 /// A reference to an event, as read: in this chunk, or from before it.
 #[derive(Clone, Copy)]
@@ -72,6 +74,7 @@ enum RawOp<T> {
     Insert { pos: usize, items: Vec<T> },
     Delete { pos: usize, len: usize },
     Undelete { targets: Vec<Ref> },
+    Move { pos: usize, len: usize, to: usize },
 }
 
 struct RawRun<T> {
@@ -87,6 +90,7 @@ impl<T> RawRun<T> {
             RawOp::Insert { items, .. } => items.len(),
             RawOp::Delete { len, .. } => *len,
             RawOp::Undelete { targets } => targets.len(),
+            RawOp::Move { .. } => 1,
         }
     }
 }
@@ -207,6 +211,12 @@ impl<T: Clone + Codec> OpLog<T> {
                         let t = target + k + i;
                         self.put_ref(out, t, first, chunk_index(t), &index);
                     }
+                }
+                RunOp::Move { pos, len, to } => {
+                    put_varint(out, MOVE << 1);
+                    put_usize(out, *pos);
+                    put_usize(out, *len);
+                    put_usize(out, *to);
                 }
             }
         }
@@ -347,6 +357,10 @@ impl<T: Clone + Codec> OpLog<T> {
                     new_kinds.extend(std::iter::repeat_n(Kind::Delete, n));
                     PlannedOp::Run(RunOp::Delete { pos, len: n })
                 }
+                RawOp::Move { pos, len, to } => {
+                    new_kinds.push(Kind::Move);
+                    PlannedOp::Run(RunOp::Move { pos, len, to })
+                }
                 RawOp::Undelete { targets } => {
                     let mut resolved = Vec::with_capacity(n);
                     for &t in &targets[known..] {
@@ -460,6 +474,11 @@ impl<T: Clone + Codec> OpLog<T> {
                     }
                     RawOp::Undelete { targets }
                 }
+                MOVE => RawOp::Move {
+                    pos: get_usize(input)?,
+                    len: get_usize(input)?,
+                    to: get_usize(input)?,
+                },
                 _ => {
                     return Err(DecodeError::Invalid(
                         "an event kind this version doesn't know",

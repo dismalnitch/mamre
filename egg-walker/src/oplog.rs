@@ -26,6 +26,7 @@ pub(crate) enum Kind {
     Insert,
     Delete,
     Undelete,
+    Move,
 }
 
 /// A local version: an event's number in this log. Parents always have
@@ -54,6 +55,11 @@ pub enum Op<T> {
     /// undelete of a delete exists, that delete is undone for good; a redo
     /// is a new delete.
     Undelete { target: Lv },
+    /// Moves the `len` items at `pos` to `to` (a position in the document
+    /// as it is, outside them or at either end), keeping their identities:
+    /// the same items, somewhere else. See `reference.rs` for what a move
+    /// does when others edit or move at the same time.
+    Move { pos: usize, len: usize, to: usize },
 }
 
 /// One event, as a log hands it out.
@@ -87,6 +93,8 @@ pub(crate) enum RunOp<T> {
     /// Deletes `target..target + len` undone, in order: undoing a run of
     /// deletes.
     Undelete { target: Lv, len: usize },
+    /// One move: moves don't run together.
+    Move { pos: usize, len: usize, to: usize },
 }
 
 impl<T> Run<T> {
@@ -94,6 +102,7 @@ impl<T> Run<T> {
         match &self.op {
             RunOp::Insert { items, .. } => items.len(),
             RunOp::Delete { len, .. } | RunOp::Undelete { len, .. } => *len,
+            RunOp::Move { .. } => 1,
         }
     }
 
@@ -167,7 +176,7 @@ impl<T: Clone> OpLog<T> {
         let k = first - run.start;
         match &run.op {
             RunOp::Insert { items, .. } => items.get(k..k + len),
-            RunOp::Delete { .. } | RunOp::Undelete { .. } => None,
+            RunOp::Delete { .. } | RunOp::Undelete { .. } | RunOp::Move { .. } => None,
         }
     }
 
@@ -182,6 +191,7 @@ impl<T: Clone> OpLog<T> {
             },
             RunOp::Delete { pos, .. } => Op::Delete { pos: *pos },
             RunOp::Undelete { target, .. } => Op::Undelete { target: target + k },
+            &RunOp::Move { pos, len, to } => Op::Move { pos, len, to },
         }
     }
 
@@ -236,6 +246,29 @@ impl<T: Clone> OpLog<T> {
             version = vec![lv];
         }
         version
+    }
+
+    /// Moves the items in `range` to `to` (a position in the document as
+    /// it is, outside `range`), in a document at `parents`, as `agent`,
+    /// keeping their identities. Returns the version after.
+    pub fn add_move(
+        &mut self,
+        agent: AgentId,
+        parents: &[Lv],
+        range: Range<usize>,
+        to: usize,
+    ) -> Vec<Lv> {
+        assert!(
+            to <= range.start || to >= range.end,
+            "can't move {range:?} into itself, to {to}"
+        );
+        let seq = self.next_seq[agent.0 as usize];
+        let op = Op::Move {
+            pos: range.start,
+            len: range.len(),
+            to,
+        };
+        vec![self.push(agent, seq, normalize(parents.to_vec()), op)]
     }
 
     /// Adds an event made elsewhere: `agent`'s event number `seq`, after
@@ -361,6 +394,7 @@ impl<T: Clone> OpLog<T> {
                     },
                     Op::Delete { pos } => RunOp::Delete { pos, len: 1 },
                     Op::Undelete { target } => RunOp::Undelete { target, len: 1 },
+                    Op::Move { pos, len, to } => RunOp::Move { pos, len, to },
                 },
             });
             self.spans[agent.0 as usize].insert(seq, (lv, 1));
@@ -385,6 +419,7 @@ impl<T> OpLog<T> {
         let len = match &op {
             RunOp::Insert { items, .. } => items.len(),
             RunOp::Delete { len, .. } => *len,
+            RunOp::Move { .. } => 1,
             RunOp::Undelete { .. } => unreachable!("undeletes go one at a time"),
         };
         debug_assert!(len > 0 && parents.iter().all(|&p| p < lv));
@@ -541,6 +576,7 @@ impl<T> OpLog<T> {
             RunOp::Insert { .. } => Kind::Insert,
             RunOp::Delete { .. } => Kind::Delete,
             RunOp::Undelete { .. } => Kind::Undelete,
+            RunOp::Move { .. } => Kind::Move,
         }
     }
 

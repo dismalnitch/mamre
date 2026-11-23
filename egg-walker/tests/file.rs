@@ -164,6 +164,7 @@ fn events(log: &OpLog<char>) -> Events {
                 Op::Insert { pos, item } => format!("ins {pos} {item}"),
                 Op::Delete { pos } => format!("del {pos}"),
                 Op::Undelete { target } => format!("undel {:?}", stable(target)),
+                Op::Move { pos, len, to } => format!("move {pos} {len} {to}"),
             };
             (stable(lv), parents, op)
         })
