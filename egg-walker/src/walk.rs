@@ -101,24 +101,49 @@ impl<T> Clone for Change<'_, T> {
     }
 }
 
-impl<T: Clone> Change<'_, T> {
-    pub fn apply(&self, doc: &mut Vec<T>) {
+/// A document changes can be applied to: anything that can put items in,
+/// take them out, and move them. Positions count items. This is all the
+/// CRDT asks of a document; it keeps everything else itself (see
+/// [`Accountant`](crate::Accountant)).
+///
+/// A text buffer counting bytes, say, maps positions to its own offsets.
+pub trait Sequence<T> {
+    /// `items` go in at `pos`.
+    fn insert(&mut self, pos: usize, items: &[T]);
+    /// The items in `range` go.
+    fn delete(&mut self, range: Range<usize>);
+    /// The items in `range` move to `to`, a position before the move,
+    /// outside the range: the same items, somewhere else.
+    fn move_range(&mut self, range: Range<usize>, to: usize);
+}
+
+impl<T: Clone> Sequence<T> for Vec<T> {
+    fn insert(&mut self, pos: usize, items: &[T]) {
+        self.splice(pos..pos, items.iter().cloned());
+    }
+
+    fn delete(&mut self, range: Range<usize>) {
+        self.drain(range);
+    }
+
+    fn move_range(&mut self, range: Range<usize>, to: usize) {
+        let moved: Vec<T> = self.drain(range.clone()).collect();
+        let at = if to > range.start {
+            to - range.len()
+        } else {
+            to
+        };
+        self.splice(at..at, moved);
+    }
+}
+
+impl<T> Change<'_, T> {
+    /// Applies this change to `doc`.
+    pub fn apply(&self, doc: &mut impl Sequence<T>) {
         match self {
-            Change::Insert { pos, items, .. } => {
-                doc.splice(*pos..*pos, items.iter().cloned());
-            }
-            Change::Delete { range } => {
-                doc.drain(range.clone());
-            }
-            Change::Move { range, to } => {
-                let moved: Vec<T> = doc.drain(range.clone()).collect();
-                let at = if *to > range.start {
-                    to - range.len()
-                } else {
-                    *to
-                };
-                doc.splice(at..at, moved);
-            }
+            Change::Insert { pos, items, .. } => doc.insert(*pos, items),
+            Change::Delete { range } => doc.delete(range.clone()),
+            Change::Move { range, to } => doc.move_range(range.clone(), *to),
         }
     }
 }

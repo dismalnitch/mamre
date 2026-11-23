@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use diamond_types::list::OpLog as Diamond;
 use diamond_types::list::operation::OpKind;
-use mamre_egg_walker::{Change, Lv, Op, OpLog};
+use mamre_egg_walker::{Lv, Op, OpLog, Sequence};
 use mamre_rope::Rope;
 
 const TRACES: [(&str, &str); 7] = [
@@ -86,26 +86,44 @@ fn convert(dt: &Diamond) -> OpLog<char> {
     ours
 }
 
+/// mamre's rope as a document the changes apply to: positions count
+/// chars, the rope counts bytes, and this maps one to the other, as any
+/// editor's buffer would.
+struct Text(Rope);
+
+impl Sequence<char> for Text {
+    fn insert(&mut self, pos: usize, items: &[char]) {
+        let text: String = items.iter().collect();
+        let at = self.0.char_to_offset(pos);
+        self.0.insert(at, &text);
+    }
+
+    fn delete(&mut self, range: std::ops::Range<usize>) {
+        let range = self.0.char_to_offset(range.start)..self.0.char_to_offset(range.end);
+        self.0.remove(range);
+    }
+
+    fn move_range(&mut self, range: std::ops::Range<usize>, to: usize) {
+        let bytes = self.0.char_to_offset(range.start)..self.0.char_to_offset(range.end);
+        let moved: String = self.0.slice(bytes.clone()).chars().collect();
+        let at = self.0.char_to_offset(to);
+        self.0.remove(bytes.clone());
+        let at = if at > bytes.start {
+            at - bytes.len()
+        } else {
+            at
+        };
+        self.0.insert(at, &moved);
+    }
+}
+
 /// The document at the tip, in a rope: one rope edit per change.
 fn checkout(log: &OpLog<char>) -> Rope {
-    let mut rope = Rope::new();
-    let mut text = String::new();
+    let mut text = Text(Rope::new());
     for change in log.changes(&[], log.version()) {
-        match change {
-            Change::Insert { pos, items, .. } => {
-                text.clear();
-                text.extend(items);
-                let at = rope.char_to_offset(pos);
-                rope.insert(at, &text);
-            }
-            Change::Delete { range } => {
-                let range = rope.char_to_offset(range.start)..rope.char_to_offset(range.end);
-                rope.remove(range);
-            }
-            Change::Move { .. } => unreachable!("the editing traces have no moves"),
-        }
+        change.apply(&mut text);
     }
-    rope
+    text.0
 }
 
 /// The fastest of a few runs of `f`.
