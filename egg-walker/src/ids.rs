@@ -18,6 +18,7 @@ use mamre::codec::{Codec, DecodeError, get_usize, put_usize};
 use mamre::cursor::Bias;
 use mamre::{Item, SumTree, Summary};
 
+use crate::blocks::Blocks;
 use crate::oplog::Lv;
 
 /// Items `first..first + len`, side by side.
@@ -76,6 +77,9 @@ pub struct Identities {
     /// Delete to the insert of the item it removed, for the latest deletes.
     pub(crate) removed: Arc<BTreeMap<Lv, Lv>>,
     window: usize,
+    /// The document's moved blocks: what a merge from it needs to know
+    /// about moves (see `blocks.rs`).
+    pub(crate) blocks: Blocks,
 }
 
 impl Default for Identities {
@@ -100,6 +104,7 @@ impl Identities {
             ids: Ids::default(),
             removed: Arc::new(BTreeMap::new()),
             window,
+            blocks: Blocks::default(),
         }
     }
 
@@ -139,8 +144,8 @@ impl Identities {
     }
 
     /// Appends these identities' bytes: the window, the runs (a sum tree,
-    /// saved as its items), and the remembered deletes, by how far each is
-    /// past the one before.
+    /// saved as its items), the remembered deletes, by how far each is
+    /// past the one before, and the moved blocks.
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         put_usize(out, self.window);
         self.ids.runs.encode(out);
@@ -151,6 +156,7 @@ impl Identities {
             put_usize(out, item);
             prev = delete;
         }
+        self.blocks.encode(out);
     }
 
     /// Reads identities [`encode`](Self::encode) wrote, for a log of
@@ -179,10 +185,13 @@ impl Identities {
             removed.insert(delete, item);
             prev = delete;
         }
+        let ids = Ids { runs };
+        let blocks = Blocks::decode(input, events, ids.len())?;
         Ok(Identities {
-            ids: Ids { runs },
+            ids,
             removed: Arc::new(removed),
             window,
+            blocks,
         })
     }
 
@@ -361,5 +370,28 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+    use crate::oplog::OpLog;
+
+    /// A replica's identities, moved blocks and all, read back as saved.
+    #[test]
+    fn blocks_round_trip() {
+        let mut log = OpLog::<char>::new();
+        let a = log.agent("a");
+        let v = log.add_insert(a, &[], 0, "abcdef".chars());
+        let v = log.add_move(a, &v, 1..3, 5);
+        let mut ids = Identities::new();
+        log.changes_with(&[], &v, &mut ids);
+        assert_eq!(ids.blocks.0, vec![(6, 3..5)]);
+        let mut bytes = Vec::new();
+        ids.encode(&mut bytes);
+        let back = Identities::decode(&mut bytes.as_slice(), log.len()).unwrap();
+        assert_eq!(back.blocks, ids.blocks);
+        assert_eq!(back.ids.len(), ids.ids.len());
     }
 }

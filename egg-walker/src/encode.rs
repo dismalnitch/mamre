@@ -556,3 +556,29 @@ mod tests {
         assert_eq!(log.len(), 0);
     }
 }
+
+#[cfg(test)]
+mod move_tests {
+    use crate::oplog::OpLog;
+
+    /// A chunk holding a move reads back as the same events.
+    #[test]
+    fn a_move_round_trips() {
+        let mut log = OpLog::<char>::new();
+        let a = log.agent("a");
+        let v = log.add_insert(a, &[], 0, "abcdef".chars());
+        let v = log.add_move(a, &v, 1..3, 5);
+        log.add_insert(a, &v, 0, "x".chars());
+        let mut bytes = Vec::new();
+        log.encode_chunk(0..log.len(), &mut bytes);
+        let mut back = OpLog::<char>::new();
+        assert_eq!(back.decode_chunk(&bytes), Ok(log.len()));
+        for lv in 0..log.len() {
+            assert_eq!(
+                format!("{:?}", back.event(lv)),
+                format!("{:?}", log.event(lv))
+            );
+        }
+        assert_eq!(back.checkout(back.version()), log.checkout(log.version()));
+    }
+}

@@ -49,6 +49,7 @@ use std::sync::Arc;
 use mamre::cursor::Bias;
 use mamre::{Item, SeekTarget, SumTree, Summary};
 
+use crate::blocks::Blocks;
 use crate::ids::{Identities, Ids};
 use crate::key::Key;
 use crate::oplog::{Kind, Lv, Op, OpLog};
@@ -131,6 +132,9 @@ pub(crate) struct Changes<'a, T> {
     /// kept, and which item each new delete removed, where known.
     pub(crate) ids: Option<Ids>,
     pub(crate) learned: Vec<(Lv, Lv)>,
+    /// The moved blocks of the document the changes make, when the log has
+    /// moves (see `blocks.rs`).
+    pub(crate) blocks: Option<Blocks>,
 }
 
 impl<'a, T: Clone> Changes<'a, T> {
@@ -140,6 +144,7 @@ impl<'a, T: Clone> Changes<'a, T> {
             out: Vec::new(),
             ids: None,
             learned: Vec::new(),
+            blocks: None,
         }
     }
 
@@ -426,6 +431,9 @@ impl<T: Clone> OpLog<T> {
         if let Some(new) = out.ids {
             ids.ids = new;
         }
+        if let Some(blocks) = out.blocks {
+            ids.blocks = blocks;
+        }
         ids.learn(out.learned);
         out.out
     }
@@ -448,6 +456,9 @@ impl<T: Clone> OpLog<T> {
         keep_ids: bool,
         known: Option<&Identities>,
     ) -> (Changes<'_, T>, Stats) {
+        if self.has_moves() {
+            return self.walk_moves(from, to, keep_ids, known);
+        }
         let mut out = Changes::new(self);
         // What to replay, and the base: a version every replayed event
         // includes whole, so none of it is ever retreated.
@@ -564,6 +575,132 @@ impl<T: Clone> OpLog<T> {
             records: walk.records.iter().count(),
         };
         (out, stats)
+    }
+
+    /// Whether any event is a move: if not, the walk needn't know about
+    /// blocks at all.
+    fn has_moves(&self) -> bool {
+        self.runs
+            .iter()
+            .any(|run| matches!(run.op, crate::oplog::RunOp::Move { .. }))
+    }
+
+    /// The walk, for a log with moves. Where nothing is concurrent, events
+    /// apply as they are, and the document's moved blocks are kept up to
+    /// date by position (see `blocks.rs`). Between, each stretch is merged
+    /// the simple walk's way, from the document where it starts, whose
+    /// identities and blocks are known by then; the first, from the base,
+    /// finds them from nothing if they aren't.
+    fn walk_moves(
+        &self,
+        from: &[Lv],
+        to: &[Lv],
+        keep_ids: bool,
+        known: Option<&Identities>,
+    ) -> (Changes<'_, T>, Stats) {
+        let mut out = Changes::new(self);
+        let (old, new, base) = self.conflict(from, to);
+        if let Some(known) = known {
+            out.ids = Some(known.ids.clone());
+        } else if from.is_empty() && keep_ids {
+            out.ids = Some(Ids::default());
+        }
+        // The document the changes make: its blocks, as it goes.
+        let mut blocks = match known {
+            Some(known) => known.blocks.clone(),
+            None if from.is_empty() => Blocks::default(),
+            None => self.blocks_at(from),
+        };
+        if new.is_empty() {
+            out.blocks = Some(blocks);
+            return (out, Stats::default());
+        }
+        let order: Vec<(Range<Lv>, bool)> = old
+            .iter()
+            .map(|span| (span.clone(), false))
+            .chain(new.iter().map(|span| (span.clone(), true)))
+            .collect();
+        let critical = self.critical_points(&order, &old, &new, &base);
+        let mut critical = critical.iter().peekable();
+        let old_len: usize = old.iter().map(|span| span.len()).sum();
+        let lamport = std::rc::Rc::new(self.lamports());
+        // Where the next window starts, and what's known of it there.
+        let mut start = base.clone();
+        let mut start_ids = if old_len == 0 { out.ids.clone() } else { None };
+        let mut start_blocks = (old_len == 0).then(|| blocks.clone());
+        let mut window: Option<crate::simple::Window<'_, T>> = None;
+        let mut at = 0;
+        for (span, output) in order {
+            for lv in span {
+                while critical.next_if(|c| c.end <= at).is_some() {}
+                let is_critical = critical.peek().is_some_and(|c| c.start <= at);
+                if is_critical && output {
+                    if let Some(w) = window.take() {
+                        blocks = w.blocks();
+                    }
+                    self.apply_critical(lv, &mut out, &mut blocks);
+                    start = vec![lv];
+                    start_ids.clone_from(&out.ids);
+                    start_blocks = Some(blocks.clone());
+                } else {
+                    let w = window.get_or_insert_with(|| {
+                        let (ids, found) = match start_blocks.take() {
+                            Some(b) => (start_ids.take(), b),
+                            None => {
+                                let (o, _) = self.walk_moves(&[], &start, true, None);
+                                (o.ids, o.blocks.unwrap_or_default())
+                            }
+                        };
+                        crate::simple::Window::new(
+                            self,
+                            start.clone(),
+                            ids,
+                            &found,
+                            lamport.clone(),
+                        )
+                    });
+                    w.step(lv, output.then_some(&mut out));
+                }
+                at += 1;
+            }
+        }
+        if let Some(w) = window.take() {
+            blocks = w.blocks();
+        }
+        out.blocks = Some(blocks);
+        (out, Stats::default())
+    }
+
+    /// Applies event `lv`, which saw everything before it and is seen by
+    /// everything after: its position is final.
+    fn apply_critical(&self, lv: Lv, out: &mut Changes<'_, T>, blocks: &mut Blocks) {
+        match self.op(lv) {
+            Op::Insert { pos, .. } => {
+                out.insert_run(pos, lv, 1);
+                blocks.insert(pos, 1);
+            }
+            Op::Delete { pos } => {
+                if let Some(ids) = &out.ids {
+                    out.learned.push((lv, ids.get(pos)));
+                }
+                out.delete_run(pos, 1);
+                blocks.delete(pos..pos + 1);
+            }
+            Op::Undelete { .. } => unreachable!("an undelete is never critical"),
+            Op::Move { pos, len, to } => {
+                if blocks.apply_move(lv, pos..pos + len, to) {
+                    out.move_range(pos..pos + len, to);
+                }
+            }
+        }
+    }
+
+    /// The moved blocks of the document at `version`, from nothing.
+    fn blocks_at(&self, version: &[Lv]) -> Blocks {
+        self.walk_moves(&[], version, false, None)
+            .0
+            .blocks
+            .unwrap_or_default()
     }
 
     /// Where a replay is critical, as ranges of places in it: each event

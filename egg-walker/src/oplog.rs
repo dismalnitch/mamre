@@ -787,6 +787,18 @@ impl<T> OpLog<T> {
         seen
     }
 
+    /// Each event's Lamport time: one more than its latest parent's. What
+    /// decides which moves are active (see `reference.rs`): a time every
+    /// replica gives an event alike.
+    pub(crate) fn lamports(&self) -> Vec<u64> {
+        let mut lamport: Vec<u64> = Vec::with_capacity(self.len());
+        for lv in 0..self.len() {
+            let l = self.parents(lv).map(|p| lamport[p]).max().unwrap_or(0) + 1;
+            lamport.push(l);
+        }
+        lamport
+    }
+
     /// Whether `version` includes event `lv`.
     pub fn contains(&self, version: &[Lv], lv: Lv) -> bool {
         self.closure(version)[lv]

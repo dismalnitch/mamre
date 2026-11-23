@@ -19,7 +19,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::rc::Rc;
 
+use crate::blocks::Blocks;
+use crate::ids::Ids;
 use crate::oplog::{Kind, Lv, Op, OpLog};
 use crate::order::{Placed, place};
 use crate::walk::{Change, Changes};
@@ -116,11 +119,84 @@ struct Walk<'a, T> {
     /// The deletes undone in the effect version.
     undone: HashSet<Lv>,
     /// Which insert each base item came from, once asked.
-    base_ids: Option<Vec<Lv>>,
+    base_ids: BaseIds,
     base: Vec<bool>,
     /// The moves that do something, in the order activity is decided in.
     moves: Vec<Moved>,
-    lamport: Vec<u64>,
+    lamport: Rc<Vec<u64>>,
+}
+
+/// Where the base items' identities come from: the reference (the oracle
+/// walk), or the fast walk's, given or found when first asked.
+enum BaseIds {
+    Reference(Option<Vec<Lv>>),
+    Given { frontier: Vec<Lv>, ids: Option<Ids> },
+}
+
+/// A stretch of a merge with moves, for the fast walk: the simple walk's
+/// way, from a base whose identities and blocks are known (or found).
+pub(crate) struct Window<'a, T>(Walk<'a, T>);
+
+impl<'a, T: Clone> Window<'a, T> {
+    /// A window from the document at `frontier`, whose items' identities are
+    /// `ids` (found from nothing when first asked, if not given) and whose
+    /// moved blocks are `blocks`.
+    pub(crate) fn new(
+        log: &'a OpLog<T>,
+        frontier: Vec<Lv>,
+        ids: Option<Ids>,
+        blocks: &Blocks,
+        lamport: Rc<Vec<u64>>,
+    ) -> Self {
+        let base = log.closure(&frontier);
+        let mut walk = Walk {
+            log,
+            records: Vec::new(),
+            prepared: base.clone(),
+            effect: base.clone(),
+            targets: HashMap::new(),
+            undos: HashMap::new(),
+            undone: HashSet::new(),
+            base_ids: BaseIds::Given { frontier, ids },
+            base,
+            moves: Vec::new(),
+            lamport,
+        };
+        walk.lay_base(blocks.0.clone());
+        Window(walk)
+    }
+
+    pub(crate) fn step(&mut self, lv: Lv, out: Option<&mut Changes<'a, T>>) {
+        self.0.step(lv, out);
+    }
+
+    /// The moved blocks of the document so far.
+    pub(crate) fn blocks(&self) -> Blocks {
+        let walk = &self.0;
+        let (entries, active) = walk.draw(In::Effect, &walk.active(In::Effect));
+        let mut spans: Vec<(Lv, Option<usize>, usize)> =
+            active.iter().map(|a| (a.m.id, None, 0)).collect();
+        let mut pos = 0;
+        for e in entries.iter().filter(|e| e.visible) {
+            let r = &walk.records[e.at];
+            if r.id >= BASE_ITEM && r.id + r.len == BASE_ITEM + UNDERWATER {
+                continue;
+            }
+            for (id, start, end) in &mut spans {
+                if e.path.contains(id) {
+                    start.get_or_insert(pos);
+                    *end = pos + r.len;
+                }
+            }
+            pos += r.len;
+        }
+        Blocks(
+            spans
+                .into_iter()
+                .filter_map(|(id, start, end)| Some((id, start?..end)))
+                .collect(),
+        )
+    }
 }
 
 impl<T: Clone> OpLog<T> {
@@ -140,11 +216,6 @@ impl<T: Clone> OpLog<T> {
             return Vec::new();
         }
         let base = self.base_simple(&have, &want);
-        let mut lamport: Vec<u64> = Vec::with_capacity(self.len());
-        for lv in 0..self.len() {
-            let l = self.parents(lv).map(|p| lamport[p]).max().unwrap_or(0) + 1;
-            lamport.push(l);
-        }
         let mut walk = Walk {
             log: self,
             records: Vec::new(),
@@ -153,10 +224,10 @@ impl<T: Clone> OpLog<T> {
             targets: HashMap::new(),
             undos: HashMap::new(),
             undone: HashSet::new(),
-            base_ids: None,
+            base_ids: BaseIds::Reference(None),
             base: base.clone(),
             moves: Vec::new(),
-            lamport,
+            lamport: Rc::new(self.lamports()),
         };
         walk.lay_base(crate::reference::blocks(self, &base));
         // First what the document already holds past the base, to set up
@@ -410,10 +481,15 @@ impl<'a, T: Clone> Walk<'a, T> {
         if id < BASE_ITEM {
             return id;
         }
-        let ids = self
-            .base_ids
-            .get_or_insert_with(|| crate::reference::visible_ids(self.log, &self.base));
-        ids[id - BASE_ITEM]
+        let (log, base) = (self.log, &self.base);
+        match &mut self.base_ids {
+            BaseIds::Reference(ids) => {
+                ids.get_or_insert_with(|| crate::reference::visible_ids(log, base))[id - BASE_ITEM]
+            }
+            BaseIds::Given { frontier, ids } => ids
+                .get_or_insert_with(|| log.ids_at(frontier))
+                .get(id - BASE_ITEM),
+        }
     }
 
     // ---- Frames ----
@@ -757,11 +833,16 @@ impl<'a, T: Clone> Walk<'a, T> {
         let at = self.prepared_at(pos);
         self.records[at].prepare = Prepare::Deleted(1);
         self.targets.insert(lv, self.records[at].id);
+        let Some(out) = out else {
+            self.records[at].dead += 1;
+            return;
+        };
+        // What it removed, for an undo later on.
+        let item = self.identity(at);
+        out.learned.push((lv, item));
         // Already deleted in the effect version by a concurrent delete:
         // nothing more to do to the document.
-        if self.records[at].dead == 0
-            && let Some(out) = out
-        {
+        if self.records[at].dead == 0 {
             out.delete(self.effect_pos(at));
         }
         self.records[at].dead += 1;

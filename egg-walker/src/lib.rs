@@ -38,6 +38,7 @@
 //! over a plain list is kept to check it against, change for change.
 
 mod anchors;
+mod blocks;
 mod encode;
 pub mod file;
 mod ids;

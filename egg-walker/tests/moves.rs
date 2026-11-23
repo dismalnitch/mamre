@@ -675,3 +675,48 @@ fn a_blocks_edge_is_decided_by_what_shows() {
     let a12 = log.add_move(a, &a10, 1..8, 0);
     merges_agree(&log, &[a12, c11]);
 }
+
+// ---- The fast walk, against the reference ----
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The fast walk, every way it's used: a merge from any writer's version
+    /// to any other's, by `changes` and by `changes_with` from a replica's
+    /// identities, and checking out each version from nothing.
+    #[test]
+    fn the_fast_walk_merges_like_the_reference(actions in actions()) {
+        let (log, versions) = history(actions);
+        for from in &versions {
+            prop_assert_eq!(
+                log.checkout(from),
+                reference::checkout(&log, from),
+                "checkout {:?}, in\n{}", from, describe(&log)
+            );
+            for to in &versions {
+                let both = log.union(from, to);
+                let want = reference::checkout(&log, &both);
+                let want_ids = reference::identities(&log, &both);
+
+                let mut doc = reference::checkout(&log, from);
+                let mut ids = reference::identities(&log, from);
+                apply(&log.changes(from, to), &mut doc, &mut ids);
+                prop_assert_eq!(&doc, &want, "changes {:?} to {:?}, in\n{}", from, to, describe(&log));
+                prop_assert_eq!(&ids, &want_ids, "changes {:?} to {:?}, in\n{}", from, to, describe(&log));
+
+                // A replica that keeps its identities (and so its blocks).
+                let mut kept = mamre_egg_walker::Identities::new();
+                let mut doc = Vec::new();
+                for c in log.changes_with(&[], from, &mut kept) {
+                    c.apply(&mut doc);
+                }
+                for c in log.changes_with(from, to, &mut kept) {
+                    c.apply(&mut doc);
+                }
+                let kept_ids: Vec<Lv> = (0..kept.len()).map(|i| kept.item(i)).collect();
+                prop_assert_eq!(&doc, &want, "changes_with {:?} to {:?}, in\n{}", from, to, describe(&log));
+                prop_assert_eq!(&kept_ids, &want_ids, "changes_with {:?} to {:?}, in\n{}", from, to, describe(&log));
+            }
+        }
+    }
+}
