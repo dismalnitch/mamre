@@ -3,7 +3,7 @@
 //! caught, and a chunk must sync a log as `pull` does.
 
 use mamre_egg_walker::file::{self, Loaded};
-use mamre_egg_walker::{Anchors, Identities, Lv, Op, OpLog};
+use mamre_egg_walker::{Accountant, Lv, Op, OpLog};
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -38,23 +38,19 @@ enum Act {
 struct Replica {
     name: String,
     log: OpLog<char>,
-    version: Vec<Lv>,
     doc: Vec<char>,
-    ids: Identities,
-    anchors: Anchors,
+    books: Accountant,
 }
 
 fn frac(len: usize, f: u16) -> usize {
     len * f as usize / u16::MAX as usize
 }
 
+/// Merges `to` in: a local edit, or what came from elsewhere.
 fn advance(rep: &mut Replica, to: &[Lv]) {
-    let to = rep.log.union(&rep.version, to);
-    for change in rep.log.changes_with(&rep.version, &to, &mut rep.ids) {
-        rep.anchors.apply(&change);
+    for change in rep.books.merge(&rep.log, to) {
         change.apply(&mut rep.doc);
     }
-    rep.version = to;
 }
 
 fn act(reps: &mut [Replica], act: &Act, next: &mut u32) {
@@ -77,10 +73,8 @@ fn act(reps: &mut [Replica], act: &Act, next: &mut u32) {
                 })
                 .collect();
             *next += n as u32;
-            rep.version = rep.log.add_insert(agent, &rep.version, pos, items.clone());
-            rep.ids.insert(pos, rep.version[0] + 1 - n, n);
-            rep.anchors.insert(pos, n);
-            rep.doc.splice(pos..pos, items);
+            let v = rep.log.add_insert(agent, rep.books.version(), pos, items);
+            advance(rep, &v);
         }
         Act::Delete { r, a, b } => {
             let rep = &mut reps[r];
@@ -88,11 +82,8 @@ fn act(reps: &mut [Replica], act: &Act, next: &mut u32) {
             let range = a.min(b)..a.max(b);
             if !range.is_empty() {
                 let agent = rep.log.agent(&rep.name.clone());
-                rep.version = rep.log.add_delete(agent, &rep.version, range.clone());
-                rep.ids
-                    .delete(range.start, rep.version[0] + 1 - range.len(), range.len());
-                rep.anchors.delete(range.clone());
-                rep.doc.drain(range);
+                let v = rep.log.add_delete(agent, rep.books.version(), range);
+                advance(rep, &v);
             }
         }
         Act::Undo { r, pick } => {
@@ -100,13 +91,13 @@ fn act(reps: &mut [Replica], act: &Act, next: &mut u32) {
             let deletes: Vec<Lv> = (0..rep.log.len())
                 .filter(|&lv| {
                     matches!(rep.log.event(lv).op, Op::Delete { .. })
-                        && rep.log.contains(&rep.version, lv)
+                        && rep.log.contains(rep.books.version(), lv)
                 })
                 .collect();
             if !deletes.is_empty() {
                 let d = deletes[frac(deletes.len() - 1, pick)];
                 let agent = rep.log.agent(&rep.name.clone());
-                let after = rep.log.add_undelete(agent, &rep.version, [d]);
+                let after = rep.log.add_undelete(agent, rep.books.version(), [d]);
                 advance(rep, &after);
             }
         }
@@ -115,7 +106,10 @@ fn act(reps: &mut [Replica], act: &Act, next: &mut u32) {
                 let theirs = reps[from].clone();
                 let rep = &mut reps[r];
                 rep.log.pull(&theirs.log);
-                let v = rep.log.translate(&theirs.log, &theirs.version).unwrap();
+                let v = rep
+                    .log
+                    .translate(&theirs.log, theirs.books.version())
+                    .unwrap();
                 advance(rep, &v);
             }
         }
@@ -123,8 +117,7 @@ fn act(reps: &mut [Replica], act: &Act, next: &mut u32) {
             let rep = &mut reps[r];
             if !rep.doc.is_empty() {
                 let pos = frac(rep.doc.len() - 1, at);
-                let item = rep.ids.item(pos);
-                rep.anchors.watch(pos, item);
+                rep.books.watch(pos);
             }
         }
         Act::Save => {}
@@ -181,15 +174,10 @@ struct State {
     anchors: Vec<(Lv, Option<usize>, bool)>,
 }
 
-fn state(
-    log: &OpLog<char>,
-    version: &[Lv],
-    doc: &[char],
-    ids: &Identities,
-    anchors: &Anchors,
-) -> State {
+fn state(log: &OpLog<char>, doc: &[char], books: &Accountant) -> State {
+    let (ids, anchors) = (books.identities(), books.anchors());
     State {
-        version: version.to_vec(),
+        version: books.version().to_vec(),
         doc: doc.to_vec(),
         ids: (0..ids.len()).map(|k| ids.item(k)).collect(),
         removed: (0..log.len())
@@ -210,10 +198,8 @@ fn run(acts: &[Act]) -> (Vec<u8>, Vec<(usize, usize, State, Events)>) {
         .map(|i| Replica {
             name: format!("r{i}"),
             log: OpLog::new(),
-            version: Vec::new(),
             doc: Vec::new(),
-            ids: Identities::new(),
-            anchors: Anchors::new(0),
+            books: Accountant::new(),
         })
         .collect();
     let mut next = 0;
@@ -224,13 +210,11 @@ fn run(acts: &[Act]) -> (Vec<u8>, Vec<(usize, usize, State, Events)>) {
         act(&mut reps, a, &mut next);
         if let Act::Save = a {
             let r = &reps[0];
-            saved = file::save(
-                &mut bytes, &r.log, saved, &r.version, &r.doc, &r.ids, &r.anchors,
-            );
+            saved = file::save(&mut bytes, &r.log, saved, &r.doc, &r.books);
             saves.push((
                 bytes.len(),
                 saved,
-                state(&r.log, &r.version, &r.doc, &r.ids, &r.anchors),
+                state(&r.log, &r.doc, &r.books),
                 events(&r.log),
             ));
         }
@@ -240,7 +224,7 @@ fn run(acts: &[Act]) -> (Vec<u8>, Vec<(usize, usize, State, Events)>) {
 
 fn loaded_state(l: &Loaded<char>) -> Option<State> {
     let s = l.snapshot.as_ref()?;
-    Some(state(&l.log, &s.version, &s.doc, &s.ids, &s.anchors))
+    Some(state(&l.log, &s.doc, &s.accountant))
 }
 
 proptest! {

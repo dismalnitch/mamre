@@ -419,7 +419,7 @@ impl<T: Clone> OpLog<T> {
 
     /// The changes, and what finding them cost.
     pub(crate) fn walk(&self, from: &[Lv], to: &[Lv]) -> (Vec<Change<'_, T>>, Stats) {
-        let (out, stats) = self.walk_into(from, to, false, None);
+        let (out, stats) = self.walk_into(from, to, false, None, None);
         (out.out, stats)
     }
 
@@ -427,12 +427,31 @@ impl<T: Clone> OpLog<T> {
     /// its document's [`Identities`], at `from`: they're used to bring back
     /// items an undo revives, and brought up to date with the changes.
     pub fn changes_with(&self, from: &[Lv], to: &[Lv], ids: &mut Identities) -> Vec<Change<'_, T>> {
-        let (out, _) = self.walk_into(from, to, true, Some(ids));
+        let (out, _) = self.walk_into(from, to, true, Some(ids), None);
         if let Some(new) = out.ids {
             ids.ids = new;
         }
-        if let Some(blocks) = out.blocks {
-            ids.blocks = blocks;
+        ids.learn(out.learned);
+        out.out
+    }
+
+    /// The changes, as [`changes_with`](Self::changes_with), keeping the
+    /// document's moved blocks as well: the [`Accountant`]'s way.
+    ///
+    /// [`Accountant`]: crate::Accountant
+    pub(crate) fn changes_kept(
+        &self,
+        from: &[Lv],
+        to: &[Lv],
+        ids: &mut Identities,
+        blocks: &mut Blocks,
+    ) -> Vec<Change<'_, T>> {
+        let (out, _) = self.walk_into(from, to, true, Some(ids), Some(blocks));
+        if let Some(new) = out.ids {
+            ids.ids = new;
+        }
+        if let Some(new) = out.blocks {
+            *blocks = new;
         }
         ids.learn(out.learned);
         out.out
@@ -440,7 +459,7 @@ impl<T: Clone> OpLog<T> {
 
     /// Which insert each item at `version` came from.
     pub(crate) fn ids_at(&self, version: &[Lv]) -> Ids {
-        self.walk_into(&[], version, true, None)
+        self.walk_into(&[], version, true, None, None)
             .0
             .ids
             .expect("a walk from nothing keeps identities")
@@ -455,9 +474,10 @@ impl<T: Clone> OpLog<T> {
         to: &[Lv],
         keep_ids: bool,
         known: Option<&Identities>,
+        known_blocks: Option<&Blocks>,
     ) -> (Changes<'_, T>, Stats) {
         if self.has_moves() {
-            return self.walk_moves(from, to, keep_ids, known);
+            return self.walk_moves(from, to, keep_ids, known, known_blocks);
         }
         let mut out = Changes::new(self);
         // What to replay, and the base: a version every replayed event
@@ -597,6 +617,7 @@ impl<T: Clone> OpLog<T> {
         to: &[Lv],
         keep_ids: bool,
         known: Option<&Identities>,
+        known_blocks: Option<&Blocks>,
     ) -> (Changes<'_, T>, Stats) {
         let mut out = Changes::new(self);
         let (old, new, base) = self.conflict(from, to);
@@ -606,8 +627,8 @@ impl<T: Clone> OpLog<T> {
             out.ids = Some(Ids::default());
         }
         // The document the changes make: its blocks, as it goes.
-        let mut blocks = match known {
-            Some(known) => known.blocks.clone(),
+        let mut blocks = match known_blocks {
+            Some(known) => known.clone(),
             None if from.is_empty() => Blocks::default(),
             None => self.blocks_at(from),
         };
@@ -647,7 +668,7 @@ impl<T: Clone> OpLog<T> {
                         let (ids, found) = match start_blocks.take() {
                             Some(b) => (start_ids.take(), b),
                             None => {
-                                let (o, _) = self.walk_moves(&[], &start, true, None);
+                                let (o, _) = self.walk_moves(&[], &start, true, None, None);
                                 (o.ids, o.blocks.unwrap_or_default())
                             }
                         };
@@ -697,7 +718,7 @@ impl<T: Clone> OpLog<T> {
 
     /// The moved blocks of the document at `version`, from nothing.
     fn blocks_at(&self, version: &[Lv]) -> Blocks {
-        self.walk_moves(&[], version, false, None)
+        self.walk_moves(&[], version, false, None, None)
             .0
             .blocks
             .unwrap_or_default()
@@ -1730,7 +1751,7 @@ mod tests {
         // Alice's replica: her own undo.
         let undone = log.add_undelete(alice, &gone, gone[0] - 2..=gone[0]);
         let mut mine = ids.clone();
-        let (out, stats) = log.walk_into(&gone, &undone, true, Some(&mine));
+        let (out, stats) = log.walk_into(&gone, &undone, true, Some(&mine), None);
         assert_eq!(stats.checkouts, 0, "local undo");
         drop(out);
         log.changes_with(&gone, &undone, &mut mine);
@@ -1742,9 +1763,9 @@ mod tests {
         let both = log.union(&theirs, &gone);
         log.changes_with(&theirs, &both, &mut bobs);
         let all = log.union(&both, &undone);
-        let (_, stats) = log.walk_into(&both, &all, true, Some(&bobs));
+        let (_, stats) = log.walk_into(&both, &all, true, Some(&bobs), None);
         assert_eq!(stats.checkouts, 0, "remote undo");
-        let (_, stats) = log.walk_into(&both, &all, false, None);
+        let (_, stats) = log.walk_into(&both, &all, false, None, None);
         assert!(stats.checkouts > 0, "without identities, a checkout");
         let mut doc = log.checkout(&both);
         for change in log.changes_with(&both, &all, &mut bobs) {
@@ -1763,7 +1784,7 @@ mod tests {
             ids.insert(len, v[0], 1);
         }
         let back = log.add_undelete(alice, &v, again[0] - 2..=again[0]);
-        let (_, stats) = log.walk_into(&v, &back, true, Some(&ids));
+        let (_, stats) = log.walk_into(&v, &back, true, Some(&ids), None);
         assert_eq!(stats.checkouts, 0, "undo after fresh starts");
     }
 

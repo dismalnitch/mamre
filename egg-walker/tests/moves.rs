@@ -737,6 +737,21 @@ proptest! {
                     c.apply(&mut doc);
                 }
                 let kept_ids: Vec<Lv> = (0..kept.len()).map(|i| kept.item(i)).collect();
+
+                // An accountant, which keeps the blocks too: to `from`, then
+                // to the merge.
+                let mut books = mamre_egg_walker::Accountant::new();
+                let mut kept_doc = Vec::new();
+                for c in books.merge(&log, from) {
+                    c.apply(&mut kept_doc);
+                }
+                for c in books.merge(&log, to) {
+                    c.apply(&mut kept_doc);
+                }
+                let books_ids: Vec<Lv> =
+                    (0..books.len()).map(|i| books.identities().item(i)).collect();
+                prop_assert_eq!(&kept_doc, &want, "accountant {:?} to {:?}, in\n{}", from, to, describe(&log));
+                prop_assert_eq!(&books_ids, &want_ids, "accountant {:?} to {:?}, in\n{}", from, to, describe(&log));
                 prop_assert_eq!(&doc, &want, "changes_with {:?} to {:?}, in\n{}", from, to, describe(&log));
                 prop_assert_eq!(&kept_ids, &want_ids, "changes_with {:?} to {:?}, in\n{}", from, to, describe(&log));
             }

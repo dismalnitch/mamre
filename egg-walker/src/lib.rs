@@ -37,6 +37,7 @@
 //! prepare version by walking only as far back as it changes. A simpler walk
 //! over a plain list is kept to check it against, change for change.
 
+mod accountant;
 mod anchors;
 mod blocks;
 mod encode;
@@ -50,6 +51,7 @@ mod simple;
 pub mod sync;
 mod walk;
 
+pub use accountant::Accountant;
 pub use anchors::Anchors;
 pub use ids::Identities;
 pub use oplog::{AgentId, Event, Lv, Op, OpLog};

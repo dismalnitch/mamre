@@ -7,8 +7,9 @@
 //! kind     = 1 chunk:    events since the last save (see `encode.rs`)
 //!            2 snapshot: the state at a version, to open without replaying
 //!            (other kinds are skipped, so they can be added)
-//! snapshot = version (count, then events), document (count, items as a run),
-//!            identities, anchors
+//! snapshot = document (count, items as a run), then its accountant's
+//!            books: version (count, then events), identities, anchors,
+//!            moved blocks
 //! ```
 //!
 //! Saving appends: a chunk of the events since the last save, then a
@@ -23,9 +24,8 @@
 
 use mamre::codec::{Codec, DecodeError, get_frame, get_usize, put_frame, put_usize};
 
-use crate::anchors::Anchors;
-use crate::ids::Identities;
-use crate::oplog::{Lv, OpLog};
+use crate::accountant::Accountant;
+use crate::oplog::OpLog;
 
 const MAGIC: &[u8; 6] = b"MAMRE\0";
 const VERSION: u8 = 1;
@@ -33,13 +33,11 @@ const CHUNK: u8 = 1;
 const SNAPSHOT: u8 = 2;
 
 /// The state of a document at a version: what opening it needs, beside
-/// the history.
+/// the history. The version is the accountant's.
 #[derive(Clone)]
 pub struct Snapshot<T> {
-    pub version: Vec<Lv>,
     pub doc: Vec<T>,
-    pub ids: Identities,
-    pub anchors: Anchors,
+    pub accountant: Accountant,
 }
 
 /// What loading a file found.
@@ -47,7 +45,7 @@ pub struct Loaded<T> {
     pub log: OpLog<T>,
     /// The last snapshot, if there was one. It may be of an older version
     /// than the log, if the last save was cut off after its chunk: bring it
-    /// up to date with [`OpLog::changes_with`].
+    /// up to date with [`Accountant::merge`].
     pub snapshot: Option<Snapshot<T>>,
     /// How many bytes were good. A save after a crash appends from here.
     pub good: usize,
@@ -72,16 +70,15 @@ pub fn create() -> Vec<u8> {
 }
 
 /// Appends a save to `file`: the log's events from `saved` on (the first
-/// save of a file passes 0), then the snapshot. Returns how many events the
+/// save of a file passes 0), then the snapshot: the document, at its
+/// accountant's version, and the accountant. Returns how many events the
 /// file now holds: the next save's `saved`.
 pub fn save<T: Clone + Codec>(
     file: &mut Vec<u8>,
     log: &OpLog<T>,
     saved: usize,
-    version: &[Lv],
     doc: &[T],
-    ids: &Identities,
-    anchors: &Anchors,
+    accountant: &Accountant,
 ) -> usize {
     if saved < log.len() {
         let mut body = Vec::new();
@@ -89,14 +86,9 @@ pub fn save<T: Clone + Codec>(
         record(file, CHUNK, &body);
     }
     let mut body = Vec::new();
-    put_usize(&mut body, version.len());
-    for &lv in version {
-        put_usize(&mut body, lv);
-    }
     put_usize(&mut body, doc.len());
     T::encode_run(doc, &mut body);
-    ids.encode(&mut body);
-    anchors.encode(&mut body);
+    accountant.encode(&mut body);
     record(file, SNAPSHOT, &body);
     log.len()
 }
@@ -154,32 +146,16 @@ fn read_record<T: Clone + Codec>(
         }
         SNAPSHOT => {
             let mut input = body;
-            let events = log.len();
-            let n = get_usize(&mut input)?;
-            let mut version = Vec::with_capacity(n.min(input.len()));
-            for _ in 0..n {
-                let lv = get_usize(&mut input)?;
-                if lv >= events {
-                    return Err(DecodeError::Invalid("a version this log doesn't have"));
-                }
-                version.push(lv);
-            }
             let n = get_usize(&mut input)?;
             let doc = T::decode_run(n, &mut input)?;
-            let ids = Identities::decode(&mut input, events)?;
-            let anchors = Anchors::decode(&mut input, events)?;
+            let accountant = Accountant::decode(&mut input, log.len())?;
+            if accountant.len() != doc.len() {
+                return Err(DecodeError::Invalid("books for another document"));
+            }
             if !input.is_empty() {
                 return Err(DecodeError::Invalid("bytes after the snapshot"));
             }
-            Ok((
-                total,
-                Some(Snapshot {
-                    version,
-                    doc,
-                    ids,
-                    anchors,
-                }),
-            ))
+            Ok((total, Some(Snapshot { doc, accountant })))
         }
         // A kind a later version added: skipped whole.
         _ => Ok((total, None)),
