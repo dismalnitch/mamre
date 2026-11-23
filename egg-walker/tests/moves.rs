@@ -588,3 +588,90 @@ proptest! {
         }
     }
 }
+
+// ---- Regressions: histories that once made the walk and the reference disagree ----
+
+/// Every pair of `versions`: the simple walk's changes make the
+/// reference's merged document, characters and identities.
+fn merges_agree(log: &OpLog<char>, versions: &[Vec<Lv>]) {
+    for from in versions {
+        for to in versions {
+            let mut doc = reference::checkout(log, from);
+            let mut ids = reference::identities(log, from);
+            apply(&log.changes_simple(from, to), &mut doc, &mut ids);
+            let both = log.union(from, to);
+            assert_eq!(
+                doc,
+                reference::checkout(log, &both),
+                "from {from:?} to {to:?}"
+            );
+            assert_eq!(
+                ids,
+                reference::identities(log, &both),
+                "from {from:?} to {to:?}"
+            );
+        }
+    }
+}
+
+/// Two moved blocks starting at the same item, one inside the other:
+/// finding the next element must stop at the outer block's start.
+#[test]
+fn nested_blocks_sharing_a_start() {
+    let mut log: OpLog<char> = OpLog::new();
+    let (a, b, c) = (log.agent("a"), log.agent("b"), log.agent("c"));
+    let v1 = log.add_insert(b, &[], 0, ['a']);
+    let v0 = log.add_insert(a, &[], 0, ['a']);
+    let v1 = log.add_insert(b, &v1, 1, ['a']);
+    let v0 = log.union(&v0, &v1);
+    let v0 = log.add_insert(a, &v0, 2, ['a']);
+    let v1 = log.add_insert(b, &v1, 0, ['a']);
+    let v1 = log.add_insert(b, &v1, 0, ['a']);
+    let v2 = log.add_insert(c, &[], 0, ['a']);
+    let v0 = log.add_move(a, &v0, 0..2, 3);
+    let v0 = log.add_move(a, &v0, 0..1, 2);
+    let v0 = log.add_move(a, &v0, 0..1, 4);
+    let v0 = log.add_insert(a, &v0, 0, ['u']);
+    merges_agree(&log, &[v0, v1, v2]);
+}
+
+/// A move whose range starts inside a moved block and ends outside it:
+/// splitting out one end mustn't lose track of the other.
+#[test]
+fn a_moves_ends_are_found_by_id() {
+    let mut log: OpLog<char> = OpLog::new();
+    let (a, c) = (log.agent("a"), log.agent("c"));
+    let mut v = Vec::new();
+    for _ in 0..4 {
+        v = log.add_insert(a, &v, 0, ['a']);
+    }
+    let v = log.add_move(a, &v, 0..2, 0);
+    let mine = log.add_insert(a, &v, 0, ['a']);
+    let theirs = log.add_move(c, &v, 3..4, 0);
+    let theirs = log.add_move(c, &theirs, 0..2, 3);
+    merges_agree(&log, &[mine, theirs]);
+}
+
+/// Typing at the end of a moved block whose last item was deleted: inside
+/// or out is decided by what shows, so the base (which keeps no tombstones)
+/// decides it the same way.
+#[test]
+fn a_blocks_edge_is_decided_by_what_shows() {
+    let mut log: OpLog<char> = OpLog::new();
+    let (a, c) = (log.agent("a"), log.agent("c"));
+    let c0 = log.add_insert(c, &[], 0, ['a']);
+    let a1 = log.add_insert(a, &[], 0, ['a']);
+    let a2 = log.add_insert(a, &a1, 0, ['a']);
+    let a3 = log.add_insert(a, &a2, 0, ['a']);
+    let c4 = log.add_insert(c, &c0, 0, ['a']);
+    let c5 = log.add_insert(c, &c4, 0, ['a']);
+    let a6 = log.add_insert(a, &a3, 0, ['a']);
+    let c7 = log.add_insert(c, &c5, 0, ['a']);
+    let a8 = log.add_insert(a, &a6, 0, ['a']);
+    let c9 = log.add_move(c, &c7, 0..3, 4);
+    let both = log.union(&a8, &c9);
+    let a10 = log.add_delete(a, &both, 8..9);
+    let c11 = log.add_insert(c, &a10, 8, ['a']);
+    let a12 = log.add_move(a, &a10, 1..8, 0);
+    merges_agree(&log, &[a12, c11]);
+}
