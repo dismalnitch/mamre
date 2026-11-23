@@ -186,6 +186,8 @@ enum Edit {
         prop::sample::Index,
         prop::sample::Index,
     ),
+    /// Undo one of the deletes this writer's version holds.
+    Undo(prop::sample::Index),
 }
 
 fn edits() -> impl Strategy<Value = Vec<Edit>> {
@@ -225,6 +227,8 @@ proptest! {
                     v = log.add_delete(me, &v, pos..pos + 1);
                     tree.delete(pos);
                 }
+                // The tree model has no undo.
+                Edit::Undo(_) => continue,
                 Edit::Move(a, b, t) => {
                     if len == 0 {
                         continue;
@@ -262,6 +266,10 @@ fn actions() -> impl Strategy<Value = Vec<Action>> {
         1 => any::<prop::sample::Index>().prop_map(Edit::Delete),
         3 => (any::<prop::sample::Index>(), any::<prop::sample::Index>(), any::<prop::sample::Index>())
             .prop_map(|(a, b, t)| Edit::Move(a, b, t)),
+    ];
+    let edit = prop_oneof![
+        8 => edit,
+        1 => any::<prop::sample::Index>().prop_map(Edit::Undo),
     ];
     let action = prop_oneof![
         4 => (0..3usize, edit).prop_map(|(w, e)| Action::Edit(w, e)),
@@ -553,6 +561,21 @@ fn history(actions: Vec<Action>) -> (OpLog<char>, Vec<Vec<Lv>>) {
                         }
                         log.add_move(agent, &v, a..b, to)
                     }
+                    Edit::Undo(k) => {
+                        let deletes: Vec<Lv> = (0..log.len())
+                            .filter(|&lv| {
+                                log.contains(&v, lv)
+                                    && matches!(
+                                        log.event(lv).op,
+                                        mamre_egg_walker::Op::Delete { .. }
+                                    )
+                            })
+                            .collect();
+                        if deletes.is_empty() {
+                            continue;
+                        }
+                        log.add_undelete(agent, &v, [deletes[k.index(deletes.len())]])
+                    }
                     _ => continue,
                 };
             }
@@ -747,4 +770,90 @@ fn a_move_whose_end_is_deleted_meanwhile() {
         c.apply(&mut doc);
     }
     assert_eq!(doc.iter().collect::<String>(), "GHABCD");
+}
+
+// ---- The middle of a moved block, while it moves ----
+
+/// Both merge orders, and the merged version, show `want`.
+fn settles(log: &OpLog<char>, a: &[Lv], b: &[Lv], want: &str) {
+    assert_eq!(text_at(log, &merged(log, a, b)), want, "merged");
+    for (from, to) in [(a, b), (b, a)] {
+        let mut doc = reference::checkout(log, from);
+        for c in log.changes(from, to) {
+            c.apply(&mut doc);
+        }
+        assert_eq!(doc.iter().collect::<String>(), want, "from {from:?}");
+    }
+}
+
+/// Deleting in the middle: hidden wherever the block goes.
+#[test]
+fn a_delete_in_the_middle() {
+    let mut log = OpLog::new();
+    let base = typed(&mut log, "u", "ABCDEFGH");
+    let (u1, u2) = (log.agent("u1"), log.agent("u2"));
+    let moved = log.add_move(u1, &base, 0..6, 8);
+    let deleted = log.add_delete(u2, &base, 2..4);
+    settles(&log, &moved, &deleted, "GHABEF");
+}
+
+/// Undoing a delete in the middle, after the block moved: the same item
+/// comes back, inside the block, at its new place.
+#[test]
+fn an_undo_in_the_middle() {
+    let mut log = OpLog::new();
+    let base = typed(&mut log, "u", "ABCDEFGH");
+    let (u1, u2) = (log.agent("u1"), log.agent("u2"));
+    let deleted = log.add_delete(u2, &base, 2..3);
+    let moved = log.add_move(u1, &deleted, 0..5, 7);
+    assert_eq!(text_at(&log, &moved), "GHABDEF");
+    let undone = log.add_undelete(u2, &deleted, [deleted[0]]);
+    assert_eq!(text_at(&log, &undone), "ABCDEFGH");
+    settles(&log, &moved, &undone, "GHABCDEF");
+}
+
+/// Moving part of the middle out, while the whole moves: both happen. The
+/// block goes, without the part, and the part goes where it was sent.
+#[test]
+fn a_part_moved_out_of_the_middle() {
+    let mut log = OpLog::new();
+    let base = typed(&mut log, "u", "ABCDEFGH");
+    let (u1, u2) = (log.agent("u1"), log.agent("u2"));
+    let whole = log.add_move(u1, &base, 0..6, 8);
+    let part = log.add_move(u2, &base, 2..4, 0);
+    assert_eq!(text_at(&log, &whole), "GHABCDEF");
+    assert_eq!(text_at(&log, &part), "CDABEFGH");
+    settles(&log, &whole, &part, "CDGHABEF");
+}
+
+/// Moving something into the middle, while the block moves: it lands
+/// inside, and goes with the block.
+#[test]
+fn something_moved_into_the_middle() {
+    let mut log = OpLog::new();
+    let base = typed(&mut log, "u", "ABCDEFGH");
+    let (u1, u2) = (log.agent("u1"), log.agent("u2"));
+    let block = log.add_move(u1, &base, 0..4, 8);
+    let into = log.add_move(u2, &base, 6..8, 2);
+    assert_eq!(text_at(&log, &block), "EFGHABCD");
+    assert_eq!(text_at(&log, &into), "ABGHCDEF");
+    settles(&log, &block, &into, "EFABGHCD");
+}
+
+/// Deleting everything in the middle, then typing where it was: nothing
+/// shows inside the block, so the typing is outside it. When the block
+/// moves, it goes without the typing.
+#[test]
+fn an_emptied_block_takes_no_typing() {
+    let mut log = OpLog::new();
+    let base = typed(&mut log, "u", "ABCDEFGH");
+    let u1 = log.agent("u1");
+    let first = log.add_move(u1, &base, 2..4, 8);
+    assert_eq!(text_at(&log, &first), "ABEFGHCD");
+    let emptied = log.add_delete(u1, &first, 6..8);
+    let typed_there = log.add_insert(u1, &emptied, 6, "xy".chars());
+    assert_eq!(text_at(&log, &typed_there), "ABEFGHxy");
+    // Moving "the block" again moves nothing visible; "xy" stays.
+    let again = log.add_move(u1, &typed_there, 0..2, 8);
+    assert_eq!(text_at(&log, &again), "EFGHxyAB");
 }
