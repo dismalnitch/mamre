@@ -11,9 +11,11 @@
 //! the document there too. That's the whole contract: changes out, books
 //! kept.
 //!
-//! A local edit is an event like any other: add it to the log at the
-//! accountant's version, and merge it. The changes are the edit itself, so
-//! a document that already made it can skip them.
+//! A local edit is an event like any other, made at the accountant's
+//! version: the document makes the edit itself, adds the event to the log,
+//! and [`record`](Accountant::record)s it, which keeps the books without
+//! handing the edit back. Everything from elsewhere is
+//! [`merge`](Accountant::merge)d, and its changes applied.
 
 use mamre::codec::{DecodeError, get_usize, put_usize};
 
@@ -123,6 +125,29 @@ impl Accountant {
         }
         self.version = to;
         out
+    }
+
+    /// Records events the document has already made: local edits, added to
+    /// the log at [`version`](Self::version). The books come up to date,
+    /// and nothing is handed back, so the edit isn't made twice. For
+    /// anything from elsewhere, use [`merge`](Self::merge).
+    ///
+    /// ```
+    /// use mamre_egg_walker::{Accountant, OpLog};
+    ///
+    /// let mut log = OpLog::new();
+    /// let me = log.agent("me");
+    /// let mut books = Accountant::new();
+    /// let mut doc = String::new();
+    ///
+    /// // The user types: the document has it already.
+    /// doc.insert_str(0, "hello");
+    /// let v = log.add_insert(me, books.version(), 0, "hello".chars());
+    /// books.record(&log, &v);
+    /// assert_eq!(books.len(), doc.chars().count());
+    /// ```
+    pub fn record<T: Clone>(&mut self, log: &OpLog<T>, to: &[Lv]) {
+        self.merge(log, to);
     }
 
     /// Appends the books' bytes: the version, the identities, the anchors,

@@ -73,8 +73,13 @@ fn act(reps: &mut [Replica], act: &Act, next: &mut u32) {
                 })
                 .collect();
             *next += n as u32;
-            let v = rep.log.add_insert(agent, rep.books.version(), pos, items);
-            advance(rep, &v);
+            // A local edit: made on the document, then recorded.
+            let v = rep
+                .log
+                .add_insert(agent, rep.books.version(), pos, items.clone());
+            rep.doc.splice(pos..pos, items);
+            rep.books.record(&rep.log, &v);
+            assert_eq!(rep.books.len(), rep.doc.len());
         }
         Act::Delete { r, a, b } => {
             let rep = &mut reps[r];
@@ -82,8 +87,11 @@ fn act(reps: &mut [Replica], act: &Act, next: &mut u32) {
             let range = a.min(b)..a.max(b);
             if !range.is_empty() {
                 let agent = rep.log.agent(&rep.name.clone());
-                let v = rep.log.add_delete(agent, rep.books.version(), range);
-                advance(rep, &v);
+                let v = rep
+                    .log
+                    .add_delete(agent, rep.books.version(), range.clone());
+                rep.doc.drain(range);
+                rep.books.record(&rep.log, &v);
             }
         }
         Act::Undo { r, pick } => {
@@ -211,7 +219,7 @@ fn run(acts: &[Act]) -> (Vec<u8>, Vec<(usize, usize, State, Events)>) {
         act(&mut reps, a, &mut next);
         if let Act::Save = a {
             let r = &reps[0];
-            saved = file::save(&mut bytes, &r.log, saved, &r.doc, &r.books);
+            saved = file::save(&mut bytes, &r.log, saved, r.doc.iter().copied(), &r.books);
             saves.push((
                 bytes.len(),
                 saved,

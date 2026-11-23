@@ -70,16 +70,19 @@ pub fn create() -> Vec<u8> {
 }
 
 /// Appends a save to `file`: the log's events from `saved` on (the first
-/// save of a file passes 0), then the snapshot: the document, at its
-/// accountant's version, and the accountant. Returns how many events the
-/// file now holds: the next save's `saved`.
+/// save of a file passes 0), then the snapshot: the document's items, at
+/// its accountant's version, and the accountant. The items come as they
+/// come, from a rope's iterator, say, so no document needs to be a slice.
+/// Returns how many events the file now holds: the next save's `saved`.
 pub fn save<T: Clone + Codec>(
     file: &mut Vec<u8>,
     log: &OpLog<T>,
     saved: usize,
-    doc: &[T],
+    doc: impl IntoIterator<Item = T>,
     accountant: &Accountant,
 ) -> usize {
+    let doc: Vec<T> = doc.into_iter().collect();
+    debug_assert_eq!(doc.len(), accountant.len(), "the books are the document's");
     if saved < log.len() {
         let mut body = Vec::new();
         log.encode_chunk(saved..log.len(), &mut body);
@@ -87,7 +90,7 @@ pub fn save<T: Clone + Codec>(
     }
     let mut body = Vec::new();
     put_usize(&mut body, doc.len());
-    T::encode_run(doc, &mut body);
+    T::encode_run(&doc, &mut body);
     accountant.encode(&mut body);
     record(file, SNAPSHOT, &body);
     log.len()
