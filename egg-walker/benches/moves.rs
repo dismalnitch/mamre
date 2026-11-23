@@ -39,11 +39,7 @@ fn book(chars: usize, moves: usize) -> (OpLog<char>, Vec<Lv>) {
     let mut len = 0;
     let paragraph: String = "a".repeat(79) + "\n";
     let paragraphs = chars / 80;
-    let every = if moves == 0 {
-        usize::MAX
-    } else {
-        (paragraphs / moves).max(1)
-    };
+    let every = paragraphs.checked_div(moves).map_or(usize::MAX, |n| n.max(1));
     for p in 0..paragraphs {
         // Somewhere at a paragraph's start.
         let at = 80 * rng.next(len / 80 + 1);
