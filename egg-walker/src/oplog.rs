@@ -27,6 +27,7 @@ pub(crate) enum Kind {
     Delete,
     Undelete,
     Move,
+    Mark,
 }
 
 /// A local version: an event's number in this log. Parents always have
@@ -60,6 +61,10 @@ pub enum Op<T> {
     /// the same items, somewhere else. See `reference.rs` for what a move
     /// does when others edit or move at the same time.
     Move { pos: usize, len: usize, to: usize },
+    /// Marks the item at `pos` as starting a section at `level`; level 0
+    /// unmarks it. The mark is the item's, wherever it goes; the latest
+    /// mark of an item wins (see `reference.rs`).
+    Mark { pos: usize, level: u8 },
 }
 
 /// One event, as a log hands it out.
@@ -97,6 +102,8 @@ pub(crate) enum RunOp<T> {
     Undelete { target: Lv, len: usize },
     /// One move: moves don't run together.
     Move { pos: usize, len: usize, to: usize },
+    /// One mark: marks don't run together either.
+    Mark { pos: usize, level: u8 },
 }
 
 impl<T> Run<T> {
@@ -104,7 +111,7 @@ impl<T> Run<T> {
         match &self.op {
             RunOp::Insert { items, .. } => items.len(),
             RunOp::Delete { len, .. } | RunOp::Undelete { len, .. } => *len,
-            RunOp::Move { .. } => 1,
+            RunOp::Move { .. } | RunOp::Mark { .. } => 1,
         }
     }
 
@@ -178,7 +185,10 @@ impl<T: Clone> OpLog<T> {
         let k = first - run.start;
         match &run.op {
             RunOp::Insert { items, .. } => items.get(k..k + len),
-            RunOp::Delete { .. } | RunOp::Undelete { .. } | RunOp::Move { .. } => None,
+            RunOp::Delete { .. }
+            | RunOp::Undelete { .. }
+            | RunOp::Move { .. }
+            | RunOp::Mark { .. } => None,
         }
     }
 
@@ -194,6 +204,7 @@ impl<T: Clone> OpLog<T> {
             RunOp::Delete { pos, .. } => Op::Delete { pos: *pos },
             RunOp::Undelete { target, .. } => Op::Undelete { target: target + k },
             &RunOp::Move { pos, len, to } => Op::Move { pos, len, to },
+            &RunOp::Mark { pos, level } => Op::Mark { pos, level },
         }
     }
 
@@ -270,6 +281,15 @@ impl<T: Clone> OpLog<T> {
             len: range.len(),
             to,
         };
+        vec![self.push(agent, seq, normalize(parents.to_vec()), op)]
+    }
+
+    /// Marks the item at `pos` as starting a section at `level` (0 to
+    /// unmark), in a document at `parents`, as `agent`. Returns the version
+    /// after.
+    pub fn add_mark(&mut self, agent: AgentId, parents: &[Lv], pos: usize, level: u8) -> Vec<Lv> {
+        let seq = self.next_seq[agent.0 as usize];
+        let op = Op::Mark { pos, level };
         vec![self.push(agent, seq, normalize(parents.to_vec()), op)]
     }
 
@@ -399,6 +419,7 @@ impl<T: Clone> OpLog<T> {
                     Op::Delete { pos } => RunOp::Delete { pos, len: 1 },
                     Op::Undelete { target } => RunOp::Undelete { target, len: 1 },
                     Op::Move { pos, len, to } => RunOp::Move { pos, len, to },
+                    Op::Mark { pos, level } => RunOp::Mark { pos, level },
                 },
             });
             self.spans[agent.0 as usize].insert(seq, (lv, 1));
@@ -423,7 +444,7 @@ impl<T> OpLog<T> {
         let len = match &op {
             RunOp::Insert { items, .. } => items.len(),
             RunOp::Delete { len, .. } => *len,
-            RunOp::Move { .. } => 1,
+            RunOp::Move { .. } | RunOp::Mark { .. } => 1,
             RunOp::Undelete { .. } => unreachable!("undeletes go one at a time"),
         };
         debug_assert!(len > 0 && parents.iter().all(|&p| p < lv));
@@ -583,6 +604,7 @@ impl<T> OpLog<T> {
             RunOp::Delete { .. } => Kind::Delete,
             RunOp::Undelete { .. } => Kind::Undelete,
             RunOp::Move { .. } => Kind::Move,
+            RunOp::Mark { .. } => Kind::Mark,
         }
     }
 

@@ -80,6 +80,14 @@ pub enum Change<'a, T> {
     /// text. They're the same items, somewhere else: anything keyed to
     /// them goes with them.
     Move { range: Range<usize>, to: usize },
+    /// Item `item` now starts a section at `level` (0: no section). It's at
+    /// `pos`, if it shows. The document's items don't change: this is for
+    /// whatever keeps its outline (see [`Accountant`](crate::Accountant)).
+    Mark {
+        item: Lv,
+        pos: Option<usize>,
+        level: u8,
+    },
 }
 
 impl<T> Clone for Change<'_, T> {
@@ -96,6 +104,11 @@ impl<T> Clone for Change<'_, T> {
             Change::Move { range, to } => Change::Move {
                 range: range.clone(),
                 to: *to,
+            },
+            Change::Mark { item, pos, level } => Change::Mark {
+                item: *item,
+                pos: *pos,
+                level: *level,
             },
         }
     }
@@ -144,6 +157,8 @@ impl<T> Change<'_, T> {
             Change::Insert { pos, items, .. } => doc.insert(*pos, items),
             Change::Delete { range } => doc.delete(range.clone()),
             Change::Move { range, to } => doc.move_range(range.clone(), *to),
+            // A mark changes no items.
+            Change::Mark { .. } => {}
         }
     }
 }
@@ -207,6 +222,11 @@ impl<'a, T: Clone> Changes<'a, T> {
             items,
             first: lv,
         });
+    }
+
+    /// Item `item`, at `pos` if it shows, starts a section at `level`.
+    pub(crate) fn mark(&mut self, item: Lv, pos: Option<usize>, level: u8) {
+        self.out.push(Change::Mark { item, pos, level });
     }
 
     /// The items in `range` move to `to`.
@@ -424,6 +444,10 @@ struct Walk<'a, T> {
     checkouts: usize,
     /// Nothing has touched the records since they were made.
     fresh: bool,
+    /// Each marked item's winning mark among those replayed, by the order
+    /// marks are decided in. One from before the base always loses: it's
+    /// earlier in Lamport time than anything replayed.
+    marks: HashMap<usize, (u64, (&'a str, u64))>,
 }
 
 impl<T: Clone> OpLog<T> {
@@ -515,10 +539,14 @@ impl<T: Clone> OpLog<T> {
         let undoes = new
             .iter()
             .any(|span| self.kind(span.start) == Kind::Undelete);
+        // A mark's change names its item, so marks need identities kept.
+        let marks = self.has_marks();
         if let Some(known) = known {
             out.ids = Some(known.ids.clone());
-        } else if from.is_empty() && (keep_ids || undoes) {
+        } else if from.is_empty() && (keep_ids || undoes || marks) {
             out.ids = Some(Ids::default());
+        } else if marks {
+            out.ids = Some(self.ids_at(from));
         }
         if new.is_empty() {
             return (out, Stats::default());
@@ -576,7 +604,13 @@ impl<T: Clone> OpLog<T> {
                                 out.delete_run(pos, n)
                             }
                             Op::Undelete { .. } => unreachable!("an undelete is never critical"),
-                            Op::Move { .. } => unimplemented!("moves aren't in the walk yet"),
+                            Op::Move { .. } => {
+                                unreachable!("a log with moves takes the moves path")
+                            }
+                            Op::Mark { pos, level } => {
+                                let item = out.ids.as_ref().expect("kept for marks").get(pos);
+                                out.mark(item, Some(pos), level);
+                            }
                         }
                     }
                     let last = lv + n - 1;
@@ -622,6 +656,13 @@ impl<T: Clone> OpLog<T> {
         (out, stats)
     }
 
+    /// Whether any event is a mark.
+    fn has_marks(&self) -> bool {
+        self.runs
+            .iter()
+            .any(|run| matches!(run.op, crate::oplog::RunOp::Mark { .. }))
+    }
+
     /// Whether any event is a move: if not, the walk needn't know about
     /// blocks at all.
     fn has_moves(&self) -> bool {
@@ -646,10 +687,13 @@ impl<T: Clone> OpLog<T> {
     ) -> (Changes<'_, T>, Stats) {
         let mut out = Changes::new(self);
         let (old, new, base) = self.conflict(from, to);
+        let marks = self.has_marks();
         if let Some(known) = known {
             out.ids = Some(known.ids.clone());
-        } else if from.is_empty() && keep_ids {
+        } else if from.is_empty() && (keep_ids || marks) {
             out.ids = Some(Ids::default());
+        } else if marks {
+            out.ids = Some(self.ids_at(from));
         }
         // The document the changes make: its blocks, as it goes.
         let mut blocks = match known_blocks {
@@ -740,6 +784,10 @@ impl<T: Clone> OpLog<T> {
                 blocks.delete(pos..pos + n);
             }
             Op::Undelete { .. } => unreachable!("an undelete is never critical"),
+            Op::Mark { pos, level } => {
+                let item = out.ids.as_ref().expect("kept for marks").get(pos);
+                out.mark(item, Some(pos), level);
+            }
             Op::Move { pos, len, to } => {
                 debug_assert_eq!(n, 1, "moves don't run");
                 if blocks.apply_move(lv, pos..pos + len, to) {
@@ -885,6 +933,7 @@ impl<'a, T: Clone> Walk<'a, T> {
             stepped: 0,
             checkouts: 0,
             fresh: true,
+            marks: HashMap::new(),
         }
     }
 }
@@ -909,7 +958,8 @@ impl<'a, T: Clone> Walk<'a, T> {
             Op::Insert { pos, .. } => self.insert(lv, pos, out),
             Op::Delete { pos } => self.delete(lv, pos, out),
             Op::Undelete { target } => self.undelete(target, out),
-            Op::Move { .. } => unimplemented!("moves aren't in the walk yet"),
+            Op::Move { .. } => unreachable!("a log with moves takes the moves path"),
+            Op::Mark { pos, level } => self.mark(lv, pos, level, out),
         }
         self.prepared = vec![lv];
     }
@@ -934,7 +984,7 @@ impl<'a, T: Clone> Walk<'a, T> {
                 true
             }
             // One at a time.
-            Kind::Undelete | Kind::Move => false,
+            Kind::Undelete | Kind::Move | Kind::Mark => false,
         };
         if done {
             self.replayed += n - 1;
@@ -1065,6 +1115,11 @@ impl<'a, T: Clone> Walk<'a, T> {
             let kind = self.log.kind(events[i]);
             if kind == Kind::Undelete {
                 self.shift_undelete(events[i], forward);
+                i += 1;
+                continue;
+            }
+            // A mark shows nothing and hides nothing.
+            if kind == Kind::Mark {
                 i += 1;
                 continue;
             }
@@ -1383,6 +1438,23 @@ impl<'a, T: Clone> Walk<'a, T> {
         // nothing more to do to the document.
         if !was_dead && let Some(out) = out {
             out.delete(self.effect_pos(&key, id));
+        }
+    }
+
+    /// A mark of the item at `pos`: it wins if it's the latest of the item's
+    /// marks so far.
+    fn mark(&mut self, lv: Lv, pos: usize, level: u8, out: Option<&mut Changes<'a, T>>) {
+        let (key, id) = self.prepared_item(pos, true);
+        let me = (self.log.lamport(lv), self.log.order_key(lv));
+        if self.marks.get(&id).is_some_and(|won| *won > me) {
+            return;
+        }
+        self.marks.insert(id, me);
+        if let Some(out) = out {
+            let item = self.identity(id);
+            let (record, _) = self.record_at(&key);
+            let pos = (record.dead == 0).then(|| self.effect_pos(&key, id));
+            out.mark(item, pos, level);
         }
     }
 
@@ -1842,7 +1914,7 @@ mod tests {
             .iter()
             .map(|c| match c {
                 Change::Insert { items, .. } => items.len(),
-                Change::Delete { .. } | Change::Move { .. } => 0,
+                Change::Delete { .. } | Change::Move { .. } | Change::Mark { .. } => 0,
             })
             .sum();
         assert_eq!(items, len);

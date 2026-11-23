@@ -188,6 +188,8 @@ enum Edit {
     ),
     /// Undo one of the deletes this writer's version holds.
     Undo(prop::sample::Index),
+    /// Mark the item there at a level (0 unmarks).
+    Mark(prop::sample::Index, u8),
 }
 
 fn edits() -> impl Strategy<Value = Vec<Edit>> {
@@ -227,6 +229,8 @@ proptest! {
                     v = log.add_delete(me, &v, pos..pos + 1);
                     tree.delete(pos);
                 }
+                // Nor marks.
+                Edit::Mark(..) => continue,
                 // The tree model has no undo.
                 Edit::Undo(_) => continue,
                 Edit::Move(a, b, t) => {
@@ -270,6 +274,7 @@ fn actions() -> impl Strategy<Value = Vec<Action>> {
     let edit = prop_oneof![
         8 => edit,
         1 => any::<prop::sample::Index>().prop_map(Edit::Undo),
+        2 => (any::<prop::sample::Index>(), 0u8..4).prop_map(|(p, l)| Edit::Mark(p, l)),
     ];
     let action = prop_oneof![
         4 => (0..3usize, edit).prop_map(|(w, e)| Action::Edit(w, e)),
@@ -505,6 +510,7 @@ fn apply(changes: &[mamre_egg_walker::Change<'_, char>], doc: &mut Vec<char>, id
             Change::Delete { range } => {
                 ids.drain(range.clone());
             }
+            Change::Mark { .. } => {}
             Change::Move { range, to } => {
                 let moved: Vec<Lv> = ids.drain(range.clone()).collect();
                 let at = if *to > range.start {
@@ -515,6 +521,35 @@ fn apply(changes: &[mamre_egg_walker::Change<'_, char>], doc: &mut Vec<char>, id
                 ids.splice(at..at, moved);
             }
         }
+    }
+}
+
+/// Applies the mark changes among `changes` to `levels`, checking each
+/// position names its item in the document as changed so far.
+fn apply_marks(
+    changes: &[mamre_egg_walker::Change<'_, char>],
+    ids: &mut Vec<Lv>,
+    levels: &mut std::collections::BTreeMap<Lv, u8>,
+) {
+    use mamre_egg_walker::Change;
+    let mut doc: Vec<char> = vec!['?'; ids.len()];
+    for c in changes {
+        if let Change::Mark { item, pos, level } = c {
+            if let Some(p) = pos {
+                assert_eq!(ids[*p], *item, "a mark's position names its item");
+            } else {
+                assert!(
+                    !ids.contains(item),
+                    "a mark with no position is of a hidden item"
+                );
+            }
+            if *level == 0 {
+                levels.remove(item);
+            } else {
+                levels.insert(*item, *level);
+            }
+        }
+        apply(std::slice::from_ref(c), &mut doc, ids);
     }
 }
 
@@ -576,6 +611,7 @@ fn history(actions: Vec<Action>) -> (OpLog<char>, Vec<Vec<Lv>>) {
                         }
                         log.add_undelete(agent, &v, [deletes[k.index(deletes.len())]])
                     }
+                    Edit::Mark(p, level) if len > 0 => log.add_mark(agent, &v, p.index(len), level),
                     _ => continue,
                 };
             }
@@ -596,8 +632,15 @@ proptest! {
             for to in &versions {
                 let mut doc = reference::checkout(&log, from);
                 let mut ids = reference::identities(&log, from);
-                apply(&log.changes_simple(from, to), &mut doc, &mut ids);
+                let changes = log.changes_simple(from, to);
+                apply(&changes, &mut doc, &mut ids);
                 let both = log.union(from, to);
+                let mut levels = reference::levels(&log, from);
+                apply_marks(&changes, &mut reference::identities(&log, from), &mut levels);
+                prop_assert_eq!(
+                    &levels, &reference::levels(&log, &both),
+                    "levels from {:?} to {:?}, in\n{}", from, to, describe(&log)
+                );
                 prop_assert_eq!(
                     doc.iter().collect::<String>(),
                     reference::checkout(&log, &both).iter().collect::<String>(),
@@ -723,8 +766,12 @@ proptest! {
 
                 let mut doc = reference::checkout(&log, from);
                 let mut ids = reference::identities(&log, from);
-                apply(&log.changes(from, to), &mut doc, &mut ids);
+                let changes = log.changes(from, to);
+                apply(&changes, &mut doc, &mut ids);
                 prop_assert_eq!(&doc, &want, "changes {:?} to {:?}, in\n{}", from, to, describe(&log));
+                let mut levels = reference::levels(&log, from);
+                apply_marks(&changes, &mut reference::identities(&log, from), &mut levels);
+                prop_assert_eq!(&levels, &reference::levels(&log, &both), "levels {:?} to {:?}, in\n{}", from, to, describe(&log));
                 prop_assert_eq!(&ids, &want_ids, "changes {:?} to {:?}, in\n{}", from, to, describe(&log));
 
                 // A replica that keeps its identities (and so its blocks).
@@ -871,4 +918,85 @@ fn an_emptied_block_takes_no_typing() {
     // Moving "the block" again moves nothing visible; "xy" stays.
     let again = log.add_move(u1, &typed_there, 0..2, 8);
     assert_eq!(text_at(&log, &again), "EFGHxyAB");
+}
+
+// ---- Marks ----
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Marks in a log with no moves: the plain fast path, against the
+    /// reference.
+    #[test]
+    fn marks_without_moves(actions in actions()) {
+        let actions: Vec<Action> = actions
+            .into_iter()
+            .filter(|a| !matches!(a, Action::Edit(_, Edit::Move(..))))
+            .collect();
+        let (log, versions) = history(actions);
+        for from in &versions {
+            for to in &versions {
+                let both = log.union(from, to);
+                let changes = log.changes(from, to);
+                let mut doc = reference::checkout(&log, from);
+                let mut ids = reference::identities(&log, from);
+                apply(&changes, &mut doc, &mut ids);
+                prop_assert_eq!(&doc, &reference::checkout(&log, &both), "in\n{}", describe(&log));
+                let mut levels = reference::levels(&log, from);
+                apply_marks(&changes, &mut reference::identities(&log, from), &mut levels);
+                prop_assert_eq!(&levels, &reference::levels(&log, &both), "levels {:?} to {:?}, in\n{}", from, to, describe(&log));
+            }
+        }
+    }
+}
+
+/// Levels of `version`'s visible items, in order, as text: `.` for none.
+fn outline_of(log: &OpLog<char>, version: &[Lv]) -> String {
+    let levels = reference::levels(log, version);
+    reference::identities(log, version)
+        .iter()
+        .map(|id| levels.get(id).map_or('.', |l| char::from(b'0' + l)))
+        .collect()
+}
+
+/// Two writers mark the same item at once: the later mark wins, on every
+/// replica.
+#[test]
+fn concurrent_marks_keep_the_latest() {
+    let mut log = OpLog::new();
+    let base = typed(&mut log, "u", "ABCD");
+    let (a, b) = (log.agent("a"), log.agent("b"));
+    let one = log.add_mark(a, &base, 1, 1);
+    let two = log.add_mark(b, &base, 1, 2);
+    // Same Lamport time; "b" orders after "a".
+    assert_eq!(outline_of(&log, &merged(&log, &one, &two)), ".2..");
+}
+
+/// A mark is its item's: it goes where the item goes.
+#[test]
+fn a_mark_goes_with_its_item() {
+    let mut log = OpLog::new();
+    let base = typed(&mut log, "u", "ABCDEF");
+    let (a, b) = (log.agent("a"), log.agent("b"));
+    let marked = log.add_mark(a, &base, 2, 1);
+    let moved = log.add_move(b, &base, 2..4, 6);
+    let both = merged(&log, &marked, &moved);
+    assert_eq!(text_at(&log, &both), "ABEFCD");
+    assert_eq!(outline_of(&log, &both), "....1.");
+}
+
+/// Marking an item while someone deletes it: the mark stays the item's,
+/// and comes back with it when the delete is undone.
+#[test]
+fn a_mark_waits_out_a_delete() {
+    let mut log = OpLog::new();
+    let base = typed(&mut log, "u", "ABCD");
+    let (a, b) = (log.agent("a"), log.agent("b"));
+    let marked = log.add_mark(a, &base, 2, 3);
+    let deleted = log.add_delete(b, &base, 2..3);
+    let both = merged(&log, &marked, &deleted);
+    assert_eq!(text_at(&log, &both), "ABD");
+    let undone = log.add_undelete(b, &both, [deleted[0]]);
+    assert_eq!(text_at(&log, &undone), "ABCD");
+    assert_eq!(outline_of(&log, &undone), "..3.");
 }

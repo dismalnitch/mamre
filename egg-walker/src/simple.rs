@@ -125,6 +125,8 @@ struct Walk<'a, T> {
     base: Vec<bool>,
     /// The moves that do something, in the order activity is decided in.
     moves: Vec<Moved>,
+    /// Each marked record's winning mark among those replayed.
+    marks: HashMap<usize, (u64, (&'a str, u64))>,
 }
 
 /// Where the base items' identities come from: the reference (the oracle
@@ -161,6 +163,7 @@ impl<'a, T: Clone> Window<'a, T> {
             base_ids: BaseIds::Given { frontier, ids },
             base,
             moves: Vec::new(),
+            marks: HashMap::new(),
         };
         walk.lay_base(blocks.0.clone());
         Window(walk)
@@ -228,6 +231,7 @@ impl<T: Clone> OpLog<T> {
             base_ids: BaseIds::Reference(None),
             base: base.clone(),
             moves: Vec::new(),
+            marks: HashMap::new(),
         };
         walk.lay_base(crate::reference::blocks(self, &base));
         // First what the document already holds past the base, to set up
@@ -356,6 +360,7 @@ impl<'a, T: Clone> Walk<'a, T> {
             Op::Delete { pos } => self.delete(lv, *pos, out),
             Op::Undelete { target } => self.undelete(*target, out),
             &Op::Move { pos, len, to } => self.move_(lv, pos, len, to, out),
+            &Op::Mark { pos, level } => self.mark(lv, pos, level, out),
         }
         self.prepared[lv] = true;
         self.effect[lv] = true;
@@ -386,6 +391,7 @@ impl<'a, T: Clone> Walk<'a, T> {
         match self.log.kind(x) {
             Kind::Undelete => return self.shift_undelete(x, false),
             Kind::Move => return self.shift_portal(x, false),
+            Kind::Mark => return,
             _ => {}
         }
         let insert = self.log.is_insert(x);
@@ -407,6 +413,7 @@ impl<'a, T: Clone> Walk<'a, T> {
         match self.log.kind(x) {
             Kind::Undelete => return self.shift_undelete(x, true),
             Kind::Move => return self.shift_portal(x, true),
+            Kind::Mark => return,
             _ => {}
         }
         let insert = self.log.is_insert(x);
@@ -858,6 +865,23 @@ impl<'a, T: Clone> Walk<'a, T> {
             out.delete(self.effect_pos(at));
         }
         self.records[at].dead += 1;
+    }
+
+    /// A mark of the item at `pos`: it wins if it's the latest of the item's
+    /// marks so far.
+    fn mark(&mut self, lv: Lv, pos: usize, level: u8, out: Option<&mut Changes<'a, T>>) {
+        let at = self.prepared_at(pos);
+        let id = self.records[at].id;
+        let me = (self.log.lamport(lv), self.log.order_key(lv));
+        if self.marks.get(&id).is_some_and(|won| *won > me) {
+            return;
+        }
+        self.marks.insert(id, me);
+        if let Some(out) = out {
+            let item = self.identity(at);
+            let pos = (self.records[at].dead == 0).then(|| self.effect_pos(at));
+            out.mark(item, pos, level);
+        }
     }
 
     // ---- Moves ----

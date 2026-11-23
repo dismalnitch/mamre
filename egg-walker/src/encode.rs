@@ -18,6 +18,7 @@
 //!             1 delete:   pos, count          (each removes the item at pos)
 //!             2 undelete: count, then each target delete, a ref
 //!             3 move:     pos, count, to   (one event: moves don't run)
+//!             4 mark:     pos, level       (one event)
 //!             (other kinds are reserved for other kinds of event)
 //! target    = varint, never 0. With no target, a run edits the document's
 //!             text, so text costs nothing for this. Other structures (ink,
@@ -62,6 +63,7 @@ const INSERT: u64 = 0;
 const DELETE: u64 = 1;
 const UNDELETE: u64 = 2;
 const MOVE: u64 = 3;
+const MARK: u64 = 4;
 
 /// A reference to an event, as read: in this chunk, or from before it.
 #[derive(Clone, Copy)]
@@ -75,6 +77,7 @@ enum RawOp<T> {
     Delete { pos: usize, len: usize },
     Undelete { targets: Vec<Ref> },
     Move { pos: usize, len: usize, to: usize },
+    Mark { pos: usize, level: u8 },
 }
 
 struct RawRun<T> {
@@ -90,7 +93,7 @@ impl<T> RawRun<T> {
             RawOp::Insert { items, .. } => items.len(),
             RawOp::Delete { len, .. } => *len,
             RawOp::Undelete { targets } => targets.len(),
-            RawOp::Move { .. } => 1,
+            RawOp::Move { .. } | RawOp::Mark { .. } => 1,
         }
     }
 }
@@ -217,6 +220,11 @@ impl<T: Clone + Codec> OpLog<T> {
                     put_usize(out, *pos);
                     put_usize(out, *len);
                     put_usize(out, *to);
+                }
+                RunOp::Mark { pos, level } => {
+                    put_varint(out, MARK << 1);
+                    put_usize(out, *pos);
+                    put_usize(out, *level as usize);
                 }
             }
         }
@@ -361,6 +369,10 @@ impl<T: Clone + Codec> OpLog<T> {
                     new_kinds.push(Kind::Move);
                     PlannedOp::Run(RunOp::Move { pos, len, to })
                 }
+                RawOp::Mark { pos, level } => {
+                    new_kinds.push(Kind::Mark);
+                    PlannedOp::Run(RunOp::Mark { pos, level })
+                }
                 RawOp::Undelete { targets } => {
                     let mut resolved = Vec::with_capacity(n);
                     for &t in &targets[known..] {
@@ -478,6 +490,11 @@ impl<T: Clone + Codec> OpLog<T> {
                     pos: get_usize(input)?,
                     len: get_usize(input)?,
                     to: get_usize(input)?,
+                },
+                MARK => RawOp::Mark {
+                    pos: get_usize(input)?,
+                    level: u8::try_from(get_usize(input)?)
+                        .map_err(|_| DecodeError::Invalid("a section level past 255"))?,
                 },
                 _ => {
                     return Err(DecodeError::Invalid(

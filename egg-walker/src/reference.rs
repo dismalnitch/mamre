@@ -28,6 +28,14 @@
 //! replaces it: the later move of a block wins), or its portal would be
 //! drawn inside its own interval, a loop (dropped).
 //!
+//! # Marks
+//!
+//! A mark names an item, by position at its own version as a delete does,
+//! and gives it a level: it starts a section at that level, or (0) not.
+//! An item's level at a version is that of the latest of its marks there,
+//! in Lamport time, then the order concurrent inserts use. It's the item's,
+//! wherever the item goes, and stays while it's deleted.
+//!
 //! A move is fixed when it's made, at its own version: its interval is the
 //! elements of one frame that its range covers exactly. One that doesn't
 //! (a range cutting into a moved block), or that moves nothing, does
@@ -46,6 +54,8 @@ enum Rec<T> {
         left: Option<Lv>,
         right: Option<Lv>,
         deleted_by: Vec<Lv>,
+        /// The mark events naming it.
+        marks: Vec<Lv>,
         value: T,
     },
     /// Where move `id`'s interval is drawn.
@@ -113,6 +123,29 @@ pub(crate) fn visible_ids<T: Clone>(log: &OpLog<T>, at: &[bool]) -> Vec<Lv> {
         .iter()
         .filter(|e| e.visible)
         .map(|e| state.list[e.at].id())
+        .collect()
+}
+
+/// Each item in `version` whose level isn't 0 there, deleted or not, and
+/// its level: what an outline must hold.
+#[doc(hidden)]
+pub fn levels<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> std::collections::BTreeMap<Lv, u8> {
+    let at = log.closure(version);
+    let state = replay(log);
+    let key = |lv: Lv| (state.lamport[lv], log.order_key(lv));
+    state
+        .list
+        .iter()
+        .filter_map(|r| match r {
+            Rec::Item { id, marks, .. } if at[*id] => {
+                let latest = marks.iter().filter(|&&m| at[m]).max_by_key(|&&m| key(m))?;
+                match log.event(*latest).op {
+                    Op::Mark { level, .. } if level > 0 => Some((*id, level)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
         .collect()
 }
 
@@ -419,6 +452,7 @@ fn replay<T: Clone>(log: &OpLog<T>) -> State<'_, T> {
                     left,
                     right,
                     deleted_by: Vec::new(),
+                    marks: Vec::new(),
                     value: item.clone(),
                 };
                 state.put(lv, left, right, rec);
@@ -433,6 +467,19 @@ fn replay<T: Clone>(log: &OpLog<T>) -> State<'_, T> {
                     .at;
                 match &mut state.list[k] {
                     Rec::Item { deleted_by, .. } => deleted_by.push(lv),
+                    Rec::Portal { .. } => unreachable!("entries are items"),
+                }
+            }
+            Op::Mark { pos, .. } => {
+                let k = view
+                    .entries
+                    .iter()
+                    .filter(|e| e.visible)
+                    .nth(*pos)
+                    .expect("a mark is of an item its version shows")
+                    .at;
+                match &mut state.list[k] {
+                    Rec::Item { marks, .. } => marks.push(lv),
                     Rec::Portal { .. } => unreachable!("entries are items"),
                 }
             }
