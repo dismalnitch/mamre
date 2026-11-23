@@ -92,7 +92,8 @@ impl Tree {
             return (Vec::new(), 0);
         };
         let lp = &drawn[left].path;
-        let common = match drawn.get(left + 1) {
+        // Decided by what shows: the next visible item.
+        let common = match visible.get(pos).map(|&k| &drawn[k]) {
             None => 0,
             Some(right) => lp
                 .iter()
@@ -480,4 +481,110 @@ fn crossing_moves_drop_the_later() {
     assert_eq!(text_at(&log, &last_two_to_front), "CCC.DDD.AAA.BBB.");
     let both = merged(&log, &first_three_to_end, &last_two_to_front);
     assert_eq!(text_at(&log, &both), "DDD.AAA.BBB.CCC.");
+}
+
+// ---- The simple walk, against the reference ----
+
+/// Applies `changes` to a document and its identities.
+fn apply(changes: &[mamre_egg_walker::Change<'_, char>], doc: &mut Vec<char>, ids: &mut Vec<Lv>) {
+    use mamre_egg_walker::Change;
+    for c in changes {
+        c.apply(doc);
+        match c {
+            Change::Insert { pos, items, first } => {
+                ids.splice(*pos..*pos, *first..*first + items.len());
+            }
+            Change::Delete { range } => {
+                ids.drain(range.clone());
+            }
+            Change::Move { range, to } => {
+                let moved: Vec<Lv> = ids.drain(range.clone()).collect();
+                let at = if *to > range.start {
+                    to - range.len()
+                } else {
+                    *to
+                };
+                ids.splice(at..at, moved);
+            }
+        }
+    }
+}
+
+/// Every event in `log`, a line each: for failure messages.
+fn describe(log: &OpLog<char>) -> String {
+    (0..log.len())
+        .map(|lv| {
+            let e = log.event(lv);
+            format!(
+                "{lv}: {} {:?} after {:?}\n",
+                log.agent_name(e.agent),
+                e.op,
+                e.parents
+            )
+        })
+        .collect()
+}
+
+/// Builds a three-writer history from `actions`, returning each writer's
+/// version.
+fn history(actions: Vec<Action>) -> (OpLog<char>, Vec<Vec<Lv>>) {
+    let mut log: OpLog<char> = OpLog::new();
+    let agents: Vec<_> = ["a", "b", "c"].iter().map(|n| log.agent(n)).collect();
+    let mut versions: Vec<Vec<Lv>> = vec![Vec::new(); 3];
+    for action in actions {
+        match action {
+            Action::Merge(a, b) => versions[a] = log.union(&versions[a], &versions[b]),
+            Action::Edit(w, edit) => {
+                let v = versions[w].clone();
+                let len = reference::checkout(&log, &v).len();
+                let agent = agents[w];
+                versions[w] = match edit {
+                    Edit::Insert(p, c) => log.add_insert(agent, &v, p.index(len + 1), [c]),
+                    Edit::Delete(p) if len > 0 => {
+                        let pos = p.index(len);
+                        log.add_delete(agent, &v, pos..pos + 1)
+                    }
+                    Edit::Move(a, b, t) if len > 0 => {
+                        let (a, b) = (a.index(len), b.index(len));
+                        let (a, b) = (a.min(b), a.max(b) + 1);
+                        let to = t.index(len + 1);
+                        if to > a && to < b {
+                            continue;
+                        }
+                        log.add_move(agent, &v, a..b, to)
+                    }
+                    _ => continue,
+                };
+            }
+        }
+    }
+    (log, versions)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// From any writer's version to any other's: the simple walk's changes
+    /// make the reference's merged document, item for item.
+    #[test]
+    fn the_simple_walk_merges_like_the_reference(actions in actions()) {
+        let (log, versions) = history(actions);
+        for from in &versions {
+            for to in &versions {
+                let mut doc = reference::checkout(&log, from);
+                let mut ids = reference::identities(&log, from);
+                apply(&log.changes_simple(from, to), &mut doc, &mut ids);
+                let both = log.union(from, to);
+                prop_assert_eq!(
+                    doc.iter().collect::<String>(),
+                    reference::checkout(&log, &both).iter().collect::<String>(),
+                    "from {:?} to {:?}, in\n{}", from, to, describe(&log)
+                );
+                prop_assert_eq!(
+                    ids, reference::identities(&log, &both),
+                    "from {:?} to {:?}, in\n{}", from, to, describe(&log)
+                );
+            }
+        }
+    }
 }

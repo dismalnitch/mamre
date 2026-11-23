@@ -267,6 +267,37 @@ impl Ids {
         }
     }
 
+    /// The items in `range` move to `to` (a position before the move,
+    /// outside the range or at either end), as `Rope::move_range` moves
+    /// text.
+    pub(crate) fn move_range(&mut self, range: Range<usize>, to: usize) {
+        debug_assert!(to <= range.start || to >= range.end);
+        if range.is_empty() || to == range.start || to == range.end {
+            return;
+        }
+        // The moved runs, in order.
+        self.cut(range.start);
+        self.cut(range.end);
+        let mut moved = Vec::new();
+        let mut cursor = self.runs.cursor::<Count>();
+        cursor.seek(&Count(range.start), Bias::Right);
+        while cursor.start().0 < range.end {
+            let run = *cursor.item().expect("the range is in the document");
+            moved.push(run);
+            cursor.next();
+        }
+        self.remove(range.clone());
+        let mut at = if to > range.start {
+            to - range.len()
+        } else {
+            to
+        };
+        for run in moved {
+            self.insert(at, run.first, run.len);
+            at += run.len;
+        }
+    }
+
     /// Makes `pos` a boundary between runs.
     fn cut(&mut self, pos: usize) {
         if pos == 0 || pos >= self.len() {

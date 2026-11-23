@@ -74,6 +74,11 @@ pub enum Change<'a, T> {
     },
     /// The items in `range` go.
     Delete { range: Range<usize> },
+    /// The items in `range` move to `to`, a position in the document as it
+    /// was before the move (outside the range), as `Rope::move_range` moves
+    /// text. They're the same items, somewhere else: anything keyed to
+    /// them goes with them.
+    Move { range: Range<usize>, to: usize },
 }
 
 impl<T> Clone for Change<'_, T> {
@@ -87,6 +92,10 @@ impl<T> Clone for Change<'_, T> {
             Change::Delete { range } => Change::Delete {
                 range: range.clone(),
             },
+            Change::Move { range, to } => Change::Move {
+                range: range.clone(),
+                to: *to,
+            },
         }
     }
 }
@@ -99,6 +108,15 @@ impl<T: Clone> Change<'_, T> {
             }
             Change::Delete { range } => {
                 doc.drain(range.clone());
+            }
+            Change::Move { range, to } => {
+                let moved: Vec<T> = doc.drain(range.clone()).collect();
+                let at = if *to > range.start {
+                    to - range.len()
+                } else {
+                    *to
+                };
+                doc.splice(at..at, moved);
             }
         }
     }
@@ -159,6 +177,14 @@ impl<'a, T: Clone> Changes<'a, T> {
             items,
             first: lv,
         });
+    }
+
+    /// The items in `range` move to `to`.
+    pub(crate) fn move_range(&mut self, range: Range<usize>, to: usize) {
+        if let Some(ids) = &mut self.ids {
+            ids.move_range(range.clone(), to);
+        }
+        self.out.push(Change::Move { range, to });
     }
 
     /// The item at `pos` goes.
@@ -1625,7 +1651,7 @@ mod tests {
             .iter()
             .map(|c| match c {
                 Change::Insert { items, .. } => items.len(),
-                Change::Delete { .. } => 0,
+                Change::Delete { .. } | Change::Move { .. } => 0,
             })
             .sum();
         assert_eq!(items, len);

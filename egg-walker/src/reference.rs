@@ -34,6 +34,7 @@
 //! nothing, ever.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use crate::oplog::{Lv, Op, OpLog};
 use crate::order::{Placed, place};
@@ -112,6 +113,24 @@ pub(crate) fn visible_ids<T: Clone>(log: &OpLog<T>, at: &[bool]) -> Vec<Lv> {
         .iter()
         .filter(|e| e.visible)
         .map(|e| state.list[e.at].id())
+        .collect()
+}
+
+/// The moved blocks the document shows at `at` (a version, as a set):
+/// each active move with something visible in it, and the visible
+/// positions it covers. They nest, and come in no particular order.
+pub(crate) fn blocks<T: Clone>(log: &OpLog<T>, at: &[bool]) -> Vec<(Lv, Range<usize>)> {
+    let state = replay(log);
+    let view = state.view(at);
+    let visible: Vec<&Entry> = view.entries.iter().filter(|e| e.visible).collect();
+    view.active
+        .iter()
+        .filter_map(|(m, _, _)| {
+            let mut inside = (0..visible.len()).filter(|&k| visible[k].path.contains(&m.id));
+            let first = inside.next()?;
+            let last = inside.next_back().unwrap_or(first);
+            Some((m.id, first..last + 1))
+        })
         .collect()
 }
 
@@ -243,7 +262,7 @@ impl<T: Clone> State<'_, T> {
         &self,
         view: &View,
         frame: Option<Lv>,
-        range: std::ops::Range<usize>,
+        range: Range<usize>,
         path: &mut Vec<Lv>,
         at: &[bool],
         out: &mut Vec<Entry>,
@@ -295,11 +314,14 @@ impl<T: Clone> State<'_, T> {
             if !view.present[i] {
                 return None;
             }
-            let ours = match innermost(&view.active, i) {
-                f if f == frame => true,
-                Some(f) => view.parent(f) == frame && view.interval(f).0 == i,
-                None => false,
-            };
+            // Its own record, or where a block moved out of it starts:
+            // any block, not just the innermost here, as blocks nest and
+            // can start at the same record.
+            let ours = innermost(&view.active, i) == frame
+                || view
+                    .active
+                    .iter()
+                    .any(|(m, lo, _)| *lo == i && view.parent(m.id) == frame);
             ours.then(|| self.list[i].id())
         })
     }
@@ -312,10 +334,12 @@ impl<T: Clone> State<'_, T> {
             .collect();
         assert!(pos <= visible.len(), "position {pos} is past the end");
         let left = pos.checked_sub(1).map(|p| visible[p]);
-        let right = left.map_or(0, |k| k + 1);
+        // The frame they share is decided by what shows: the visible item
+        // after, not a tombstone, so an edge is where it looks to be.
+        let right = visible.get(pos).copied();
         let empty = Vec::new();
         let left_path = left.map_or(&empty, |k| &view.entries[k].path);
-        let right_path = view.entries.get(right).map_or(&empty, |e| &e.path);
+        let right_path = right.map_or(&empty, |k| &view.entries[k].path);
         let depth = left_path
             .iter()
             .zip(right_path)

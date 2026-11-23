@@ -102,6 +102,7 @@ fn checkout(log: &OpLog<char>) -> Rope {
                 let range = rope.char_to_offset(range.start)..rope.char_to_offset(range.end);
                 rope.remove(range);
             }
+            Change::Move { .. } => unreachable!("the editing traces have no moves"),
         }
     }
     rope
