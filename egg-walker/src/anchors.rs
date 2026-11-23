@@ -19,6 +19,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 
+use mamre::codec::{DecodeError, get_usize, put_usize};
 use mamre::cursor::Bias;
 use mamre::{Item, SeekTarget, SumTree, Summary};
 
@@ -158,6 +159,69 @@ impl Anchors {
     /// Whether `item` is watched and deleted now, waiting to come back.
     pub fn is_parked(&self, item: Lv) -> bool {
         self.parked.contains(&item)
+    }
+
+    /// Appends these anchors' bytes: the tail, each mark's item and gap in
+    /// order, and the parked items. Order keys are the tree's own, made
+    /// afresh on load.
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        put_usize(out, self.tail);
+        let marks = self.marks.items();
+        put_usize(out, marks.len());
+        for m in &marks {
+            put_usize(out, m.item);
+            put_usize(out, m.before);
+        }
+        put_usize(out, self.parked.len());
+        let mut prev = 0;
+        for &item in &self.parked {
+            put_usize(out, item - prev);
+            prev = item;
+        }
+    }
+
+    /// Reads anchors [`encode`](Self::encode) wrote, for a log of `events`
+    /// events.
+    pub(crate) fn decode(input: &mut &[u8], events: usize) -> Result<Self, DecodeError> {
+        let tail = get_usize(input)?;
+        let n = get_usize(input)?;
+        let mut anchors = Anchors {
+            tail,
+            ..Anchors::default()
+        };
+        let mut key: Option<Key> = None;
+        for _ in 0..n {
+            let item = get_usize(input)?;
+            let before = get_usize(input)?;
+            if item >= events || anchors.keys.contains_key(&item) {
+                return Err(DecodeError::Invalid(
+                    "an anchor on an item this log doesn't have",
+                ));
+            }
+            let k = Key::between(key.as_ref(), None);
+            anchors.keys.insert(item, k.clone());
+            anchors.marks.push(Mark {
+                key: k.clone(),
+                item,
+                before,
+            });
+            key = Some(k);
+        }
+        let n = get_usize(input)?;
+        let mut prev: usize = 0;
+        for _ in 0..n {
+            let item = prev
+                .checked_add(get_usize(input)?)
+                .ok_or(DecodeError::Overflow)?;
+            if item >= events {
+                return Err(DecodeError::Invalid(
+                    "an anchor on an item this log doesn't have",
+                ));
+            }
+            anchors.parked.insert(item);
+            prev = item;
+        }
+        Ok(anchors)
     }
 
     /// A change from a merge or an undo.

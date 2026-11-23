@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e4cdfcf1266b2249ffa85d9ce7a92a8c1b6875cbad2c0741d348885528355df8 # shrinks to acts = [Save, Insert { r: 0, at: 0, n: 1 }, Insert { r: 0, at: 0, n: 1 }]
+cc 5c74d125d7dc28282e0c74c102617a20d2a8a6788b9a6fafa5e240b12f322562 # shrinks to acts = [Insert { r: 1, at: 0, n: 1 }, Insert { r: 2, at: 0, n: 3 }, Sync { r: 2, from: 1 }, Sync { r: 0, from: 1 }, Insert { r: 2, at: 0, n: 1 }, Sync { r: 0, from: 2 }]
+cc fa323410adf86a5eae1462d681b157d141846aca0387b7ce4c70cdbe666908c9 # shrinks to acts = [Insert { r: 0, at: 0, n: 3 }, Delete { r: 0, a: 43690, b: 0 }]
+cc 0b8b53d618f7ec158e793241b87182c856dc0a3269e826bd80cdada5fa90be3f # shrinks to acts = [Insert { r: 0, at: 0, n: 3 }, Insert { r: 0, at: 0, n: 1 }, Delete { r: 0, a: 32768, b: 0 }]
+cc aca965c026032e0038d0712eea461e05eceecc9776b74dccd076470eeb2fef2f # shrinks to acts = [Insert { r: 0, at: 0, n: 2 }, Watch { r: 0, at: 0 }, Delete { r: 0, a: 0, b: 32768 }]
+cc 34e47935a3ff1e2f643c9375dcbba443cc39afe410415c0e6dba56b58cdb1460 # shrinks to acts = [Insert { r: 0, at: 0, n: 3 }, Insert { r: 0, at: 0, n: 3 }, Watch { r: 0, at: 26214 }, Insert { r: 0, at: 0, n: 1 }, Insert { r: 0, at: 0, n: 1 }, Delete { r: 0, a: 40960, b: 0 }]

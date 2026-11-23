@@ -64,16 +64,16 @@ pub struct Event<T> {
 /// One agent's consecutive events, each right after the last: the first
 /// has `parents`, every other has the one before it.
 #[derive(Clone, Debug)]
-struct Run<T> {
-    agent: AgentId,
-    seq: u64,
-    start: Lv,
-    parents: Vec<Lv>,
-    op: RunOp<T>,
+pub(crate) struct Run<T> {
+    pub(crate) agent: AgentId,
+    pub(crate) seq: u64,
+    pub(crate) start: Lv,
+    pub(crate) parents: Vec<Lv>,
+    pub(crate) op: RunOp<T>,
 }
 
 #[derive(Clone, Debug)]
-enum RunOp<T> {
+pub(crate) enum RunOp<T> {
     /// Item `k` goes in at `pos + k`: typing forward.
     Insert { pos: usize, items: Vec<T> },
     /// `len` items each removed at `pos`: deleting forward.
@@ -84,14 +84,14 @@ enum RunOp<T> {
 }
 
 impl<T> Run<T> {
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match &self.op {
             RunOp::Insert { items, .. } => items.len(),
             RunOp::Delete { len, .. } | RunOp::Undelete { len, .. } => *len,
         }
     }
 
-    fn end(&self) -> Lv {
+    pub(crate) fn end(&self) -> Lv {
         self.start + self.len()
     }
 }
@@ -103,7 +103,7 @@ pub struct OpLog<T> {
     by_name: HashMap<String, AgentId>,
     next_seq: Vec<u64>,
     /// In local-version order, covering every event.
-    runs: Vec<Run<T>>,
+    pub(crate) runs: Vec<Run<T>>,
     /// Per agent, by the seq each stretch starts at: where in this log the
     /// agent's events are, as `(first local version, how many)`.
     spans: Vec<BTreeMap<u64, (Lv, usize)>>,
@@ -364,6 +364,11 @@ impl<T: Clone> OpLog<T> {
 }
 
 impl<T> OpLog<T> {
+    /// The agent named `name`, if this log knows it.
+    pub(crate) fn agent_by_name(&self, name: &str) -> Option<AgentId> {
+        self.by_name.get(name).copied()
+    }
+
     pub fn agent_name(&self, agent: AgentId) -> &str {
         &self.agents[agent.0 as usize]
     }
@@ -387,11 +392,11 @@ impl<T> OpLog<T> {
         &self.frontier
     }
 
-    fn run_of(&self, lv: Lv) -> &Run<T> {
+    pub(crate) fn run_of(&self, lv: Lv) -> &Run<T> {
         &self.runs[self.run_index(lv)]
     }
 
-    fn run_index(&self, lv: Lv) -> usize {
+    pub(crate) fn run_index(&self, lv: Lv) -> usize {
         let i = self.runs.partition_point(|r| r.start <= lv) - 1;
         debug_assert!(lv < self.runs[i].end(), "event {lv} isn't in the log");
         i
@@ -441,7 +446,7 @@ impl<T> OpLog<T> {
     }
 
     /// This log's number for the event `agent` numbered `seq`.
-    fn find(&self, agent: AgentId, seq: u64) -> Option<Lv> {
+    pub(crate) fn find(&self, agent: AgentId, seq: u64) -> Option<Lv> {
         let (&first, &(lv, len)) = self.spans[agent.0 as usize].range(..=seq).next_back()?;
         let k = (seq - first) as usize;
         (k < len).then_some(lv + k)
