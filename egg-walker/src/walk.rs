@@ -669,45 +669,49 @@ impl<T: Clone> OpLog<T> {
         let critical = self.critical_points(&order, &old, &new, &base);
         let mut critical = critical.iter().peekable();
         let old_len: usize = old.iter().map(|span| span.len()).sum();
-        let lamport = std::rc::Rc::new(self.lamports());
         // Where the next window starts, and what's known of it there.
         let mut start = base.clone();
-        let mut start_ids = if old_len == 0 { out.ids.clone() } else { None };
-        let mut start_blocks = (old_len == 0).then(|| blocks.clone());
+        // Whether the books kept so far are the document's at `start`:
+        // from the document the changes start from, or just after events
+        // applied as they are. (Nothing changes between those and the next
+        // window, so they're taken when it opens.)
+        let mut fresh = old_len == 0;
         let mut window: Option<crate::simple::Window<'_, T>> = None;
         let mut at = 0;
         for (span, output) in order {
-            for lv in span {
+            let mut lv = span.start;
+            while lv < span.end {
+                // The stretch from here that's all critical, or none of it.
                 while critical.next_if(|c| c.end <= at).is_some() {}
-                let is_critical = critical.peek().is_some_and(|c| c.start <= at);
+                let (is_critical, until) = match critical.peek() {
+                    Some(c) if c.start <= at => (true, c.end),
+                    Some(c) => (false, c.start),
+                    None => (false, usize::MAX),
+                };
+                let n = (span.end - lv).min(until - at);
                 if is_critical && output {
                     if let Some(w) = window.take() {
                         blocks = w.blocks();
                     }
-                    self.apply_critical(lv, &mut out, &mut blocks);
-                    start = vec![lv];
-                    start_ids.clone_from(&out.ids);
-                    start_blocks = Some(blocks.clone());
+                    self.apply_critical(lv, n, &mut out, &mut blocks);
+                    start = vec![lv + n - 1];
+                    fresh = true;
                 } else {
                     let w = window.get_or_insert_with(|| {
-                        let (ids, found) = match start_blocks.take() {
-                            Some(b) => (start_ids.take(), b),
-                            None => {
-                                let (o, _) = self.walk_moves(&[], &start, true, None, None);
-                                (o.ids, o.blocks.unwrap_or_default())
-                            }
+                        let (ids, found) = if fresh {
+                            (out.ids.clone(), blocks.clone())
+                        } else {
+                            let (o, _) = self.walk_moves(&[], &start, true, None, None);
+                            (o.ids, o.blocks.unwrap_or_default())
                         };
-                        crate::simple::Window::new(
-                            self,
-                            start.clone(),
-                            ids,
-                            &found,
-                            lamport.clone(),
-                        )
+                        crate::simple::Window::new(self, start.clone(), ids, &found)
                     });
-                    w.step(lv, output.then_some(&mut out));
+                    for k in 0..n {
+                        w.step(lv + k, output.then_some(&mut out));
+                    }
                 }
-                at += 1;
+                lv += n;
+                at += n;
             }
         }
         if let Some(w) = window.take() {
@@ -717,23 +721,27 @@ impl<T: Clone> OpLog<T> {
         (out, Stats::default())
     }
 
-    /// Applies event `lv`, which saw everything before it and is seen by
-    /// everything after: its position is final.
-    fn apply_critical(&self, lv: Lv, out: &mut Changes<'_, T>, blocks: &mut Blocks) {
+    /// Applies events `lv..lv + n`, one run in the log, each of which saw
+    /// everything before it and is seen by everything after: their
+    /// positions are final.
+    fn apply_critical(&self, lv: Lv, n: usize, out: &mut Changes<'_, T>, blocks: &mut Blocks) {
         match self.op(lv) {
             Op::Insert { pos, .. } => {
-                out.insert_run(pos, lv, 1);
-                blocks.insert(pos, 1);
+                out.insert_run(pos, lv, n);
+                blocks.insert(pos, n);
             }
             Op::Delete { pos } => {
+                // Deleting forward: each removes what's moved up to `pos`.
                 if let Some(ids) = &out.ids {
-                    out.learned.push((lv, ids.get(pos)));
+                    let gone: Vec<(Lv, Lv)> = (0..n).map(|k| (lv + k, ids.get(pos + k))).collect();
+                    out.learned.extend(gone);
                 }
-                out.delete_run(pos, 1);
-                blocks.delete(pos..pos + 1);
+                out.delete_run(pos, n);
+                blocks.delete(pos..pos + n);
             }
             Op::Undelete { .. } => unreachable!("an undelete is never critical"),
             Op::Move { pos, len, to } => {
+                debug_assert_eq!(n, 1, "moves don't run");
                 if blocks.apply_move(lv, pos..pos + len, to) {
                     out.move_range(pos..pos + len, to);
                 }

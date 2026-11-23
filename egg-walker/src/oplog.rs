@@ -82,6 +82,8 @@ pub(crate) struct Run<T> {
     pub(crate) start: Lv,
     pub(crate) parents: Vec<Lv>,
     pub(crate) op: RunOp<T>,
+    /// The first event's Lamport time; each after it is one more.
+    pub(crate) lamport: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -382,11 +384,13 @@ impl<T: Clone> OpLog<T> {
                 .expect("a run's agent has a span for it");
             span.1 += 1;
         } else {
+            let lamport = self.lamport_after(&parents);
             self.runs.push(Run {
                 agent,
                 seq,
                 start: lv,
                 parents,
+                lamport,
                 op: match op {
                     Op::Insert { pos, item } => RunOp::Insert {
                         pos,
@@ -455,12 +459,14 @@ impl<T> OpLog<T> {
                 .expect("a run's agent has a span for it");
             span.1 += len;
         } else {
+            let lamport = self.lamport_after(&parents);
             self.runs.push(Run {
                 agent,
                 seq,
                 start: lv,
                 parents,
                 op,
+                lamport,
             });
             self.spans[agent.index()].insert(seq, (lv, len));
         }
@@ -787,16 +793,17 @@ impl<T> OpLog<T> {
         seen
     }
 
-    /// Each event's Lamport time: one more than its latest parent's. What
+    /// Event `lv`'s Lamport time: one more than its latest parent's. What
     /// decides which moves are active (see `reference.rs`): a time every
-    /// replica gives an event alike.
-    pub(crate) fn lamports(&self) -> Vec<u64> {
-        let mut lamport: Vec<u64> = Vec::with_capacity(self.len());
-        for lv in 0..self.len() {
-            let l = self.parents(lv).map(|p| lamport[p]).max().unwrap_or(0) + 1;
-            lamport.push(l);
-        }
-        lamport
+    /// replica gives an event alike. Kept as events are added.
+    pub(crate) fn lamport(&self, lv: Lv) -> u64 {
+        let run = self.run_of(lv);
+        run.lamport + (lv - run.start) as u64
+    }
+
+    /// The Lamport time of an event after `parents`.
+    fn lamport_after(&self, parents: &[Lv]) -> u64 {
+        parents.iter().map(|&p| self.lamport(p)).max().unwrap_or(0) + 1
     }
 
     /// Whether `version` includes event `lv`.

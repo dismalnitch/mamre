@@ -19,7 +19,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::rc::Rc;
 
 use crate::blocks::Blocks;
 use crate::ids::Ids;
@@ -126,7 +125,6 @@ struct Walk<'a, T> {
     base: Vec<bool>,
     /// The moves that do something, in the order activity is decided in.
     moves: Vec<Moved>,
-    lamport: Rc<Vec<u64>>,
 }
 
 /// Where the base items' identities come from: the reference (the oracle
@@ -149,7 +147,6 @@ impl<'a, T: Clone> Window<'a, T> {
         frontier: Vec<Lv>,
         ids: Option<Ids>,
         blocks: &Blocks,
-        lamport: Rc<Vec<u64>>,
     ) -> Self {
         let base = log.closure(&frontier);
         let mut walk = Walk {
@@ -164,7 +161,6 @@ impl<'a, T: Clone> Window<'a, T> {
             base_ids: BaseIds::Given { frontier, ids },
             base,
             moves: Vec::new(),
-            lamport,
         };
         walk.lay_base(blocks.0.clone());
         Window(walk)
@@ -232,7 +228,6 @@ impl<T: Clone> OpLog<T> {
             base_ids: BaseIds::Reference(None),
             base: base.clone(),
             moves: Vec::new(),
-            lamport: Rc::new(self.lamports()),
         };
         walk.lay_base(crate::reference::blocks(self, &base));
         // First what the document already holds past the base, to set up
@@ -320,7 +315,7 @@ impl<'a, T: Clone> Walk<'a, T> {
     /// Adds a move, in the order activity is decided in: Lamport time, then
     /// as concurrent inserts are ordered.
     fn add_move(&mut self, m: Moved) {
-        let key = |id: Lv| (self.lamport[id], self.log.order_key(id));
+        let key = |id: Lv| (self.log.lamport(id), self.log.order_key(id));
         let k = self.moves.partition_point(|o| key(o.id) < key(m.id));
         self.moves.insert(k, m);
     }
