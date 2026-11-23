@@ -9,7 +9,7 @@
 //!            (other kinds are skipped, so they can be added)
 //! snapshot = document (count, items as a run), then its accountant's
 //!            books: version (count, then events), identities, anchors,
-//!            moved blocks
+//!            outline, moved blocks
 //! ```
 //!
 //! Saving appends: a chunk of the events since the last save, then a

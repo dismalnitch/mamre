@@ -799,6 +799,21 @@ proptest! {
                     (0..books.len()).map(|i| books.identities().item(i)).collect();
                 prop_assert_eq!(&kept_doc, &want, "accountant {:?} to {:?}, in\n{}", from, to, describe(&log));
                 prop_assert_eq!(&books_ids, &want_ids, "accountant {:?} to {:?}, in\n{}", from, to, describe(&log));
+                // Its outline: every marked item's level, shown or not, and
+                // the sections it shows, in order, where they are.
+                let want_levels = reference::levels(&log, &both);
+                for item in 0..log.len() {
+                    let want = want_levels.get(&item).copied().unwrap_or(0);
+                    prop_assert_eq!(books.level(item), want, "level of {}, in\n{}", item, describe(&log));
+                }
+                let want_sections: Vec<(usize, Lv, u8)> = want_ids
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(pos, id)| want_levels.get(id).map(|&l| (pos, *id, l)))
+                    .collect();
+                let got_sections: Vec<(usize, Lv, u8)> =
+                    books.sections().iter().map(|s| (s.pos, s.item, s.level)).collect();
+                prop_assert_eq!(got_sections, want_sections, "sections, in\n{}", describe(&log));
                 prop_assert_eq!(&doc, &want, "changes_with {:?} to {:?}, in\n{}", from, to, describe(&log));
                 prop_assert_eq!(&kept_ids, &want_ids, "changes_with {:?} to {:?}, in\n{}", from, to, describe(&log));
             }
@@ -999,4 +1014,64 @@ fn a_mark_waits_out_a_delete() {
     let undone = log.add_undelete(b, &both, [deleted[0]]);
     assert_eq!(text_at(&log, &undone), "ABCD");
     assert_eq!(outline_of(&log, &undone), "..3.");
+}
+
+/// The outline at work: three chapters, marked; one moved by its section
+/// range while someone types in it and renames its heading. The section is
+/// the same one throughout, by identity.
+#[test]
+fn moving_a_marked_chapter() {
+    use mamre_egg_walker::Accountant;
+    let mut log = OpLog::new();
+    let me = log.agent("me");
+    let mut books = Accountant::new();
+    let mut doc: Vec<char> = Vec::new();
+    let text = "One\nfirst\nTwo\nsecond\nThree\nthird\n";
+    let v = log.add_insert(me, &[], 0, text.chars());
+    for c in books.merge(&log, &v) {
+        c.apply(&mut doc);
+    }
+    for pos in [0, 10, 21] {
+        let v = log.add_mark(me, books.version(), pos, 1);
+        books.merge(&log, &v);
+    }
+    let sections = books.sections();
+    assert_eq!(
+        sections.iter().map(|s| s.pos).collect::<Vec<_>>(),
+        [0, 10, 21]
+    );
+    let two = sections[1].item;
+    assert_eq!(books.section_range(two), Some(10..21));
+
+    // Someone else, at the same time, types inside chapter Two and renames
+    // its heading (deleting "Two", typing "2").
+    let them = log.agent("them");
+    let base = books.version().to_vec();
+    let t = log.add_insert(them, &base, 14, "!".chars());
+    let t = log.add_delete(them, &t, 11..13);
+    let t = log.add_insert(them, &t, 11, "2".chars());
+
+    // I move chapter Two to the end, by its section range.
+    let range = books.section_range(two).unwrap();
+    let v = log.add_move(me, &base, range, doc.len());
+    for c in books.merge(&log, &v) {
+        c.apply(&mut doc);
+    }
+    assert_eq!(
+        doc.iter().collect::<String>(),
+        "One\nfirst\nThree\nthird\nTwo\nsecond\n"
+    );
+    for c in books.merge(&log, &t) {
+        c.apply(&mut doc);
+    }
+    assert_eq!(
+        doc.iter().collect::<String>(),
+        "One\nfirst\nThree\nthird\nT2\n!second\n"
+    );
+    // Still three sections; chapter Two is still the same section, at the
+    // end, with its range following it.
+    let sections = books.sections();
+    assert_eq!(sections.len(), 3);
+    assert_eq!(sections[2].item, two);
+    assert_eq!(books.section_range(two), Some(sections[2].pos..doc.len()));
 }
