@@ -23,3 +23,8 @@ mamre-rope = { path = "../rope" }
 [[bench]]
 name = "traces"
 harness = false
+
+# What moves cost: a synthetic book, against the same with no moves.
+[[bench]]
+name = "moves"
+harness = false

@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 5ba4514deacb5c3e2cfb114a93386210367ebaa47e351fb52f5e94436adb8a67 # shrinks to acts = [Insert { a: 0, at: 0, text: "aaa" }, Merge { a: 1, from: 0 }, Delete { a: 0, from: 0, to: 43690 }, Merge { a: 2, from: 1 }, Insert { a: 1, at: 0, text: "a" }, Insert { a: 0, at: 0, text: "b" }]

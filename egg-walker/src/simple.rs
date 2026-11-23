@@ -110,6 +110,9 @@ struct Walk<'a, T> {
     records: Vec<Record>,
     /// The prepare version, as a set.
     prepared: Vec<bool>,
+    /// The events stepped so far, in order: all the prepare version can
+    /// hold beyond the base.
+    stepped: Vec<Lv>,
     /// The effect version, as a set: the base, and everything stepped.
     effect: Vec<bool>,
     /// Which record each delete replayed so far removed.
@@ -153,6 +156,7 @@ impl<'a, T: Clone> Window<'a, T> {
             log,
             records: Vec::new(),
             prepared: base.clone(),
+            stepped: Vec::new(),
             effect: base.clone(),
             targets: HashMap::new(),
             undos: HashMap::new(),
@@ -220,6 +224,7 @@ impl<T: Clone> OpLog<T> {
             log: self,
             records: Vec::new(),
             prepared: base.clone(),
+            stepped: Vec::new(),
             effect: base.clone(),
             targets: HashMap::new(),
             undos: HashMap::new(),
@@ -322,23 +327,35 @@ impl<'a, T: Clone> Walk<'a, T> {
 
     fn step(&mut self, lv: Lv, out: Option<&mut Changes<'a, T>>) {
         let event = self.log.event(lv);
-        let parents = self.log.closure(&event.parents);
         // Move the prepare version to this event's parents: take back what
         // it shouldn't hold, latest first, then add what it's missing,
         // earliest first, so a delete is never undone before its insert.
-        // The base is in every replayed event's parents, so it never moves.
-        for x in (0..self.prepared.len()).rev() {
-            if self.prepared[x] && !parents[x] {
+        // The base is in every replayed event's parents, so it never moves,
+        // and only stepped events can: what the parents hold above the
+        // base is found by walking back to it.
+        let mut above: HashSet<Lv> = HashSet::new();
+        let mut stack: Vec<Lv> = event.parents.clone();
+        while let Some(x) = stack.pop() {
+            if !self.base[x] && above.insert(x) {
+                stack.extend(self.log.parents(x));
+            }
+        }
+        for k in (0..self.stepped.len()).rev() {
+            let x = self.stepped[k];
+            if self.prepared[x] && !above.contains(&x) {
                 self.retreat(x);
                 self.prepared[x] = false;
             }
         }
-        for (x, &wanted) in parents.iter().enumerate() {
-            if wanted && !self.prepared[x] {
+        for k in 0..self.stepped.len() {
+            let x = self.stepped[k];
+            if !self.prepared[x] && above.contains(&x) {
                 self.advance(x);
                 self.prepared[x] = true;
             }
         }
+        let at = self.stepped.partition_point(|&x| x < lv);
+        self.stepped.insert(at, lv);
         match &event.op {
             Op::Insert { pos, .. } => self.insert(lv, *pos, out),
             Op::Delete { pos } => self.delete(lv, *pos, out),
