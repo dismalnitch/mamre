@@ -265,7 +265,7 @@ impl Layout {
 /// walk), or the fast walk's, given or found when first asked.
 enum BaseIds {
     Reference(Option<Vec<Lv>>),
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    #[cfg_attr(not(all(debug_assertions, not(feature = "perf"))), allow(dead_code))]
     Given {
         frontier: Vec<Lv>,
         ids: Option<Ids>,
@@ -275,10 +275,10 @@ enum BaseIds {
 /// A stretch of a merge with moves, the simple walk's way, from a base
 /// whose identities and blocks are known (or found): what debug builds
 /// check the fast window (`window.rs`) against.
-#[cfg_attr(not(debug_assertions), allow(dead_code))]
+#[cfg_attr(not(all(debug_assertions, not(feature = "perf"))), allow(dead_code))]
 pub(crate) struct Window<'a, T>(Walk<'a, T>);
 
-#[cfg_attr(not(debug_assertions), allow(dead_code))]
+#[cfg_attr(not(all(debug_assertions, not(feature = "perf"))), allow(dead_code))]
 impl<'a, T: Clone> Window<'a, T> {
     /// A window from the document at `frontier`, whose items' identities are
     /// `ids` (found from nothing when first asked, if not given) and whose

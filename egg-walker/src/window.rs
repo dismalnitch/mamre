@@ -23,7 +23,8 @@
 //! each of the window's active moves. Nothing is kept up to date by hand.
 //!
 //! In debug builds the merge runs the simple walk's window beside this one
-//! and checks they make the same changes, step by step.
+//! and checks they make the same changes, step by step: unless built with
+//! the `perf` feature, for timing a debug build when speed is the focus.
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -410,7 +411,8 @@ impl<'a, T: Clone> Window<'a, T> {
             }
             active.push(m);
         }
-        debug_assert_eq!(active, self.decide(&self.moves), "the base's moves");
+        #[cfg(all(debug_assertions, not(feature = "perf")))]
+        assert_eq!(active, self.decide(&self.moves), "the base's moves");
         self.base_active = active;
     }
 
@@ -1444,7 +1446,7 @@ impl<'a, T: Clone> Window<'a, T> {
                 (!span.is_empty()).then_some((k, span))
             })
             .collect::<Vec<_>>();
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(feature = "perf")))]
         {
             let mut spans: Vec<(Lv, Option<usize>, usize)> =
                 frames.active.iter().map(|a| (a.m.id, None, 0)).collect();
@@ -1504,7 +1506,7 @@ impl<'a, T: Clone> Window<'a, T> {
 /// learned, the same blocks at the end.
 pub(crate) struct Checked<'a, T> {
     fast: Window<'a, T>,
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(feature = "perf")))]
     simple: (crate::simple::Window<'a, T>, Changes<'a, T>),
 }
 
@@ -1516,7 +1518,7 @@ impl<'a, T: Clone> Checked<'a, T> {
         blocks: &Blocks,
     ) -> Self {
         Checked {
-            #[cfg(debug_assertions)]
+            #[cfg(all(debug_assertions, not(feature = "perf")))]
             simple: (
                 crate::simple::Window::new(log, frontier.clone(), ids.clone(), blocks),
                 Changes::new(log),
@@ -1526,10 +1528,10 @@ impl<'a, T: Clone> Checked<'a, T> {
     }
 
     pub(crate) fn step(&mut self, lv: Lv, mut out: Option<&mut Changes<'a, T>>) {
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(feature = "perf")))]
         let marks = out.as_ref().map(|o| (o.calls.len(), o.learned.len()));
         self.fast.step(lv, out.as_mut().map(|o| &mut **o));
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(feature = "perf")))]
         {
             let (simple, theirs) = &mut self.simple;
             let theirs_marks = (theirs.calls.len(), theirs.learned.len());
@@ -1551,7 +1553,7 @@ impl<'a, T: Clone> Checked<'a, T> {
 
     pub(crate) fn blocks(&self) -> Blocks {
         let blocks = self.fast.blocks();
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(feature = "perf")))]
         {
             assert_eq!(blocks, self.simple.0.blocks(), "the windows' blocks");
         }

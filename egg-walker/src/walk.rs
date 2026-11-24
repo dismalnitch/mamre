@@ -178,12 +178,12 @@ pub(crate) struct Changes<'a, T> {
     pub(crate) blocks: Option<Blocks>,
     /// Every change asked for, as asked, before any are joined up: so a
     /// debug build can check two windows ask for the same.
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(feature = "perf")))]
     pub(crate) calls: Vec<Call>,
 }
 
 /// A change as asked for: see `Changes::calls`.
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, not(feature = "perf")))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Call {
     Insert(usize, Lv, usize),
@@ -200,7 +200,7 @@ impl<'a, T: Clone> Changes<'a, T> {
             ids: None,
             learned: Vec::new(),
             blocks: None,
-            #[cfg(debug_assertions)]
+            #[cfg(all(debug_assertions, not(feature = "perf")))]
             calls: Vec::new(),
         }
     }
@@ -212,7 +212,7 @@ impl<'a, T: Clone> Changes<'a, T> {
 
     /// The items of events `lv..lv + n`, one run in the log, go in at `pos`.
     pub(crate) fn insert_run(&mut self, pos: usize, lv: Lv, n: usize) {
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(feature = "perf")))]
         self.calls.push(Call::Insert(pos, lv, n));
         if let Some(ids) = &mut self.ids {
             ids.insert(pos, lv, n);
@@ -245,14 +245,14 @@ impl<'a, T: Clone> Changes<'a, T> {
 
     /// Item `item`, at `pos` if it shows, starts a section at `level`.
     pub(crate) fn mark(&mut self, item: Lv, pos: Option<usize>, level: u8) {
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(feature = "perf")))]
         self.calls.push(Call::Mark(item, pos, level));
         self.out.push(Change::Mark { item, pos, level });
     }
 
     /// The items in `range` move to `to`.
     pub(crate) fn move_range(&mut self, range: Range<usize>, to: usize) {
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(feature = "perf")))]
         self.calls.push(Call::Move(range.clone(), to));
         if let Some(ids) = &mut self.ids {
             ids.move_range(range.clone(), to);
@@ -267,7 +267,7 @@ impl<'a, T: Clone> Changes<'a, T> {
 
     /// The item at `pos` goes, `n` times over: the `n` items from `pos`.
     pub(crate) fn delete_run(&mut self, pos: usize, n: usize) {
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(feature = "perf")))]
         self.calls.push(Call::Delete(pos, n));
         if let Some(ids) = &mut self.ids {
             ids.remove(pos..pos + n);

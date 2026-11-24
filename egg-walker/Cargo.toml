@@ -8,6 +8,13 @@ keywords = ["crdt", "eg-walker", "collaboration", "sequence", "event-graph"]
 repository = "https://github.com/dismalnitch/mamre"
 publish = false
 
+[features]
+# For timing when speed is the focus, not correctness: debug builds skip
+# their slow self-checks (the fast window run beside the simple walk's,
+# step by step, and the layouts it checks against a drawing). Release
+# builds never run them anyway.
+perf = []
+
 [dependencies]
 mamre = { path = ".." }
 
