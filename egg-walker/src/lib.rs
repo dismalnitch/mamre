@@ -54,6 +54,8 @@
 
 mod accountant;
 mod anchors;
+// Kept in the books' format until it's cleaned out (#20): always empty.
+#[allow(dead_code)]
 mod blocks;
 #[doc(hidden)]
 pub mod copies;
@@ -67,10 +69,12 @@ mod order;
 mod outline;
 mod recent;
 pub mod reference;
+// Its moves (portals) retire with #20: it stays the oracle for merges
+// without moves.
+#[allow(dead_code)]
 mod simple;
 pub mod sync;
 mod walk;
-mod window;
 
 pub use accountant::Accountant;
 pub use anchors::Anchors;

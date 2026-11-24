@@ -910,14 +910,6 @@ impl<T: Clone> OpLog<T> {
         }
     }
 
-    /// The moved blocks of the document at `version`, from nothing.
-    fn blocks_at(&self, version: &[Lv]) -> Blocks {
-        self.walk_moves(&[], version, false, None, None, None)
-            .0
-            .blocks
-            .unwrap_or_default()
-    }
-
     /// Where a replay is critical, as ranges of places in it: each event
     /// there saw everything replayed before it (its parents are all of it),
     /// and everything replayed after it descends from it. There the walk
