@@ -1038,7 +1038,12 @@ impl<'a, T: Clone> Window<'a, T> {
                 c = frames.parent[i];
             }
             // Inside a block of the frame, and not its start: nothing in
-            // it is the frame's own. On after it.
+            // it is the frame's own. On after it. (It can't happen: a
+            // block's first record is always in the prepare version, a base
+            // item, or one its move's author saw. So the first record found
+            // in a block is its start. Kept as the simple walk's scan would
+            // go on.)
+            debug_assert!(false, "a block's first record is in the prepare version");
             let mut c = inner.expect("inside the frame, deeper");
             while frames.parent[c] != frame {
                 c = frames.parent[c].expect("the frame holds it");

@@ -1393,3 +1393,83 @@ proptest! {
         }
     }
 }
+
+/// Two nested moved blocks that show the same items: move 10's interval
+/// holds move 9's and a deleted item besides. The books keep blocks by
+/// what they show, so a merge whose base has them laid both over the same
+/// base items, and move 10 reads as a move of exactly move 9's stretch,
+/// replacing it. A walk from nothing, which sees the deleted item, keeps
+/// both. (Found by `live_replicas_keep_their_books` at 1,000 cases.)
+#[test]
+#[ignore = "the books cannot tell blocks with the same span apart: not fixed yet"]
+fn blocks_showing_the_same_items_stay_two() {
+    use mamre_egg_walker::Accountant;
+    let mut log = OpLog::new();
+    let (a, b, c) = (log.agent("a"), log.agent("b"), log.agent("c"));
+    log.add_insert(a, &[], 0, ['f']);
+    log.add_insert(a, &[0], 1, ['w']);
+    log.add_insert(a, &[1], 1, ['d']);
+    log.add_insert(a, &[2], 3, ['n']);
+    log.add_insert(a, &[3], 4, ['n']);
+    log.add_insert(a, &[4], 0, ['d']);
+    log.add_delete(b, &[5], 2..3);
+    log.add_insert(a, &[5], 2, ['u']);
+    log.add_delete(b, &[6], 3..4);
+    log.add_move(a, &[7], 0..3, 5);
+    log.add_move(a, &[9], 2..7, 0);
+    log.add_delete(b, &[8], 3..4);
+    log.add_mark(b, &[11], 1, 1);
+    log.add_move(a, &[10], 0..3, 3);
+    log.add_insert(c, &[4], 1, ['b']);
+    log.add_delete(b, &[12, 13], 0..1);
+    log.add_undelete(a, &[12, 13, 14], [8]);
+    let v = log.add_undelete(b, &[15], [15]);
+    assert_eq!(v, [17]);
+    // A replica at 15 takes in the undo of 15.
+    let mut books = Accountant::new();
+    let mut doc = Vec::new();
+    for to in [&[15][..], &[17]] {
+        for ch in books.merge(&log, to) {
+            ch.apply(&mut doc);
+        }
+    }
+    assert_eq!(doc, reference::checkout(&log, &[17]));
+    let mut fresh = Accountant::new();
+    fresh.merge(&log, &[17]);
+    assert_eq!(books.moved_blocks(), [(9, 0..3), (10, 0..3)]);
+    assert_eq!(books.moved_blocks(), fresh.moved_blocks());
+}
+
+/// A base block whose last item a concurrent move carries away: a later
+/// move of a range ending with what's left of the block is still whole
+/// elements, as the block's end, cut out, draws nothing where it lies.
+#[test]
+fn a_block_whose_end_was_moved_away() {
+    use mamre_egg_walker::Accountant;
+    let mut log = OpLog::new();
+    let (a, x, y) = (log.agent("a"), log.agent("x"), log.agent("y"));
+    let v = log.add_insert(a, &[], 0, "abcdef".chars());
+    // "aefbcd", with "bcd" a moved block.
+    let k = log.add_move(a, &v, 1..4, 6);
+    // x moves the block's last item to the front: "daefbc"; then "fbc",
+    // what's before and what's left of the block, to the front too.
+    let x1 = log.add_move(x, &k, 5..6, 0);
+    let x2 = log.add_move(x, &x1, 3..6, 0);
+    // y, meanwhile, types.
+    let mut books = Accountant::new();
+    let mut doc = Vec::new();
+    for ch in books.merge(&log, &k) {
+        ch.apply(&mut doc);
+    }
+    doc.insert(0, 'y');
+    let y1 = log.add_insert(y, books.version(), 0, ['y']);
+    books.record(&log, &y1);
+    for ch in books.merge(&log, &x2) {
+        ch.apply(&mut doc);
+    }
+    books_agree(&log, &books, &doc);
+    assert_eq!(
+        reference::checkout(&log, &x2).iter().collect::<String>(),
+        "fbcdae"
+    );
+}
