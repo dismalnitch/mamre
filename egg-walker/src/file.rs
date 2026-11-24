@@ -7,8 +7,9 @@
 //! kind     = 1 chunk:    events since the last save (see `encode.rs`)
 //!            2 snapshot: the state at a version, to open without replaying
 //!            (other kinds are skipped, so they can be added)
-//! snapshot = version (count, then events), document (count, items as a run),
-//!            identities, anchors
+//! snapshot = document (count, items as a run), then its accountant's
+//!            books: version (count, then events), identities, anchors,
+//!            outline, moved blocks
 //! ```
 //!
 //! Saving appends: a chunk of the events since the last save, then a
@@ -23,9 +24,8 @@
 
 use mamre::codec::{Codec, DecodeError, get_frame, get_usize, put_frame, put_usize};
 
-use crate::anchors::Anchors;
-use crate::ids::Identities;
-use crate::oplog::{Lv, OpLog};
+use crate::accountant::Accountant;
+use crate::oplog::OpLog;
 
 const MAGIC: &[u8; 6] = b"MAMRE\0";
 const VERSION: u8 = 1;
@@ -33,13 +33,11 @@ const CHUNK: u8 = 1;
 const SNAPSHOT: u8 = 2;
 
 /// The state of a document at a version: what opening it needs, beside
-/// the history.
+/// the history. The version is the accountant's.
 #[derive(Clone)]
 pub struct Snapshot<T> {
-    pub version: Vec<Lv>,
     pub doc: Vec<T>,
-    pub ids: Identities,
-    pub anchors: Anchors,
+    pub accountant: Accountant,
 }
 
 /// What loading a file found.
@@ -47,7 +45,7 @@ pub struct Loaded<T> {
     pub log: OpLog<T>,
     /// The last snapshot, if there was one. It may be of an older version
     /// than the log, if the last save was cut off after its chunk: bring it
-    /// up to date with [`OpLog::changes_with`].
+    /// up to date with [`Accountant::merge`].
     pub snapshot: Option<Snapshot<T>>,
     /// How many bytes were good. A save after a crash appends from here.
     pub good: usize,
@@ -72,31 +70,29 @@ pub fn create() -> Vec<u8> {
 }
 
 /// Appends a save to `file`: the log's events from `saved` on (the first
-/// save of a file passes 0), then the snapshot. Returns how many events the
-/// file now holds: the next save's `saved`.
+/// save of a file passes 0), then the snapshot: the document's items, at
+/// its accountant's version, and the accountant. The items come as they
+/// come, from a rope's iterator, say, so no document needs to be a slice.
+/// Returns how many events the file now holds: the next save's `saved`.
 pub fn save<T: Clone + Codec>(
     file: &mut Vec<u8>,
     log: &OpLog<T>,
     saved: usize,
-    version: &[Lv],
-    doc: &[T],
-    ids: &Identities,
-    anchors: &Anchors,
+    doc: impl IntoIterator<Item = T>,
+    accountant: &Accountant,
 ) -> usize {
     if saved < log.len() {
         let mut body = Vec::new();
         log.encode_chunk(saved..log.len(), &mut body);
         record(file, CHUNK, &body);
     }
+    // The items go straight from the document into the snapshot: how many
+    // there are, the books know.
     let mut body = Vec::new();
-    put_usize(&mut body, version.len());
-    for &lv in version {
-        put_usize(&mut body, lv);
-    }
-    put_usize(&mut body, doc.len());
-    T::encode_run(doc, &mut body);
-    ids.encode(&mut body);
-    anchors.encode(&mut body);
+    put_usize(&mut body, accountant.len());
+    let n = T::encode_iter(doc, &mut body);
+    debug_assert_eq!(n, accountant.len(), "the books are the document's");
+    accountant.encode(&mut body);
     record(file, SNAPSHOT, &body);
     log.len()
 }
@@ -154,34 +150,56 @@ fn read_record<T: Clone + Codec>(
         }
         SNAPSHOT => {
             let mut input = body;
-            let events = log.len();
-            let n = get_usize(&mut input)?;
-            let mut version = Vec::with_capacity(n.min(input.len()));
-            for _ in 0..n {
-                let lv = get_usize(&mut input)?;
-                if lv >= events {
-                    return Err(DecodeError::Invalid("a version this log doesn't have"));
-                }
-                version.push(lv);
-            }
             let n = get_usize(&mut input)?;
             let doc = T::decode_run(n, &mut input)?;
-            let ids = Identities::decode(&mut input, events)?;
-            let anchors = Anchors::decode(&mut input, events)?;
+            let accountant = Accountant::decode(&mut input, log.len())?;
+            if accountant.len() != doc.len() {
+                return Err(DecodeError::Invalid("books for another document"));
+            }
             if !input.is_empty() {
                 return Err(DecodeError::Invalid("bytes after the snapshot"));
             }
-            Ok((
-                total,
-                Some(Snapshot {
-                    version,
-                    doc,
-                    ids,
-                    anchors,
-                }),
-            ))
+            Ok((total, Some(Snapshot { doc, accountant })))
         }
         // A kind a later version added: skipped whole.
         _ => Ok((total, None)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Saving streams the document's items, and writes exactly the bytes
+    /// collecting them into a `Vec` first did.
+    #[test]
+    fn a_saved_document_is_the_same_bytes_streamed() {
+        let long: String = "a moment's ñ, then 𝄞; ".repeat(300);
+        for text in ["", "hello", "héllo wörld ✓ 𝄞", long.as_str()] {
+            let mut log = OpLog::new();
+            let me = log.agent("me");
+            let mut books = Accountant::new();
+            let v = log.add_insert(me, &[], 0, text.chars());
+            books.merge(&log, &v);
+            let doc: Vec<char> = text.chars().collect();
+
+            let mut streamed = create();
+            save(&mut streamed, &log, 0, text.chars(), &books);
+
+            // As it was: the items in a Vec, written as a slice.
+            let mut collected = create();
+            if log.len() > 0 {
+                let mut body = Vec::new();
+                log.encode_chunk(0..log.len(), &mut body);
+                record(&mut collected, CHUNK, &body);
+            }
+            let mut body = Vec::new();
+            put_usize(&mut body, doc.len());
+            char::encode_run(&doc, &mut body);
+            books.encode(&mut body);
+            record(&mut collected, SNAPSHOT, &body);
+
+            assert_eq!(streamed, collected, "saving {} chars", doc.len());
+        }
     }
 }

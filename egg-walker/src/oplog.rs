@@ -17,7 +17,7 @@
 //! how a document's whole history stays small. Single events are rebuilt
 //! when asked for; nothing about their numbering changes.
 
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ops::Range;
 
 /// What an event does, without its details.
@@ -26,6 +26,8 @@ pub(crate) enum Kind {
     Insert,
     Delete,
     Undelete,
+    Move,
+    Mark,
 }
 
 /// A local version: an event's number in this log. Parents always have
@@ -54,6 +56,15 @@ pub enum Op<T> {
     /// undelete of a delete exists, that delete is undone for good; a redo
     /// is a new delete.
     Undelete { target: Lv },
+    /// Moves the `len` items at `pos` to `to` (a position in the document
+    /// as it is, outside them or at either end), keeping their identities:
+    /// the same items, somewhere else. See `reference.rs` for what a move
+    /// does when others edit or move at the same time.
+    Move { pos: usize, len: usize, to: usize },
+    /// Marks the item at `pos` as starting a section at `level`; level 0
+    /// unmarks it. The mark is the item's, wherever it goes; the latest
+    /// mark of an item wins (see `reference.rs`).
+    Mark { pos: usize, level: u8 },
 }
 
 /// One event, as a log hands it out.
@@ -76,6 +87,8 @@ pub(crate) struct Run<T> {
     pub(crate) start: Lv,
     pub(crate) parents: Vec<Lv>,
     pub(crate) op: RunOp<T>,
+    /// The first event's Lamport time; each after it is one more.
+    pub(crate) lamport: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +100,10 @@ pub(crate) enum RunOp<T> {
     /// Deletes `target..target + len` undone, in order: undoing a run of
     /// deletes.
     Undelete { target: Lv, len: usize },
+    /// One move: moves don't run together.
+    Move { pos: usize, len: usize, to: usize },
+    /// One mark: marks don't run together either.
+    Mark { pos: usize, level: u8 },
 }
 
 impl<T> Run<T> {
@@ -94,6 +111,7 @@ impl<T> Run<T> {
         match &self.op {
             RunOp::Insert { items, .. } => items.len(),
             RunOp::Delete { len, .. } | RunOp::Undelete { len, .. } => *len,
+            RunOp::Move { .. } | RunOp::Mark { .. } => 1,
         }
     }
 
@@ -167,7 +185,10 @@ impl<T: Clone> OpLog<T> {
         let k = first - run.start;
         match &run.op {
             RunOp::Insert { items, .. } => items.get(k..k + len),
-            RunOp::Delete { .. } | RunOp::Undelete { .. } => None,
+            RunOp::Delete { .. }
+            | RunOp::Undelete { .. }
+            | RunOp::Move { .. }
+            | RunOp::Mark { .. } => None,
         }
     }
 
@@ -182,6 +203,8 @@ impl<T: Clone> OpLog<T> {
             },
             RunOp::Delete { pos, .. } => Op::Delete { pos: *pos },
             RunOp::Undelete { target, .. } => Op::Undelete { target: target + k },
+            &RunOp::Move { pos, len, to } => Op::Move { pos, len, to },
+            &RunOp::Mark { pos, level } => Op::Mark { pos, level },
         }
     }
 
@@ -236,6 +259,38 @@ impl<T: Clone> OpLog<T> {
             version = vec![lv];
         }
         version
+    }
+
+    /// Moves the items in `range` to `to` (a position in the document as
+    /// it is, outside `range`), in a document at `parents`, as `agent`,
+    /// keeping their identities. Returns the version after.
+    pub fn add_move(
+        &mut self,
+        agent: AgentId,
+        parents: &[Lv],
+        range: Range<usize>,
+        to: usize,
+    ) -> Vec<Lv> {
+        assert!(
+            to <= range.start || to >= range.end,
+            "can't move {range:?} into itself, to {to}"
+        );
+        let seq = self.next_seq[agent.0 as usize];
+        let op = Op::Move {
+            pos: range.start,
+            len: range.len(),
+            to,
+        };
+        vec![self.push(agent, seq, normalize(parents.to_vec()), op)]
+    }
+
+    /// Marks the item at `pos` as starting a section at `level` (0 to
+    /// unmark), in a document at `parents`, as `agent`. Returns the version
+    /// after.
+    pub fn add_mark(&mut self, agent: AgentId, parents: &[Lv], pos: usize, level: u8) -> Vec<Lv> {
+        let seq = self.next_seq[agent.0 as usize];
+        let op = Op::Mark { pos, level };
+        vec![self.push(agent, seq, normalize(parents.to_vec()), op)]
     }
 
     /// Adds an event made elsewhere: `agent`'s event number `seq`, after
@@ -349,11 +404,13 @@ impl<T: Clone> OpLog<T> {
                 .expect("a run's agent has a span for it");
             span.1 += 1;
         } else {
+            let lamport = self.lamport_after(&parents);
             self.runs.push(Run {
                 agent,
                 seq,
                 start: lv,
                 parents,
+                lamport,
                 op: match op {
                     Op::Insert { pos, item } => RunOp::Insert {
                         pos,
@@ -361,6 +418,8 @@ impl<T: Clone> OpLog<T> {
                     },
                     Op::Delete { pos } => RunOp::Delete { pos, len: 1 },
                     Op::Undelete { target } => RunOp::Undelete { target, len: 1 },
+                    Op::Move { pos, len, to } => RunOp::Move { pos, len, to },
+                    Op::Mark { pos, level } => RunOp::Mark { pos, level },
                 },
             });
             self.spans[agent.0 as usize].insert(seq, (lv, 1));
@@ -385,6 +444,7 @@ impl<T> OpLog<T> {
         let len = match &op {
             RunOp::Insert { items, .. } => items.len(),
             RunOp::Delete { len, .. } => *len,
+            RunOp::Move { .. } | RunOp::Mark { .. } => 1,
             RunOp::Undelete { .. } => unreachable!("undeletes go one at a time"),
         };
         debug_assert!(len > 0 && parents.iter().all(|&p| p < lv));
@@ -420,12 +480,14 @@ impl<T> OpLog<T> {
                 .expect("a run's agent has a span for it");
             span.1 += len;
         } else {
+            let lamport = self.lamport_after(&parents);
             self.runs.push(Run {
                 agent,
                 seq,
                 start: lv,
                 parents,
                 op,
+                lamport,
             });
             self.spans[agent.index()].insert(seq, (lv, len));
         }
@@ -541,6 +603,8 @@ impl<T> OpLog<T> {
             RunOp::Insert { .. } => Kind::Insert,
             RunOp::Delete { .. } => Kind::Delete,
             RunOp::Undelete { .. } => Kind::Undelete,
+            RunOp::Move { .. } => Kind::Move,
+            RunOp::Mark { .. } => Kind::Mark,
         }
     }
 
@@ -751,6 +815,19 @@ impl<T> OpLog<T> {
         seen
     }
 
+    /// Event `lv`'s Lamport time: one more than its latest parent's. What
+    /// decides which moves are active (see `reference.rs`): a time every
+    /// replica gives an event alike. Kept as events are added.
+    pub(crate) fn lamport(&self, lv: Lv) -> u64 {
+        let run = self.run_of(lv);
+        run.lamport + (lv - run.start) as u64
+    }
+
+    /// The Lamport time of an event after `parents`.
+    fn lamport_after(&self, parents: &[Lv]) -> u64 {
+        parents.iter().map(|&p| self.lamport(p)).max().unwrap_or(0) + 1
+    }
+
     /// Whether `version` includes event `lv`.
     pub fn contains(&self, version: &[Lv], lv: Lv) -> bool {
         self.closure(version)[lv]
@@ -760,15 +837,38 @@ impl<T> OpLog<T> {
     /// already includes.
     pub fn union(&self, a: &[Lv], b: &[Lv]) -> Vec<Lv> {
         let all = normalize(a.iter().chain(b).copied().collect());
-        let keep: Vec<Lv> = all
-            .iter()
-            .copied()
-            .filter(|&lv| {
-                let others: Vec<Lv> = all.iter().copied().filter(|&o| o != lv).collect();
-                !self.closure(&others)[lv]
-            })
-            .collect();
-        keep
+        if all.len() < 2 {
+            return all;
+        }
+        // An entry another includes is before that one: in what all the
+        // entries' parents include, as nothing includes itself. One walk
+        // back from all the parents at once finds them, latest first, a run
+        // at a time; as events come after their parents, it stops below the
+        // earliest entry.
+        let mut dropped = vec![false; all.len()];
+        let mut next: BinaryHeap<Lv> = all.iter().flat_map(|&lv| self.parents(lv)).collect();
+        let mut seen: HashSet<Lv> = HashSet::new();
+        while let Some(x) = next.pop() {
+            if x < all[0] {
+                break;
+            }
+            // Latest first, so the first time a run is reached is from
+            // its latest event reached at all.
+            let run = self.run_of(x);
+            if !seen.insert(run.start) {
+                continue;
+            }
+            let (i, j) = (
+                all.partition_point(|&e| e < run.start),
+                all.partition_point(|&e| e <= x),
+            );
+            dropped[i..j].fill(true);
+            next.extend(&run.parents);
+        }
+        all.into_iter()
+            .zip(dropped)
+            .filter_map(|(lv, gone)| (!gone).then_some(lv))
+            .collect()
     }
 
     /// How an event's inserts are ordered against concurrent ones at the

@@ -91,21 +91,19 @@ impl<T: Item, const CAP: usize> SumTree<T, CAP> {
     }
 }
 
-/// Pushes each item onto the end, one at a time.
+/// Adds the items onto the end: built into a tree of their own at once
+/// (see [`SumTree::from_items`]), then appended.
 impl<T: Item, const CAP: usize> Extend<T> for SumTree<T, CAP> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, items: I) {
-        for item in items {
-            self.push(item);
-        }
+        self.append(SumTree::from_items(items));
     }
 }
 
-/// So `iter.collect::<SumTree<_>>()` works.
+/// So `iter.collect::<SumTree<_>>()` works: built at once, see
+/// [`SumTree::from_items`].
 impl<T: Item, const CAP: usize> FromIterator<T> for SumTree<T, CAP> {
     fn from_iter<I: IntoIterator<Item = T>>(items: I) -> Self {
-        let mut tree = SumTree::new();
-        tree.extend(items);
-        tree
+        SumTree::from_items(items)
     }
 }
 

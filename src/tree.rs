@@ -60,6 +60,51 @@ impl<T: Item, const CAP: usize> SumTree<T, CAP> {
         })
     }
 
+    /// A tree of `items`, in order, built a level at a time: each level's
+    /// nodes cut as evenly as they go into as few as fit, then those nodes
+    /// are the next level's children, up to a single root. O(n), where
+    /// pushing them one by one is O(n log n), and every node is as full as
+    /// an even cut allows, so the tree is as short as it can be.
+    ///
+    /// An even cut keeps the shape rules: `n` things in `g = ⌈n / CAP⌉`
+    /// nodes put at most `CAP` in each, and when `g ≥ 2`, at least
+    /// `⌊n / g⌋ ≥ CAP / 2`, as `n > CAP (g − 1)`.
+    pub fn from_items(items: impl IntoIterator<Item = T>) -> Self {
+        let mut items = items.into_iter().collect::<Vec<T>>().into_iter();
+        let mut level: Vec<SumTree<T, CAP>> = even_cut::<CAP>(items.len())
+            .map(|size| {
+                let items: ArrayVec<T, CAP> = items.by_ref().take(size).collect();
+                let item_summaries: ArrayVec<T::Summary, CAP> =
+                    items.iter().map(Item::summary).collect();
+                Self::from_node(Node::Leaf {
+                    summary: sum_all(&item_summaries),
+                    items,
+                    item_summaries,
+                })
+            })
+            .collect();
+        let mut height = 0;
+        while level.len() > 1 {
+            height += 1;
+            let mut below = level.into_iter();
+            level = even_cut::<CAP>(below.len())
+                .map(|size| {
+                    let children: ArrayVec<SumTree<T, CAP>, CAP> =
+                        below.by_ref().take(size).collect();
+                    let child_summaries: ArrayVec<T::Summary, CAP> =
+                        children.iter().map(|c| c.summary().clone()).collect();
+                    Self::from_node(Node::Internal {
+                        height,
+                        summary: sum_all(&child_summaries),
+                        children,
+                        child_summaries,
+                    })
+                })
+                .collect();
+        }
+        level.pop().unwrap_or_default()
+    }
+
     pub fn summary(&self) -> &T::Summary {
         self.root.summary()
     }
@@ -455,6 +500,18 @@ fn share<E, const CAP: usize>(
         let n = keep - left.len();
         left.extend(right.drain(..n));
     }
+}
+
+/// The sizes of the nodes `n` things are cut into, evenly, as few as fit
+/// in nodes of `CAP`: the first `n mod g` of the `g` nodes one bigger.
+fn even_cut<const CAP: usize>(n: usize) -> impl ExactSizeIterator<Item = usize> {
+    let nodes = n.div_ceil(CAP);
+    let (each, bigger) = if nodes == 0 {
+        (0, 0)
+    } else {
+        (n / nodes, n % nodes)
+    };
+    (0..nodes).map(move |k| each + (k < bigger) as usize)
 }
 
 fn sum_all<S: Summary, const CAP: usize>(children: &ArrayVec<S, CAP>) -> S {
@@ -1075,6 +1132,25 @@ mod tests {
     }
 
     proptest! {
+        /// Built at once, on tiny nodes, odd and even, and the default:
+        /// the same items and summary as pushing them one by one, the
+        /// shape rules kept, and never taller.
+        #[test]
+        fn from_items_matches_pushing(n in 0u64..3000) {
+            fn check<const CAP: usize>(n: u64) -> Result<(), TestCaseError> {
+                let built: SumTree<u64, CAP> = SumTree::from_items(0..n);
+                let pushed: SumTree<u64, CAP> = tree_of(0..n);
+                built.check().map_err(TestCaseError::fail)?;
+                prop_assert_eq!(built.items(), pushed.items());
+                prop_assert_eq!(built.summary(), pushed.summary());
+                prop_assert!(built.height() <= pushed.height());
+                Ok(())
+            }
+            check::<4>(n)?;
+            check::<5>(n)?;
+            check::<{ crate::CAPSIZE }>(n)?;
+        }
+
         #[test]
         fn push_keeps_order_summaries_and_balance(n in 0u64..2000) {
             let tree: SumTree<u64> = tree_of(0..n);

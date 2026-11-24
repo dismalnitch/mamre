@@ -49,9 +49,11 @@ use std::sync::Arc;
 use mamre::cursor::Bias;
 use mamre::{Item, SeekTarget, SumTree, Summary};
 
+use crate::blocks::Blocks;
 use crate::ids::{Identities, Ids};
 use crate::key::Key;
 use crate::oplog::{Kind, Lv, Op, OpLog};
+use crate::recent::Recent;
 
 /// Ids at or above this name items of the base document, by position.
 pub(crate) const BASE_ITEM: usize = 1 << 62;
@@ -74,6 +76,19 @@ pub enum Change<'a, T> {
     },
     /// The items in `range` go.
     Delete { range: Range<usize> },
+    /// The items in `range` move to `to`, a position in the document as it
+    /// was before the move (outside the range), as `Rope::move_range` moves
+    /// text. They're the same items, somewhere else: anything keyed to
+    /// them goes with them.
+    Move { range: Range<usize>, to: usize },
+    /// Item `item` now starts a section at `level` (0: no section). It's at
+    /// `pos`, if it shows. The document's items don't change: this is for
+    /// whatever keeps its outline (see [`Accountant`](crate::Accountant)).
+    Mark {
+        item: Lv,
+        pos: Option<usize>,
+        level: u8,
+    },
 }
 
 impl<T> Clone for Change<'_, T> {
@@ -87,19 +102,64 @@ impl<T> Clone for Change<'_, T> {
             Change::Delete { range } => Change::Delete {
                 range: range.clone(),
             },
+            Change::Move { range, to } => Change::Move {
+                range: range.clone(),
+                to: *to,
+            },
+            Change::Mark { item, pos, level } => Change::Mark {
+                item: *item,
+                pos: *pos,
+                level: *level,
+            },
         }
     }
 }
 
-impl<T: Clone> Change<'_, T> {
-    pub fn apply(&self, doc: &mut Vec<T>) {
+/// A document changes can be applied to: anything that can put items in,
+/// take them out, and move them. Positions count items. This is all the
+/// CRDT asks of a document; it keeps everything else itself (see
+/// [`Accountant`](crate::Accountant)).
+///
+/// A text buffer counting bytes, say, maps positions to its own offsets.
+pub trait Sequence<T> {
+    /// `items` go in at `pos`.
+    fn insert(&mut self, pos: usize, items: &[T]);
+    /// The items in `range` go.
+    fn delete(&mut self, range: Range<usize>);
+    /// The items in `range` move to `to`, a position before the move,
+    /// outside the range: the same items, somewhere else.
+    fn move_range(&mut self, range: Range<usize>, to: usize);
+}
+
+impl<T: Clone> Sequence<T> for Vec<T> {
+    fn insert(&mut self, pos: usize, items: &[T]) {
+        self.splice(pos..pos, items.iter().cloned());
+    }
+
+    fn delete(&mut self, range: Range<usize>) {
+        self.drain(range);
+    }
+
+    fn move_range(&mut self, range: Range<usize>, to: usize) {
+        let moved: Vec<T> = self.drain(range.clone()).collect();
+        let at = if to > range.start {
+            to - range.len()
+        } else {
+            to
+        };
+        self.splice(at..at, moved);
+    }
+}
+
+impl<T> Change<'_, T> {
+    /// Applies this change to `doc`.
+    pub fn apply(&self, doc: &mut impl Sequence<T>) {
         match self {
-            Change::Insert { pos, items, .. } => {
-                doc.splice(*pos..*pos, items.iter().cloned());
-            }
-            Change::Delete { range } => {
-                doc.drain(range.clone());
-            }
+            Change::Insert { pos, items, .. } => doc.insert(*pos, items),
+            Change::Delete { range } => doc.delete(range.clone()),
+            Change::Move { range, to } => doc.move_range(range.clone(), *to),
+            // A mark changes no items.
+            Change::Mark { .. } => {}
         }
     }
 }
@@ -113,6 +173,23 @@ pub(crate) struct Changes<'a, T> {
     /// kept, and which item each new delete removed, where known.
     pub(crate) ids: Option<Ids>,
     pub(crate) learned: Vec<(Lv, Lv)>,
+    /// The moved blocks of the document the changes make, when the log has
+    /// moves (see `blocks.rs`).
+    pub(crate) blocks: Option<Blocks>,
+    /// Every change asked for, as asked, before any are joined up: so a
+    /// debug build can check two windows ask for the same.
+    #[cfg(all(debug_assertions, not(feature = "perf")))]
+    pub(crate) calls: Vec<Call>,
+}
+
+/// A change as asked for: see `Changes::calls`.
+#[cfg(all(debug_assertions, not(feature = "perf")))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Call {
+    Insert(usize, Lv, usize),
+    Mark(Lv, Option<usize>, u8),
+    Move(Range<usize>, usize),
+    Delete(usize, usize),
 }
 
 impl<'a, T: Clone> Changes<'a, T> {
@@ -122,6 +199,9 @@ impl<'a, T: Clone> Changes<'a, T> {
             out: Vec::new(),
             ids: None,
             learned: Vec::new(),
+            blocks: None,
+            #[cfg(all(debug_assertions, not(feature = "perf")))]
+            calls: Vec::new(),
         }
     }
 
@@ -132,6 +212,8 @@ impl<'a, T: Clone> Changes<'a, T> {
 
     /// The items of events `lv..lv + n`, one run in the log, go in at `pos`.
     pub(crate) fn insert_run(&mut self, pos: usize, lv: Lv, n: usize) {
+        #[cfg(all(debug_assertions, not(feature = "perf")))]
+        self.calls.push(Call::Insert(pos, lv, n));
         if let Some(ids) = &mut self.ids {
             ids.insert(pos, lv, n);
         }
@@ -161,6 +243,23 @@ impl<'a, T: Clone> Changes<'a, T> {
         });
     }
 
+    /// Item `item`, at `pos` if it shows, starts a section at `level`.
+    pub(crate) fn mark(&mut self, item: Lv, pos: Option<usize>, level: u8) {
+        #[cfg(all(debug_assertions, not(feature = "perf")))]
+        self.calls.push(Call::Mark(item, pos, level));
+        self.out.push(Change::Mark { item, pos, level });
+    }
+
+    /// The items in `range` move to `to`.
+    pub(crate) fn move_range(&mut self, range: Range<usize>, to: usize) {
+        #[cfg(all(debug_assertions, not(feature = "perf")))]
+        self.calls.push(Call::Move(range.clone(), to));
+        if let Some(ids) = &mut self.ids {
+            ids.move_range(range.clone(), to);
+        }
+        self.out.push(Change::Move { range, to });
+    }
+
     /// The item at `pos` goes.
     pub(crate) fn delete(&mut self, pos: usize) {
         self.delete_run(pos, 1);
@@ -168,6 +267,8 @@ impl<'a, T: Clone> Changes<'a, T> {
 
     /// The item at `pos` goes, `n` times over: the `n` items from `pos`.
     pub(crate) fn delete_run(&mut self, pos: usize, n: usize) {
+        #[cfg(all(debug_assertions, not(feature = "perf")))]
+        self.calls.push(Call::Delete(pos, n));
         if let Some(ids) = &mut self.ids {
             ids.remove(pos..pos + n);
         }
@@ -368,6 +469,10 @@ struct Walk<'a, T> {
     checkouts: usize,
     /// Nothing has touched the records since they were made.
     fresh: bool,
+    /// Each marked item's winning mark among those replayed, by the order
+    /// marks are decided in. One from before the base always loses: it's
+    /// earlier in Lamport time than anything replayed.
+    marks: HashMap<usize, (u64, (&'a str, u64))>,
 }
 
 impl<T: Clone> OpLog<T> {
@@ -388,7 +493,7 @@ impl<T: Clone> OpLog<T> {
 
     /// The changes, and what finding them cost.
     pub(crate) fn walk(&self, from: &[Lv], to: &[Lv]) -> (Vec<Change<'_, T>>, Stats) {
-        let (out, stats) = self.walk_into(from, to, false, None);
+        let (out, stats) = self.walk_into(from, to, false, None, None);
         (out.out, stats)
     }
 
@@ -396,7 +501,7 @@ impl<T: Clone> OpLog<T> {
     /// its document's [`Identities`], at `from`: they're used to bring back
     /// items an undo revives, and brought up to date with the changes.
     pub fn changes_with(&self, from: &[Lv], to: &[Lv], ids: &mut Identities) -> Vec<Change<'_, T>> {
-        let (out, _) = self.walk_into(from, to, true, Some(ids));
+        let (out, _) = self.walk_into(from, to, true, Some(ids), None);
         if let Some(new) = out.ids {
             ids.ids = new;
         }
@@ -404,9 +509,32 @@ impl<T: Clone> OpLog<T> {
         out.out
     }
 
+    /// The changes, as [`changes_with`](Self::changes_with), keeping the
+    /// document's moved blocks as well: the [`Accountant`]'s way.
+    ///
+    /// [`Accountant`]: crate::Accountant
+    pub(crate) fn changes_kept(
+        &self,
+        from: &[Lv],
+        to: &[Lv],
+        ids: &mut Identities,
+        blocks: &mut Blocks,
+        recent: &Recent,
+    ) -> Vec<Change<'_, T>> {
+        let (out, _) = self.walk_into_kept(from, to, Some(ids), Some(blocks), Some(recent));
+        if let Some(new) = out.ids {
+            ids.ids = new;
+        }
+        if let Some(new) = out.blocks {
+            *blocks = new;
+        }
+        ids.learn(out.learned);
+        out.out
+    }
+
     /// Which insert each item at `version` came from.
     pub(crate) fn ids_at(&self, version: &[Lv]) -> Ids {
-        self.walk_into(&[], version, true, None)
+        self.walk_into(&[], version, true, None, None)
             .0
             .ids
             .expect("a walk from nothing keeps identities")
@@ -421,7 +549,12 @@ impl<T: Clone> OpLog<T> {
         to: &[Lv],
         keep_ids: bool,
         known: Option<&Identities>,
+        known_blocks: Option<&Blocks>,
     ) -> (Changes<'_, T>, Stats) {
+        if self.has_moves() {
+            let known = known.map(|k| &k.ids);
+            return self.walk_moves(from, to, keep_ids, known, known_blocks, None);
+        }
         let mut out = Changes::new(self);
         // What to replay, and the base: a version every replayed event
         // includes whole, so none of it is ever retreated.
@@ -433,10 +566,14 @@ impl<T: Clone> OpLog<T> {
         let undoes = new
             .iter()
             .any(|span| self.kind(span.start) == Kind::Undelete);
+        // A mark's change names its item, so marks need identities kept.
+        let marks = self.has_marks();
         if let Some(known) = known {
             out.ids = Some(known.ids.clone());
-        } else if from.is_empty() && (keep_ids || undoes) {
+        } else if from.is_empty() && (keep_ids || undoes || marks) {
             out.ids = Some(Ids::default());
+        } else if marks {
+            out.ids = Some(self.ids_at(from));
         }
         if new.is_empty() {
             return (out, Stats::default());
@@ -494,6 +631,13 @@ impl<T: Clone> OpLog<T> {
                                 out.delete_run(pos, n)
                             }
                             Op::Undelete { .. } => unreachable!("an undelete is never critical"),
+                            Op::Move { .. } => {
+                                unreachable!("a log with moves takes the moves path")
+                            }
+                            Op::Mark { pos, level } => {
+                                let item = out.ids.as_ref().expect("kept for marks").get(pos);
+                                out.mark(item, Some(pos), level);
+                            }
                         }
                     }
                     let last = lv + n - 1;
@@ -537,6 +681,200 @@ impl<T: Clone> OpLog<T> {
             records: walk.records.iter().count(),
         };
         (out, stats)
+    }
+
+    /// Whether any event is a mark.
+    fn has_marks(&self) -> bool {
+        self.runs
+            .iter()
+            .any(|run| matches!(run.op, crate::oplog::RunOp::Mark { .. }))
+    }
+
+    /// Whether any event is a move: if not, the walk needn't know about
+    /// blocks at all.
+    fn has_moves(&self) -> bool {
+        self.runs
+            .iter()
+            .any(|run| matches!(run.op, crate::oplog::RunOp::Move { .. }))
+    }
+
+    /// The walk, as the accountant asks: identities kept, and with moves,
+    /// the blocks too, and the base's books found from the `recent` ones.
+    fn walk_into_kept(
+        &self,
+        from: &[Lv],
+        to: &[Lv],
+        known: Option<&Identities>,
+        known_blocks: Option<&Blocks>,
+        recent: Option<&Recent>,
+    ) -> (Changes<'_, T>, Stats) {
+        if self.has_moves() {
+            let known = known.map(|k| &k.ids);
+            return self.walk_moves(from, to, true, known, known_blocks, recent);
+        }
+        self.walk_into(from, to, true, known, known_blocks)
+    }
+
+    /// The identities and blocks of the document at `version`: from the
+    /// latest of the `recent` books at or before it, walked forward, or
+    /// from nothing.
+    fn books_at(&self, version: &[Lv], recent: Option<&Recent>) -> (Option<Ids>, Blocks) {
+        if let Some(recent) = recent {
+            if let Some(kept) = recent.at(version) {
+                return (Some(kept.ids.clone()), kept.blocks.clone());
+            }
+            let holds = self.closure(version);
+            if let Some(kept) = recent.latest_within(|lv| holds[lv]) {
+                // Its base is at or before the kept version, and before
+                // `version`: each walk back starts earlier, so this ends.
+                let (o, _) = self.walk_moves(
+                    &kept.version,
+                    version,
+                    true,
+                    Some(&kept.ids),
+                    Some(&kept.blocks),
+                    Some(recent),
+                );
+                return (o.ids, o.blocks.unwrap_or_default());
+            }
+        }
+        let (o, _) = self.walk_moves(&[], version, true, None, None, None);
+        (o.ids, o.blocks.unwrap_or_default())
+    }
+
+    /// The walk, for a log with moves. Where nothing is concurrent, events
+    /// apply as they are, and the document's moved blocks are kept up to
+    /// date by position (see `blocks.rs`). Between, each stretch is merged
+    /// the simple walk's way, from the document where it starts, whose
+    /// identities and blocks are known by then; the first, from the base,
+    /// finds them if they aren't: from the `recent` books (see `recent.rs`),
+    /// or from nothing.
+    fn walk_moves(
+        &self,
+        from: &[Lv],
+        to: &[Lv],
+        keep_ids: bool,
+        known: Option<&Ids>,
+        known_blocks: Option<&Blocks>,
+        recent: Option<&Recent>,
+    ) -> (Changes<'_, T>, Stats) {
+        let mut out = Changes::new(self);
+        let (old, new, base) = self.conflict(from, to);
+        let marks = self.has_marks();
+        if let Some(known) = known {
+            out.ids = Some(known.clone());
+        } else if from.is_empty() && (keep_ids || marks) {
+            out.ids = Some(Ids::default());
+        } else if marks {
+            out.ids = Some(self.ids_at(from));
+        }
+        // The document the changes make: its blocks, as it goes.
+        let mut blocks = match known_blocks {
+            Some(known) => known.clone(),
+            None if from.is_empty() => Blocks::default(),
+            None => self.blocks_at(from),
+        };
+        if new.is_empty() {
+            out.blocks = Some(blocks);
+            return (out, Stats::default());
+        }
+        let order: Vec<(Range<Lv>, bool)> = old
+            .iter()
+            .map(|span| (span.clone(), false))
+            .chain(new.iter().map(|span| (span.clone(), true)))
+            .collect();
+        let critical = self.critical_points(&order, &old, &new, &base);
+        let mut critical = critical.iter().peekable();
+        let old_len: usize = old.iter().map(|span| span.len()).sum();
+        // Where the next window starts, and what's known of it there.
+        let mut start = base.clone();
+        // Whether the books kept so far are the document's at `start`:
+        // from the document the changes start from, or just after events
+        // applied as they are. (Nothing changes between those and the next
+        // window, so they're taken when it opens.)
+        let mut fresh = old_len == 0;
+        let mut window: Option<crate::window::Checked<'_, T>> = None;
+        let mut at = 0;
+        for (span, output) in order {
+            let mut lv = span.start;
+            while lv < span.end {
+                // The stretch from here that's all critical, or none of it.
+                while critical.next_if(|c| c.end <= at).is_some() {}
+                let (is_critical, until) = match critical.peek() {
+                    Some(c) if c.start <= at => (true, c.end),
+                    Some(c) => (false, c.start),
+                    None => (false, usize::MAX),
+                };
+                let n = (span.end - lv).min(until - at);
+                if is_critical && output {
+                    if let Some(w) = window.take() {
+                        blocks = w.blocks();
+                    }
+                    self.apply_critical(lv, n, &mut out, &mut blocks);
+                    start = vec![lv + n - 1];
+                    fresh = true;
+                } else {
+                    let w = window.get_or_insert_with(|| {
+                        let (ids, found) = if fresh {
+                            (out.ids.clone(), blocks.clone())
+                        } else {
+                            self.books_at(&start, recent)
+                        };
+                        crate::window::Checked::new(self, start.clone(), ids, &found)
+                    });
+                    for k in 0..n {
+                        w.step(lv + k, output.then_some(&mut out));
+                    }
+                }
+                lv += n;
+                at += n;
+            }
+        }
+        if let Some(w) = window.take() {
+            blocks = w.blocks();
+        }
+        out.blocks = Some(blocks);
+        (out, Stats::default())
+    }
+
+    /// Applies events `lv..lv + n`, one run in the log, each of which saw
+    /// everything before it and is seen by everything after: their
+    /// positions are final.
+    fn apply_critical(&self, lv: Lv, n: usize, out: &mut Changes<'_, T>, blocks: &mut Blocks) {
+        match self.op(lv) {
+            Op::Insert { pos, .. } => {
+                out.insert_run(pos, lv, n);
+                blocks.insert(pos, n);
+            }
+            Op::Delete { pos } => {
+                // Deleting forward: each removes what's moved up to `pos`.
+                if let Some(ids) = &out.ids {
+                    let gone: Vec<(Lv, Lv)> = (0..n).map(|k| (lv + k, ids.get(pos + k))).collect();
+                    out.learned.extend(gone);
+                }
+                out.delete_run(pos, n);
+                blocks.delete(pos..pos + n);
+            }
+            Op::Undelete { .. } => unreachable!("an undelete is never critical"),
+            Op::Mark { pos, level } => {
+                let item = out.ids.as_ref().expect("kept for marks").get(pos);
+                out.mark(item, Some(pos), level);
+            }
+            Op::Move { pos, len, to } => {
+                debug_assert_eq!(n, 1, "moves don't run");
+                if blocks.apply_move(lv, pos..pos + len, to) {
+                    out.move_range(pos..pos + len, to);
+                }
+            }
+        }
+    }
+
+    /// The moved blocks of the document at `version`, from nothing.
+    fn blocks_at(&self, version: &[Lv]) -> Blocks {
+        self.walk_moves(&[], version, false, None, None, None)
+            .0
+            .blocks
+            .unwrap_or_default()
     }
 
     /// Where a replay is critical, as ranges of places in it: each event
@@ -667,6 +1005,7 @@ impl<'a, T: Clone> Walk<'a, T> {
             stepped: 0,
             checkouts: 0,
             fresh: true,
+            marks: HashMap::new(),
         }
     }
 }
@@ -691,6 +1030,8 @@ impl<'a, T: Clone> Walk<'a, T> {
             Op::Insert { pos, .. } => self.insert(lv, pos, out),
             Op::Delete { pos } => self.delete(lv, pos, out),
             Op::Undelete { target } => self.undelete(target, out),
+            Op::Move { .. } => unreachable!("a log with moves takes the moves path"),
+            Op::Mark { pos, level } => self.mark(lv, pos, level, out),
         }
         self.prepared = vec![lv];
     }
@@ -715,7 +1056,7 @@ impl<'a, T: Clone> Walk<'a, T> {
                 true
             }
             // One at a time.
-            Kind::Undelete => false,
+            Kind::Undelete | Kind::Move | Kind::Mark => false,
         };
         if done {
             self.replayed += n - 1;
@@ -846,6 +1187,11 @@ impl<'a, T: Clone> Walk<'a, T> {
             let kind = self.log.kind(events[i]);
             if kind == Kind::Undelete {
                 self.shift_undelete(events[i], forward);
+                i += 1;
+                continue;
+            }
+            // A mark shows nothing and hides nothing.
+            if kind == Kind::Mark {
                 i += 1;
                 continue;
             }
@@ -1167,6 +1513,23 @@ impl<'a, T: Clone> Walk<'a, T> {
         }
     }
 
+    /// A mark of the item at `pos`: it wins if it's the latest of the item's
+    /// marks so far.
+    fn mark(&mut self, lv: Lv, pos: usize, level: u8, out: Option<&mut Changes<'a, T>>) {
+        let (key, id) = self.prepared_item(pos, true);
+        let me = (self.log.lamport(lv), self.log.order_key(lv));
+        if self.marks.get(&id).is_some_and(|won| *won > me) {
+            return;
+        }
+        self.marks.insert(id, me);
+        if let Some(out) = out {
+            let item = self.identity(id);
+            let (record, _) = self.record_at(&key);
+            let pos = (record.dead == 0).then(|| self.effect_pos(&key, id));
+            out.mark(item, pos, level);
+        }
+    }
+
     /// Undoes delete `d`: the item it removed shows again, in both
     /// versions, if nothing else still removes it there.
     fn undelete(&mut self, d: Lv, out: Option<&mut Changes<'a, T>>) {
@@ -1326,7 +1689,7 @@ fn without(ranges: Vec<Range<usize>>, mut cut: Vec<Range<usize>>) -> Vec<Range<u
 }
 
 /// Compares right origins, where `None` is after everything.
-fn cmp_right(a: Option<&Key>, b: Option<&Key>) -> Ordering {
+pub(crate) fn cmp_right(a: Option<&Key>, b: Option<&Key>) -> Ordering {
     match (a, b) {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Greater,
@@ -1565,7 +1928,7 @@ mod tests {
         // Alice's replica: her own undo.
         let undone = log.add_undelete(alice, &gone, gone[0] - 2..=gone[0]);
         let mut mine = ids.clone();
-        let (out, stats) = log.walk_into(&gone, &undone, true, Some(&mine));
+        let (out, stats) = log.walk_into(&gone, &undone, true, Some(&mine), None);
         assert_eq!(stats.checkouts, 0, "local undo");
         drop(out);
         log.changes_with(&gone, &undone, &mut mine);
@@ -1577,9 +1940,9 @@ mod tests {
         let both = log.union(&theirs, &gone);
         log.changes_with(&theirs, &both, &mut bobs);
         let all = log.union(&both, &undone);
-        let (_, stats) = log.walk_into(&both, &all, true, Some(&bobs));
+        let (_, stats) = log.walk_into(&both, &all, true, Some(&bobs), None);
         assert_eq!(stats.checkouts, 0, "remote undo");
-        let (_, stats) = log.walk_into(&both, &all, false, None);
+        let (_, stats) = log.walk_into(&both, &all, false, None, None);
         assert!(stats.checkouts > 0, "without identities, a checkout");
         let mut doc = log.checkout(&both);
         for change in log.changes_with(&both, &all, &mut bobs) {
@@ -1598,7 +1961,7 @@ mod tests {
             ids.insert(len, v[0], 1);
         }
         let back = log.add_undelete(alice, &v, again[0] - 2..=again[0]);
-        let (_, stats) = log.walk_into(&v, &back, true, Some(&ids));
+        let (_, stats) = log.walk_into(&v, &back, true, Some(&ids), None);
         assert_eq!(stats.checkouts, 0, "undo after fresh starts");
     }
 
@@ -1623,7 +1986,7 @@ mod tests {
             .iter()
             .map(|c| match c {
                 Change::Insert { items, .. } => items.len(),
-                Change::Delete { .. } => 0,
+                Change::Delete { .. } | Change::Move { .. } | Change::Mark { .. } => 0,
             })
             .sum();
         assert_eq!(items, len);

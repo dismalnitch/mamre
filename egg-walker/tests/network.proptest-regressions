@@ -1,9 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc dfa4c224466d17d40a5b7e3a6c959d1e5cf1552294b7c3c7cf7fd88f4cc16fc1 # shrinks to acts = [Insert { p: 3, at: 0, n: 1 }, Insert { p: 3, at: 0, n: 1 }, Gossip { p: 0, to: 3 }, Deliver { pick: 0 }, Garbage { p: 0, bytes: [226], from_queue: Some(0) }]
-cc 00d9c1e49302d0076d03c41051ea8fb20198812fd22dab5d5c79ebcf34466832 # shrinks to acts = [Insert { p: 0, at: 0, n: 1 }, Insert { p: 1, at: 0, n: 3 }, Gossip { p: 2, to: 1 }, Duplicate { pick: 0 }, Gossip { p: 2, to: 0 }, Deliver { pick: 0 }, Deliver { pick: 0 }, Insert { p: 0, at: 0, n: 1 }, Deliver { pick: 0 }, Gossip { p: 0, to: 1 }, Deliver { pick: 43690 }, Deliver { pick: 0 }, Garbage { p: 0, bytes: [138], from_queue: Some(0) }]
-cc 7fdfe7621330a8f0745153e4201e071f1e922c55a68bac19ba13f9ce21cec8f0 # shrinks to acts = [Insert { p: 0, at: 0, n: 1 }, Gossip { p: 2, to: 0 }, Insert { p: 1, at: 0, n: 1 }, Deliver { pick: 0 }, Insert { p: 0, at: 0, n: 1 }]

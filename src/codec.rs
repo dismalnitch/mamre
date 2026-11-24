@@ -56,6 +56,17 @@ pub trait Codec: Sized {
         }
     }
 
+    /// Appends a run of values handed over one at a time, as
+    /// [`encode_run`](Self::encode_run) would write them, and returns how
+    /// many. For a run too big to want a copy of first, such as a whole
+    /// document: by default it's collected and written as a slice, and a
+    /// type can write as it goes (text does).
+    fn encode_iter(items: impl IntoIterator<Item = Self>, out: &mut Vec<u8>) -> usize {
+        let items: Vec<Self> = items.into_iter().collect();
+        Self::encode_run(&items, out);
+        items.len()
+    }
+
     /// Reads a run of `n` values written by [`encode_run`](Self::encode_run).
     fn decode_run(n: usize, input: &mut &[u8]) -> Result<Vec<Self>, DecodeError> {
         // Don't trust `n` with an allocation: the bytes run out first.
@@ -201,6 +212,24 @@ impl Codec for char {
     fn encode_run(items: &[Self], out: &mut Vec<u8>) {
         let text: String = items.iter().collect();
         put_str(out, &text);
+    }
+    /// The same string as [`encode_run`](Codec::encode_run), written
+    /// straight into `out`. Its length in bytes comes first, and isn't
+    /// known until it's written: so the text goes in first, and the length
+    /// is put in front of it after, which moves the text once inside `out`
+    /// but never copies the document anywhere else.
+    fn encode_iter(items: impl IntoIterator<Item = Self>, out: &mut Vec<u8>) -> usize {
+        let start = out.len();
+        let mut n = 0;
+        let mut utf8 = [0u8; 4];
+        for c in items {
+            out.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
+            n += 1;
+        }
+        let mut len = Vec::new();
+        put_usize(&mut len, out.len() - start);
+        out.splice(start..start, len);
+        n
     }
     fn decode_run(n: usize, input: &mut &[u8]) -> Result<Vec<Self>, DecodeError> {
         let chars: Vec<char> = get_str(input)?.chars().collect();
@@ -348,6 +377,28 @@ mod tests {
             round_trip(b)?;
             round_trip(c)?;
             round_trip(d)?;
+        }
+
+        /// A run handed over one at a time is written as the same bytes as
+        /// a run in a slice, after whatever was already there: chars
+        /// (which write as they go), and numbers (which collect first).
+        #[test]
+        fn runs_one_at_a_time_match_runs_in_a_slice(
+            text in ".{0,300}",
+            numbers in prop::collection::vec(any::<u32>(), 0..300),
+            before in prop::collection::vec(any::<u8>(), 0..4),
+        ) {
+            let chars: Vec<char> = text.chars().collect();
+            let (mut a, mut b) = (before.clone(), before.clone());
+            char::encode_run(&chars, &mut a);
+            let n = char::encode_iter(chars.iter().copied(), &mut b);
+            prop_assert_eq!(n, chars.len());
+            prop_assert_eq!(&a, &b);
+            let (mut a, mut b) = (before.clone(), before);
+            u32::encode_run(&numbers, &mut a);
+            let n = u32::encode_iter(numbers.iter().copied(), &mut b);
+            prop_assert_eq!(n, numbers.len());
+            prop_assert_eq!(a, b);
         }
 
         #[test]
