@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 use std::rc::Rc;
 
 use crate::blocks::Blocks;
@@ -195,6 +195,63 @@ struct Layout {
     /// Each interval by its move, and each portaled move by its portal.
     by_id: Map<Lv, usize>,
     portal: Map<Lv, usize>,
+}
+
+/// What a drawing goes to: each record drawn, in order, inside the
+/// blocks entered and not yet left.
+trait Sink {
+    fn enter(&mut self, block: Lv);
+    fn leave(&mut self);
+    /// Record `at`, of `len` items, and whether it shows. `Break` stops the
+    /// drawing.
+    fn record(&mut self, at: usize, visible: bool, len: usize) -> ControlFlow<()>;
+}
+
+/// The whole drawing, with each record's path: shared by the records of
+/// one frame.
+struct Entries {
+    out: Vec<Entry>,
+    path: Vec<Lv>,
+    shared: Vec<Rc<[Lv]>>,
+}
+
+impl Sink for Entries {
+    fn enter(&mut self, block: Lv) {
+        self.path.push(block);
+        self.shared.push(Rc::from(&self.path[..]));
+    }
+    fn leave(&mut self) {
+        self.path.pop();
+        self.shared.pop();
+    }
+    fn record(&mut self, at: usize, visible: bool, _: usize) -> ControlFlow<()> {
+        let path = self.shared.last().expect("the top frame's").clone();
+        self.out.push(Entry { at, visible, path });
+        ControlFlow::Continue(())
+    }
+}
+
+/// A search along the drawing: `stop` is asked of each record, with how
+/// many visible items came before it, until it finds something.
+struct Find<R, F> {
+    seen: usize,
+    found: Option<R>,
+    stop: F,
+}
+
+impl<R, F: FnMut(usize, bool, usize, usize) -> Option<R>> Sink for Find<R, F> {
+    fn enter(&mut self, _: Lv) {}
+    fn leave(&mut self) {}
+    fn record(&mut self, at: usize, visible: bool, len: usize) -> ControlFlow<()> {
+        if let Some(found) = (self.stop)(at, visible, len, self.seen) {
+            self.found = Some(found);
+            return ControlFlow::Break(());
+        }
+        if visible {
+            self.seen += len;
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 impl Layout {
@@ -808,42 +865,41 @@ impl<'a, T: Clone> Walk<'a, T> {
         }
     }
 
-    /// The records of version `v`, drawn with `moves` active.
-    fn draw(&self, v: In, moves: &[Moved]) -> (Vec<Entry>, Rc<Layout>) {
+    /// The layout of `moves`, kept until a record goes in.
+    fn laid_out(&self, moves: &[Moved]) -> Rc<Layout> {
         let cached = match &*self.layout.borrow() {
             Some((m, lay)) if m == moves => Some(lay.clone()),
             _ => None,
         };
-        let lay = cached.unwrap_or_else(|| {
+        cached.unwrap_or_else(|| {
             let lay = Rc::new(self.layout(moves));
             *self.layout.borrow_mut() = Some((moves.to_vec(), lay.clone()));
             lay
-        });
-        let mut out = Vec::with_capacity(self.records.len());
-        let mut path = Vec::new();
-        let top: Rc<[Lv]> = Rc::from([]);
-        self.draw_frame(
-            v,
-            &lay,
-            None,
-            0..self.records.len(),
-            &mut path,
-            &top,
-            &mut out,
-        );
-        (out, lay)
+        })
     }
 
+    /// The records of version `v`, drawn with `moves` active.
+    fn draw(&self, v: In, moves: &[Moved]) -> (Vec<Entry>, Rc<Layout>) {
+        let lay = self.laid_out(moves);
+        let mut sink = Entries {
+            out: Vec::with_capacity(self.records.len()),
+            path: Vec::new(),
+            shared: vec![Rc::from([])],
+        };
+        let _ = self.draw_frame(v, &lay, None, 0..self.records.len(), &mut sink);
+        (sink.out, lay)
+    }
+
+    /// Draws the records of frame `frame` in `range` into `sink`, in
+    /// order, until it says to stop.
     fn draw_frame(
         &self,
         v: In,
         lay: &Layout,
         frame: Option<usize>,
         range: Range<usize>,
-        path: &mut Vec<Lv>,
-        shared: &Rc<[Lv]>,
-        out: &mut Vec<Entry>,
-    ) {
+        sink: &mut impl Sink,
+    ) -> ControlFlow<()> {
         let mut i = range.start;
         while i < range.end {
             let r = &self.records[i];
@@ -852,17 +908,12 @@ impl<'a, T: Clone> Walk<'a, T> {
                     if r.portal {
                         if let Some(&k) = lay.portal.get(&r.id) {
                             let a = &lay.active[k];
-                            path.push(a.m.id);
-                            let inner: Rc<[Lv]> = Rc::from(&path[..]);
-                            self.draw_frame(v, lay, Some(k), a.lo..a.hi + 1, path, &inner, out);
-                            path.pop();
+                            sink.enter(a.m.id);
+                            self.draw_frame(v, lay, Some(k), a.lo..a.hi + 1, sink)?;
+                            sink.leave();
                         }
                     } else {
-                        out.push(Entry {
-                            at: i,
-                            visible: self.shows(r, v),
-                            path: shared.clone(),
-                        });
+                        sink.record(i, self.shows(r, v), r.len)?;
                     }
                 }
                 i += 1;
@@ -876,15 +927,15 @@ impl<'a, T: Clone> Walk<'a, T> {
                 .find(|&k| lay.active[k].m.in_place && lay.parent[k] == frame);
             if let Some(k) = here {
                 let a = &lay.active[k];
-                path.push(a.m.id);
-                let inner: Rc<[Lv]> = Rc::from(&path[..]);
-                self.draw_frame(v, lay, Some(k), a.lo..a.hi + 1, path, &inner, out);
-                path.pop();
+                sink.enter(a.m.id);
+                self.draw_frame(v, lay, Some(k), a.lo..a.hi + 1, sink)?;
+                sink.leave();
                 i = a.hi + 1;
             } else {
                 i += 1;
             }
         }
+        ControlFlow::Continue(())
     }
 
     /// The index of the record holding the `pos`th item visible in the
@@ -892,16 +943,19 @@ impl<'a, T: Clone> Walk<'a, T> {
     /// a run of base items. The placeholder never runs out, so there
     /// always is one.
     fn prepared_at(&mut self, pos: usize) -> usize {
-        let (entries, _) = self.draw(In::Prepare, &self.active(In::Prepare));
-        let mut seen = 0;
-        for e in entries.iter().filter(|e| e.visible) {
-            let len = self.records[e.at].len;
-            if pos < seen + len {
-                return self.isolate(e.at, pos - seen);
-            }
-            seen += len;
-        }
-        unreachable!("the placeholder is longer than any document")
+        let lay = self.laid_out(&self.active(In::Prepare));
+        let mut find = Find {
+            seen: 0,
+            found: None,
+            stop: |at, visible, len, seen| {
+                (visible && pos < seen + len).then_some((at, pos - seen))
+            },
+        };
+        let _ = self.draw_frame(In::Prepare, &lay, None, 0..self.records.len(), &mut find);
+        let (at, offset) = find
+            .found
+            .expect("the placeholder is longer than any document");
+        self.isolate(at, offset)
     }
 
     /// Splits item `offset` of record `i` into a record of its own, so
@@ -932,17 +986,15 @@ impl<'a, T: Clone> Walk<'a, T> {
 
     /// How many items the effect version shows before record `i`.
     fn effect_pos(&self, i: usize) -> usize {
-        let (entries, _) = self.draw(In::Effect, &self.active(In::Effect));
-        let mut pos = 0;
-        for e in &entries {
-            if e.at == i {
-                return pos;
-            }
-            if e.visible {
-                pos += self.records[e.at].len;
-            }
-        }
-        unreachable!("record {i} is drawn")
+        let lay = self.laid_out(&self.active(In::Effect));
+        let mut find = Find {
+            seen: 0,
+            found: None,
+            stop: |at, _, _, seen| (at == i).then_some(seen),
+        };
+        let _ = self.draw_frame(In::Effect, &lay, None, 0..self.records.len(), &mut find);
+        find.found
+            .unwrap_or_else(|| unreachable!("record {i} is drawn"))
     }
 
     /// What draws `entry` in the frame at `depth` of its path: its first
