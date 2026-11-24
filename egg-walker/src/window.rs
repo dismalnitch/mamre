@@ -33,7 +33,7 @@ use std::rc::Rc;
 use mamre::cursor::Bias;
 use mamre::{Item, SeekTarget, SumTree, Summary};
 
-use crate::blocks::{Block, Blocks, MARKER, Piece};
+use crate::blocks::{Block, Blocks, Edges, MARKER, Piece};
 use crate::ids::Ids;
 use crate::key::Key;
 use crate::oplog::{Kind, Lv, Op, OpLog};
@@ -1483,7 +1483,11 @@ impl<'a, T: Clone> Window<'a, T> {
                     None => last.last.clone(),
                     Some(g) => frames.location(frames.by_id[g]).1,
                 };
-                let block = Block::new(a.m.id, span, starts != a.lo, ends != a.hi);
+                let hidden = Edges {
+                    head: starts != a.lo,
+                    tail: ends != a.hi,
+                };
+                let block = Block::new(a.m.id, span, hidden);
                 (block, depth)
             })
             .collect();

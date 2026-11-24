@@ -24,7 +24,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::{ControlFlow, Range};
 use std::rc::Rc;
 
-use crate::blocks::{Block, Blocks, MARKER, Piece};
+use crate::blocks::{Block, Blocks, Edges, MARKER, Piece};
 use crate::ids::Ids;
 use crate::oplog::{Kind, Lv, Op, OpLog};
 use crate::order::{Placed, place};
@@ -329,7 +329,7 @@ impl<'a, T: Clone> Window<'a, T> {
                 let depth = f.path.iter().position(|&x| x == a.m.id).unwrap();
                 let head = walk.element(&lay, f, depth + 1).0 != a.lo;
                 let tail = walk.element(&lay, l, depth + 1).1 != a.hi;
-                Some((Block::new(a.m.id, start..end, head, tail), depth))
+                Some((Block::new(a.m.id, start..end, Edges { head, tail }), depth))
             })
             .collect();
         blocks.sort_by_key(|(b, depth)| (b.span.start, std::cmp::Reverse(b.span.end), *depth));

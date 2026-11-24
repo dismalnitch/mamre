@@ -44,7 +44,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use crate::blocks::{Block, Blocks};
+use crate::blocks::{Block, Blocks, Edges};
 use crate::oplog::{Lv, Op, OpLog};
 use crate::order::{Placed, place};
 use crate::walk::tie_break;
@@ -172,7 +172,10 @@ pub(crate) fn blocks<T: Clone>(log: &OpLog<T>, at: &[bool]) -> Blocks {
             let depth = f.path.iter().position(|&x| x == m.id).unwrap();
             let head = state.lifted(f, depth + 1) != lo;
             let tail = state.lifted(l, depth + 1) != hi;
-            Some((Block::new(m.id, first..last + 1, head, tail), depth))
+            Some((
+                Block::new(m.id, first..last + 1, Edges { head, tail }),
+                depth,
+            ))
         })
         .collect();
     blocks.sort_by_key(|(b, depth)| (b.span.start, std::cmp::Reverse(b.span.end), *depth));
@@ -191,7 +194,7 @@ pub fn moved_blocks<T: Clone>(
     blocks(log, &log.closure(version))
         .0
         .into_iter()
-        .map(|b| (b.lv, b.span, b.head, b.tail))
+        .map(|b| (b.lv, b.span, b.hidden.head, b.hidden.tail))
         .collect()
 }
 

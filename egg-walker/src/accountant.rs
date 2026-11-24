@@ -120,7 +120,7 @@ impl Accountant {
         self.blocks
             .sorted()
             .into_iter()
-            .map(|b| (b.lv, b.span, b.head, b.tail))
+            .map(|b| (b.lv, b.span, b.hidden.head, b.hidden.tail))
             .collect()
     }
 

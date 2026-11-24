@@ -45,25 +45,51 @@ use crate::walk::{BASE_ITEM, UNDERWATER};
 /// The ids of a base's markers start here: past every base item.
 pub(crate) const MARKER: usize = BASE_ITEM + UNDERWATER + 1;
 
-/// One moved block: its move, the visible positions it covers, and
-/// whether its interval has hidden records before its first visible
-/// element (`head`) or after its last (`tail`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Block {
-    pub(crate) lv: Lv,
-    pub(crate) span: Range<usize>,
+/// Which ends of a block's interval hide records: before its first
+/// visible element (`head`), after its last (`tail`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Edges {
     pub(crate) head: bool,
     pub(crate) tail: bool,
 }
 
+impl Edges {
+    /// Neither end hides anything.
+    pub(crate) const NONE: Edges = Edges {
+        head: false,
+        tail: false,
+    };
+
+    /// These ends hide something now too: an edge, once hidden, stays so.
+    fn hide(&mut self, more: Edges) {
+        self.head |= more.head;
+        self.tail |= more.tail;
+    }
+
+    fn to_bits(self) -> usize {
+        self.head as usize | (self.tail as usize) << 1
+    }
+
+    fn from_bits(bits: usize) -> Option<Self> {
+        (bits <= 3).then_some(Edges {
+            head: bits & 1 != 0,
+            tail: bits & 2 != 0,
+        })
+    }
+}
+
+/// One moved block: its move, the visible positions it covers, and which
+/// of its ends hide records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Block {
+    pub(crate) lv: Lv,
+    pub(crate) span: Range<usize>,
+    pub(crate) hidden: Edges,
+}
+
 impl Block {
-    pub(crate) fn new(lv: Lv, span: Range<usize>, head: bool, tail: bool) -> Self {
-        Block {
-            lv,
-            span,
-            head,
-            tail,
-        }
+    pub(crate) fn new(lv: Lv, span: Range<usize>, hidden: Edges) -> Self {
+        Block { lv, span, hidden }
     }
 }
 
@@ -144,7 +170,7 @@ impl Blocks {
     /// Whether block `k`'s first element (or last, `!front`) loses all it
     /// shows to `gone`: the visible positions an edit removes from where
     /// they are, deleted or moved off.
-    fn edge_lost(&self, nest: &Nesting, k: usize, gone: &Range<usize>, front: bool) -> bool {
+    fn element_lost(&self, nest: &Nesting, k: usize, gone: &Range<usize>, front: bool) -> bool {
         let b = &self.0[k];
         let child = if front {
             nest.first_child[k]
@@ -163,21 +189,20 @@ impl Blocks {
         }
     }
 
-    /// For each block, whether its first and last element lose all they
-    /// show to `gone` (see `edge_lost`). Only blocks `gone` reaches into
-    /// can, so how blocks nest is worked out only if there are some.
-    fn edges_lost(&self, gone: &Range<usize>) -> Vec<(bool, bool)> {
+    /// The ends of each block whose first or last element loses all it
+    /// shows to `gone` (see `element_lost`): they hide something now. Only
+    /// blocks `gone` reaches into can lose one, so how blocks nest is
+    /// worked out only if there are some.
+    fn edges_lost(&self, gone: &Range<usize>) -> Vec<Edges> {
         let reached = |b: &Block| b.span.start < gone.end && gone.start < b.span.end;
         if !self.0.iter().any(reached) {
-            return vec![(false, false); self.0.len()];
+            return vec![Edges::NONE; self.0.len()];
         }
         let nest = self.nesting();
         (0..self.0.len())
-            .map(|k| {
-                (
-                    self.edge_lost(&nest, k, gone, true),
-                    self.edge_lost(&nest, k, gone, false),
-                )
+            .map(|k| Edges {
+                head: self.element_lost(&nest, k, gone, true),
+                tail: self.element_lost(&nest, k, gone, false),
             })
             .collect()
     }
@@ -212,10 +237,9 @@ impl Blocks {
                 range.start
             }
         };
-        for (b, (head, tail)) in self.0.iter_mut().zip(lost) {
+        for (b, lost) in self.0.iter_mut().zip(lost) {
             b.span = map(b.span.start)..map(b.span.end);
-            b.head |= head;
-            b.tail |= tail;
+            b.hidden.hide(lost);
         }
         self.0.retain(|b| !b.span.is_empty());
     }
@@ -274,8 +298,7 @@ impl Blocks {
             // The moved items leave...
             if s.start <= r.start && r.end <= s.end {
                 s.end -= n;
-                b.head |= lost[k].0;
-                b.tail |= lost[k].1;
+                b.hidden.hide(lost[k]);
             } else if s.start >= r.end {
                 s.start -= n;
                 s.end -= n;
@@ -292,7 +315,7 @@ impl Blocks {
         // Blocks of exactly the moved items are left with nothing: in
         // their place, the new block.
         self.0
-            .insert(at, Block::new(lv, dest..dest + n, false, false));
+            .insert(at, Block::new(lv, dest..dest + n, Edges::NONE));
         self.0.retain(|b| !b.span.is_empty());
         true
     }
@@ -318,10 +341,10 @@ impl Blocks {
         let mut heads: Vec<(usize, usize, usize)> = Vec::new();
         let mut tails: Vec<(usize, Reverse<usize>, usize)> = Vec::new();
         for (k, x) in b.iter().enumerate() {
-            if x.head {
+            if x.hidden.head {
                 heads.push((x.span.start, nest.depth[k], k));
             }
-            if x.tail {
+            if x.hidden.tail {
                 tails.push((x.span.end, Reverse(nest.depth[k]), k));
             }
         }
@@ -388,7 +411,7 @@ impl Blocks {
             put_usize(out, b.lv);
             put_usize(out, b.span.start);
             put_usize(out, b.span.len());
-            put_usize(out, b.head as usize | (b.tail as usize) << 1);
+            put_usize(out, b.hidden.to_bits());
         }
     }
 
@@ -407,11 +430,11 @@ impl Blocks {
             let end = start
                 .checked_add(get_usize(input)?)
                 .ok_or(DecodeError::Overflow)?;
-            let edges = get_usize(input)?;
-            if lv >= events || start >= end || end > len || edges > 3 {
+            let hidden = Edges::from_bits(get_usize(input)?);
+            let Some(hidden) = hidden.filter(|_| lv < events && start < end && end <= len) else {
                 return Err(DecodeError::Invalid("a block this document can't have"));
-            }
-            blocks.push(Block::new(lv, start..end, edges & 1 != 0, edges & 2 != 0));
+            };
+            blocks.push(Block::new(lv, start..end, hidden));
         }
         Ok(Blocks(blocks))
     }
