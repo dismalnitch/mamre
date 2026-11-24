@@ -24,6 +24,7 @@ use crate::blocks::Blocks;
 use crate::ids::Identities;
 use crate::oplog::{Lv, OpLog};
 use crate::outline::{Outline, Section};
+use crate::recent::Recent;
 use crate::walk::Change;
 
 #[derive(Clone)]
@@ -33,6 +34,8 @@ pub struct Accountant {
     anchors: Anchors,
     outline: Outline,
     blocks: Blocks,
+    /// The books at the latest versions, for a merge to start from.
+    recent: Recent,
 }
 
 impl Default for Accountant {
@@ -56,6 +59,7 @@ impl Accountant {
             anchors: Anchors::new(0),
             outline: Outline::default(),
             blocks: Blocks::default(),
+            recent: Recent::default(),
         }
     }
 
@@ -118,12 +122,19 @@ impl Accountant {
     /// and returns the changes that bring the document there.
     pub fn merge<'a, T: Clone>(&mut self, log: &'a OpLog<T>, to: &[Lv]) -> Vec<Change<'a, T>> {
         let to = log.union(&self.version, to);
-        let out = log.changes_kept(&self.version, &to, &mut self.ids, &mut self.blocks);
+        let out = log.changes_kept(
+            &self.version,
+            &to,
+            &mut self.ids,
+            &mut self.blocks,
+            &self.recent,
+        );
         for change in &out {
             self.anchors.apply(change);
             self.outline.apply(change);
         }
         self.version = to;
+        self.recent.keep(&self.version, &self.ids.ids, &self.blocks);
         out
     }
 
@@ -179,12 +190,15 @@ impl Accountant {
         let anchors = Anchors::decode(input, events)?;
         let outline = Outline::decode(input, events)?;
         let blocks = Blocks::decode(input, events, ids.len())?;
+        let mut recent = Recent::default();
+        recent.keep(&version, &ids.ids, &blocks);
         Ok(Accountant {
             version,
             ids,
             anchors,
             outline,
             blocks,
+            recent,
         })
     }
 }

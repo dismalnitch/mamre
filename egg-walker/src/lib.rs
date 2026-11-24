@@ -47,6 +47,7 @@ mod key;
 mod oplog;
 mod order;
 mod outline;
+mod recent;
 pub mod reference;
 mod simple;
 pub mod sync;

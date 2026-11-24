@@ -53,6 +53,7 @@ use crate::blocks::Blocks;
 use crate::ids::{Identities, Ids};
 use crate::key::Key;
 use crate::oplog::{Kind, Lv, Op, OpLog};
+use crate::recent::Recent;
 
 /// Ids at or above this name items of the base document, by position.
 pub(crate) const BASE_ITEM: usize = 1 << 62;
@@ -494,8 +495,9 @@ impl<T: Clone> OpLog<T> {
         to: &[Lv],
         ids: &mut Identities,
         blocks: &mut Blocks,
+        recent: &Recent,
     ) -> Vec<Change<'_, T>> {
-        let (out, _) = self.walk_into(from, to, true, Some(ids), Some(blocks));
+        let (out, _) = self.walk_into_kept(from, to, Some(ids), Some(blocks), Some(recent));
         if let Some(new) = out.ids {
             ids.ids = new;
         }
@@ -526,7 +528,8 @@ impl<T: Clone> OpLog<T> {
         known_blocks: Option<&Blocks>,
     ) -> (Changes<'_, T>, Stats) {
         if self.has_moves() {
-            return self.walk_moves(from, to, keep_ids, known, known_blocks);
+            let known = known.map(|k| &k.ids);
+            return self.walk_moves(from, to, keep_ids, known, known_blocks, None);
         }
         let mut out = Changes::new(self);
         // What to replay, and the base: a version every replayed event
@@ -671,6 +674,50 @@ impl<T: Clone> OpLog<T> {
             .any(|run| matches!(run.op, crate::oplog::RunOp::Move { .. }))
     }
 
+    /// The walk, as the accountant asks: identities kept, and with moves,
+    /// the blocks too, and the base's books found from the `recent` ones.
+    fn walk_into_kept(
+        &self,
+        from: &[Lv],
+        to: &[Lv],
+        known: Option<&Identities>,
+        known_blocks: Option<&Blocks>,
+        recent: Option<&Recent>,
+    ) -> (Changes<'_, T>, Stats) {
+        if self.has_moves() {
+            let known = known.map(|k| &k.ids);
+            return self.walk_moves(from, to, true, known, known_blocks, recent);
+        }
+        self.walk_into(from, to, true, known, known_blocks)
+    }
+
+    /// The identities and blocks of the document at `version`: from the
+    /// latest of the `recent` books at or before it, walked forward, or
+    /// from nothing.
+    fn books_at(&self, version: &[Lv], recent: Option<&Recent>) -> (Option<Ids>, Blocks) {
+        if let Some(recent) = recent {
+            if let Some(kept) = recent.at(version) {
+                return (Some(kept.ids.clone()), kept.blocks.clone());
+            }
+            let holds = self.closure(version);
+            if let Some(kept) = recent.latest_within(|lv| holds[lv]) {
+                // Its base is at or before the kept version, and before
+                // `version`: each walk back starts earlier, so this ends.
+                let (o, _) = self.walk_moves(
+                    &kept.version,
+                    version,
+                    true,
+                    Some(&kept.ids),
+                    Some(&kept.blocks),
+                    Some(recent),
+                );
+                return (o.ids, o.blocks.unwrap_or_default());
+            }
+        }
+        let (o, _) = self.walk_moves(&[], version, true, None, None, None);
+        (o.ids, o.blocks.unwrap_or_default())
+    }
+
     /// The walk, for a log with moves. Where nothing is concurrent, events
     /// apply as they are, and the document's moved blocks are kept up to
     /// date by position (see `blocks.rs`). Between, each stretch is merged
@@ -682,14 +729,15 @@ impl<T: Clone> OpLog<T> {
         from: &[Lv],
         to: &[Lv],
         keep_ids: bool,
-        known: Option<&Identities>,
+        known: Option<&Ids>,
         known_blocks: Option<&Blocks>,
+        recent: Option<&Recent>,
     ) -> (Changes<'_, T>, Stats) {
         let mut out = Changes::new(self);
         let (old, new, base) = self.conflict(from, to);
         let marks = self.has_marks();
         if let Some(known) = known {
-            out.ids = Some(known.ids.clone());
+            out.ids = Some(known.clone());
         } else if from.is_empty() && (keep_ids || marks) {
             out.ids = Some(Ids::default());
         } else if marks {
@@ -745,8 +793,7 @@ impl<T: Clone> OpLog<T> {
                         let (ids, found) = if fresh {
                             (out.ids.clone(), blocks.clone())
                         } else {
-                            let (o, _) = self.walk_moves(&[], &start, true, None, None);
-                            (o.ids, o.blocks.unwrap_or_default())
+                            self.books_at(&start, recent)
                         };
                         crate::simple::Window::new(self, start.clone(), ids, &found)
                     });
@@ -799,7 +846,7 @@ impl<T: Clone> OpLog<T> {
 
     /// The moved blocks of the document at `version`, from nothing.
     fn blocks_at(&self, version: &[Lv]) -> Blocks {
-        self.walk_moves(&[], version, false, None, None)
+        self.walk_moves(&[], version, false, None, None, None)
             .0
             .blocks
             .unwrap_or_default()
