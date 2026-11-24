@@ -198,6 +198,17 @@ pub fn moved_blocks<T: Clone>(
         .collect()
 }
 
+/// The moves that do nothing, ever: of nothing, to where they are, or of
+/// a range that isn't whole elements of one frame at their version.
+#[doc(hidden)]
+pub fn inert<T: Clone>(log: &OpLog<T>) -> Vec<Lv> {
+    let state = replay(log);
+    (0..log.len())
+        .filter(|&lv| matches!(log.event(lv).op, Op::Move { .. }))
+        .filter(|&lv| !state.moves.iter().any(|m| m.id == lv))
+        .collect()
+}
+
 /// Every record, in home order, and what drawing them needs.
 struct State<'a, T> {
     log: &'a OpLog<T>,

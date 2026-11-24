@@ -55,6 +55,8 @@
 mod accountant;
 mod anchors;
 mod blocks;
+#[doc(hidden)]
+pub mod copies;
 mod encode;
 pub mod file;
 mod ids;
