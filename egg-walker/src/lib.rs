@@ -36,6 +36,21 @@
 //! each merge from the latest point the history narrows to, and moves its
 //! prepare version by walking only as far back as it changes. A simpler walk
 //! over a plain list is kept to check it against, change for change.
+//!
+//! # Built on mamre
+//!
+//! This crate is mamre's CRDT, not a standalone one. The document stays
+//! anyone's (all a merge asks of it is [`Sequence`]), but the CRDT's own
+//! state is built on mamre, on purpose:
+//!
+//! - the walk's records, [`Identities`] and [`Anchors`] are mamre
+//!   `SumTree`s, sought by their summaries;
+//! - the log, sync messages, files and the accountant's books are written
+//!   with `mamre::codec`, whose `DecodeError` the decoding functions return.
+//!
+//! The parts that don't need either are the reference ([`reference`](mod@reference)) and
+//! the simple walk: plain lists, correct and slow. A CRDT without mamre
+//! would start from those and bring its own tree.
 
 mod accountant;
 mod anchors;
