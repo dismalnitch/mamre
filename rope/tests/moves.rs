@@ -1,7 +1,7 @@
 //! Moving text and sections: the same as cutting and pasting a `String`,
 //! chunks kept full, summaries right, and every position carried across.
 
-use mamre_rope::{Address, Markdown, MoveError, Moved, Rope, Sections};
+use mamre_rope::{Address, Markdown, Moved, Newline, Rope, Sections};
 use proptest::prelude::*;
 
 /// Markdown-ish text: headings at a few levels, plain lines, some
@@ -119,8 +119,10 @@ proptest! {
         }
     }
 
-    /// Moving a section before another, or to the end, is the same string
-    /// surgery, and the moved section's heading is at its new place.
+    /// Moving a section is reordering whole lines, the last one ending in
+    /// its implied newline (as in Vim) whether the text has one or not.
+    /// Every char lands where `map` says, and the moved section's heading
+    /// is at its new place.
     #[test]
     fn moves_sections(text in text(), pick in any::<prop::sample::Index>(), dest in any::<prop::sample::Index>()) {
         let rope: Rope<Markdown> = Rope::from(text.as_str());
@@ -137,29 +139,57 @@ proptest! {
             .filter(|&t| t <= range.start || t >= range.end)
             .collect();
         let to = targets[dest.index(targets.len())];
+        let want = reorder_lines(&text, range.clone(), to);
         let mut moved = rope.clone();
-        // A move that would run lines together is refused, and nothing
-        // changes.
-        let in_place = to == range.start || to == range.end;
-        let joins = !in_place
-            && (!text[..range.end].ends_with('\n') || to == text.len() && !text.ends_with('\n'));
-        let m = match moved.move_section(address, to) {
-            Err(MoveError::WouldJoinLines) => {
-                prop_assert!(joins, "refused a move that joins nothing");
-                prop_assert_eq!(moved.chars().collect::<String>(), text);
-                return Ok(());
-            }
-            other => {
-                prop_assert!(!joins, "moved, joining lines");
-                other.unwrap()
-            }
-        };
-        let mut by_range = rope.clone();
-        let want = by_range.move_range(range.clone(), to);
-        prop_assert_eq!(&m, &want);
-        prop_assert_eq!(moved.chars().collect::<String>(), by_range.chars().collect::<String>());
-        prop_assert_eq!(moved.heading_at(moved.address_at(m.to.start)), Some(m.to.start));
+        let m = moved.move_section(address, to).unwrap();
+        prop_assert_eq!(moved.chars().collect::<String>(), want.clone());
+        moved.check().map_err(TestCaseError::fail)?;
+        let fresh: Rope<Markdown> = Rope::from(want.as_str());
+        prop_assert_eq!(moved.summary(), fresh.summary(), "summaries as if built afresh");
+        for (i, c) in text.char_indices() {
+            let j = m.map(i);
+            prop_assert_eq!(want[j..].chars().next(), Some(c), "char at {} went to {}", i, j);
+        }
+        // It only turns when the text has no final newline to move with.
+        if m.newline != Newline::Stays {
+            prop_assert!(!text.ends_with('\n'));
+        } else {
+            let mut by_range = rope.clone();
+            prop_assert_eq!(&m, &by_range.move_range(range.clone(), to));
+        }
+        // The heading is where the section now starts.
+        let heading = m.map(range.start);
+        prop_assert_eq!(moved.heading_at(moved.address_at(heading)), Some(heading));
     }
+}
+
+/// The model: the text as lines, each ending in a newline (the last one's
+/// implied if the text has none), the section's lines moved to before the
+/// line at `to` (or after them all), and joined back.
+fn reorder_lines(text: &str, range: std::ops::Range<usize>, to: usize) -> String {
+    let implied = !text.ends_with('\n');
+    let mut whole = text.to_string();
+    if implied {
+        whole.push('\n');
+    }
+    // A line's index by its start; the end, past every line.
+    let line = |at: usize| {
+        if at == text.len() {
+            whole.split_inclusive('\n').count()
+        } else {
+            text[..at].matches('\n').count()
+        }
+    };
+    let mut lines: Vec<&str> = whole.split_inclusive('\n').collect();
+    let (a, b, t) = (line(range.start), line(range.end), line(to));
+    let section: Vec<&str> = lines.drain(a..b).collect();
+    let t = if t > a { t - (b - a) } else { t };
+    lines.splice(t..t, section);
+    let mut out = lines.concat();
+    if implied {
+        out.pop();
+    }
+    out
 }
 
 #[test]
@@ -177,7 +207,8 @@ fn moving_a_chapter_carries_its_sections() {
         moved,
         Moved {
             from: 0..23,
-            to: 13..36
+            to: 13..36,
+            newline: Newline::Stays,
         }
     );
     // Its subsection came with it, now 2.1.
@@ -194,4 +225,46 @@ fn moving_a_chapter_carries_its_sections() {
 fn not_into_itself() {
     let mut rope: Rope = Rope::from("hello world");
     rope.move_range(0..5, 3);
+}
+
+/// The last section of a text with no final newline, moved earlier: it
+/// takes the newline before it along, to end its own last line.
+#[test]
+fn the_last_section_moves_with_its_implied_newline() {
+    let text = "# A\nSome text.\n# B\nThe last line";
+    let mut rope: Rope<Markdown> = Rope::from(text);
+    let b = Address::new(&[2]).unwrap();
+    let moved = rope.move_section(b, 0).unwrap();
+    assert_eq!(
+        rope.chars().collect::<String>(),
+        "# B\nThe last line\n# A\nSome text."
+    );
+    assert_eq!(
+        moved,
+        Moved {
+            from: 14..32,
+            to: 0..18,
+            newline: Newline::ToEnd,
+        }
+    );
+    // The newline that ended "Some text." now ends "The last line".
+    assert_eq!(moved.map(14), 17);
+    assert_eq!(moved.map(15), 0);
+}
+
+/// A section moved to the end of a text with no final newline goes after
+/// the last line, its own newline now ending that line.
+#[test]
+fn a_section_moved_to_the_end_puts_its_newline_first() {
+    let text = "# A\nSome text.\n# B\nThe last line";
+    let mut rope: Rope<Markdown> = Rope::from(text);
+    let a = Address::new(&[1]).unwrap();
+    let moved = rope.move_section(a, text.len()).unwrap();
+    assert_eq!(
+        rope.chars().collect::<String>(),
+        "# B\nThe last line\n# A\nSome text."
+    );
+    assert_eq!(moved.newline, Newline::ToStart);
+    assert_eq!(moved.map(14), 17, "A's newline ends the line before it");
+    assert_eq!(moved.map(0), 18, "A's heading");
 }

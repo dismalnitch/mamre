@@ -55,7 +55,7 @@ use mamre::{Item, SumTree};
 
 pub use angela::Angela;
 pub use measure::{Markdown, Measure, Plain, Prose};
-pub use moves::{MoveError, Moved};
+pub use moves::{MoveError, Moved, Newline};
 pub use outline::{Address, Sections};
 pub use scan::Edge;
 pub use summary::{ByteOffset, CharOffset, Point, TextSummary};
