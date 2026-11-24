@@ -81,16 +81,17 @@ pub fn save<T: Clone + Codec>(
     doc: impl IntoIterator<Item = T>,
     accountant: &Accountant,
 ) -> usize {
-    let doc: Vec<T> = doc.into_iter().collect();
-    debug_assert_eq!(doc.len(), accountant.len(), "the books are the document's");
     if saved < log.len() {
         let mut body = Vec::new();
         log.encode_chunk(saved..log.len(), &mut body);
         record(file, CHUNK, &body);
     }
+    // The items go straight from the document into the snapshot: how many
+    // there are, the books know.
     let mut body = Vec::new();
-    put_usize(&mut body, doc.len());
-    T::encode_run(&doc, &mut body);
+    put_usize(&mut body, accountant.len());
+    let n = T::encode_iter(doc, &mut body);
+    debug_assert_eq!(n, accountant.len(), "the books are the document's");
     accountant.encode(&mut body);
     record(file, SNAPSHOT, &body);
     log.len()
@@ -162,5 +163,43 @@ fn read_record<T: Clone + Codec>(
         }
         // A kind a later version added: skipped whole.
         _ => Ok((total, None)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Saving streams the document's items, and writes exactly the bytes
+    /// collecting them into a `Vec` first did.
+    #[test]
+    fn a_saved_document_is_the_same_bytes_streamed() {
+        let long: String = "a moment's ñ, then 𝄞; ".repeat(300);
+        for text in ["", "hello", "héllo wörld ✓ 𝄞", long.as_str()] {
+            let mut log = OpLog::new();
+            let me = log.agent("me");
+            let mut books = Accountant::new();
+            let v = log.add_insert(me, &[], 0, text.chars());
+            books.merge(&log, &v);
+            let doc: Vec<char> = text.chars().collect();
+
+            let mut streamed = create();
+            save(&mut streamed, &log, 0, text.chars(), &books);
+
+            // As it was: the items in a Vec, written as a slice.
+            let mut collected = create();
+            if log.len() > 0 {
+                let mut body = Vec::new();
+                log.encode_chunk(0..log.len(), &mut body);
+                record(&mut collected, CHUNK, &body);
+            }
+            let mut body = Vec::new();
+            put_usize(&mut body, doc.len());
+            char::encode_run(&doc, &mut body);
+            books.encode(&mut body);
+            record(&mut collected, SNAPSHOT, &body);
+
+            assert_eq!(streamed, collected, "saving {} chars", doc.len());
+        }
     }
 }
