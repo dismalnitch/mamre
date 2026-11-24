@@ -67,6 +67,7 @@ pub mod reference;
 mod simple;
 pub mod sync;
 mod walk;
+mod window;
 
 pub use accountant::Accountant;
 pub use anchors::Anchors;

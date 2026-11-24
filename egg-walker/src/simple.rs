@@ -32,11 +32,11 @@ use crate::walk::{Change, Changes};
 
 /// A map keyed by ids or indices, hashed cheaply: the walk looks records
 /// up all the time, and nothing here is chosen by an adversary.
-type Map<K, V> = HashMap<K, V, BuildHasherDefault<IdHasher>>;
-type Set = HashSet<Lv, BuildHasherDefault<IdHasher>>;
+pub(crate) type Map<K, V> = HashMap<K, V, BuildHasherDefault<IdHasher>>;
+pub(crate) type Set = HashSet<Lv, BuildHasherDefault<IdHasher>>;
 
 #[derive(Default)]
-struct IdHasher(u64);
+pub(crate) struct IdHasher(u64);
 
 impl Hasher for IdHasher {
     fn write(&mut self, bytes: &[u8]) {
@@ -265,13 +265,20 @@ impl Layout {
 /// walk), or the fast walk's, given or found when first asked.
 enum BaseIds {
     Reference(Option<Vec<Lv>>),
-    Given { frontier: Vec<Lv>, ids: Option<Ids> },
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    Given {
+        frontier: Vec<Lv>,
+        ids: Option<Ids>,
+    },
 }
 
-/// A stretch of a merge with moves, for the fast walk: the simple walk's
-/// way, from a base whose identities and blocks are known (or found).
+/// A stretch of a merge with moves, the simple walk's way, from a base
+/// whose identities and blocks are known (or found): what debug builds
+/// check the fast window (`window.rs`) against.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub(crate) struct Window<'a, T>(Walk<'a, T>);
 
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 impl<'a, T: Clone> Window<'a, T> {
     /// A window from the document at `frontier`, whose items' identities are
     /// `ids` (found from nothing when first asked, if not given) and whose
