@@ -46,6 +46,7 @@ mod oplog;
 mod order;
 pub mod reference;
 mod simple;
+pub mod sync;
 mod walk;
 
 pub use anchors::Anchors;

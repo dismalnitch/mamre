@@ -21,7 +21,7 @@
 //! numbers them, and a snapshot refers to them by number. Loading reads the
 //! chunks in order, which numbers them the same.
 
-use mamre::codec::{Codec, DecodeError, crc32c, get_bytes, get_usize, put_usize};
+use mamre::codec::{Codec, DecodeError, get_frame, get_usize, put_frame, put_usize};
 
 use crate::anchors::Anchors;
 use crate::ids::Identities;
@@ -102,12 +102,7 @@ pub fn save<T: Clone + Codec>(
 }
 
 fn record(out: &mut Vec<u8>, kind: u8, body: &[u8]) {
-    let start = out.len();
-    out.push(kind);
-    put_usize(out, body.len());
-    out.extend_from_slice(body);
-    let crc = crc32c(&out[start..]);
-    out.extend_from_slice(&crc.to_le_bytes());
+    put_frame(out, kind, body);
 }
 
 /// Loads a file: its history, and its last snapshot.
@@ -150,14 +145,8 @@ fn read_record<T: Clone + Codec>(
     log: &mut OpLog<T>,
 ) -> Result<(usize, Option<Snapshot<T>>), DecodeError> {
     let mut input = bytes;
-    let kind = u8::decode(&mut input)?;
-    let len = get_usize(&mut input)?;
-    let body = get_bytes(&mut input, len)?;
-    let crc = u32::from_le_bytes(get_bytes(&mut input, 4)?.try_into().expect("four bytes"));
+    let (kind, body) = get_frame(&mut input)?;
     let total = bytes.len() - input.len();
-    if crc32c(&bytes[..total - 4]) != crc {
-        return Err(DecodeError::Invalid("a record's checksum doesn't match"));
-    }
     match kind {
         CHUNK => {
             log.decode_chunk(body)?;
