@@ -243,6 +243,100 @@ proptest! {
     }
 }
 
+// ---- A window, from where everything after saw it ----
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Replayed from a start every later event saw, flatly where it can:
+    /// each flat step is as rebuilt, and the end is as the reference has
+    /// it. The start is the last version that everything after included.
+    #[test]
+    fn a_window_is_the_reference(actions in actions(3, 40)) {
+        let (log, versions) = history(&actions, 3);
+        let Some(end) = versions.last() else { return Ok(()) };
+        let all: Vec<Lv> = (0..log.len()).filter(|&lv| log.contains(end, lv)).collect();
+        // Candidates: each event's own closure, latest first; the first
+        // that every later event (in the end version) includes.
+        let start = all
+            .iter()
+            .rev()
+            .map(|&s| vec![s])
+            .find(|s| all.iter().filter(|&&lv| !log.contains(s, lv)).all(|&lv| log.contains(&[lv], s[0])))
+            .unwrap_or_default();
+        for start in [Vec::new(), start] {
+            if let Some(got) = copies::from_start(&log, &start, end) {
+                prop_assert_eq!(got, copies::identities(&log, end), "from {:?}\n{}", start, describe(&log));
+            }
+        }
+    }
+}
+
+// ---- The walk, against the reference ----
+
+fn text(v: &[char]) -> String {
+    v.iter().collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The fast walk as the reference has it: every checkout; the changes
+    /// between any two versions, applied; and replicas keeping books,
+    /// merging as they go, their documents, identities, outline and
+    /// losses.
+    #[test]
+    fn the_walk_is_the_reference(actions in actions(3, 40)) {
+        let (log, versions) = history(&actions, 3);
+        for v in &versions {
+            prop_assert_eq!(text(&log.checkout(v)), text(&copies::checkout(&log, v)), "checkout at {:?}\n{}", v, describe(&log));
+        }
+        for (a, b) in versions.iter().zip(versions.iter().skip(1)) {
+            let mut doc = copies::checkout(&log, a);
+            for c in log.changes(a, b) {
+                c.apply(&mut doc);
+            }
+            let both = log.union(a, b);
+            prop_assert_eq!(text(&doc), text(&copies::checkout(&log, &both)), "{:?} to {:?}\n{}", a, b, describe(&log));
+        }
+        // A replica keeping books, merging each version in turn.
+        let mut books = mamre_egg_walker::Accountant::new();
+        let mut doc: Vec<char> = Vec::new();
+        let mut lost: Vec<Lv> = Vec::new();
+        struct Doc<'a>(&'a mut Vec<char>, &'a mut Vec<Lv>);
+        impl mamre_egg_walker::Sequence<char> for Doc<'_> {
+            fn insert(&mut self, pos: usize, items: &[char]) { self.0.insert(pos, items[0]); for (k, &c) in items.iter().enumerate().skip(1) { self.0.insert(pos + k, c); } }
+            fn delete(&mut self, range: std::ops::Range<usize>) { self.0.drain(range); }
+            fn move_range(&mut self, range: std::ops::Range<usize>, to: usize) { mamre_egg_walker::Sequence::move_range(self.0, range, to) }
+            fn lost(&mut self, op: Lv, _: Option<Lv>, _: &[std::ops::Range<usize>]) { self.1.push(op); }
+        }
+        for v in &versions {
+            for c in books.merge(&log, v) {
+                c.apply(&mut Doc(&mut doc, &mut lost));
+            }
+            let at = books.version().to_vec();
+            prop_assert_eq!(text(&doc), text(&copies::checkout(&log, &at)), "replica at {:?}\n{}", at, describe(&log));
+            let ids: Vec<Lv> = (0..books.len()).map(|p| books.identities().item(p)).collect();
+            prop_assert_eq!(ids, copies::identities(&log, &at), "replica ids at {:?}\n{}", at, describe(&log));
+            let levels: std::collections::BTreeMap<Lv, u8> = books.sections().iter().map(|s| (s.item, s.level)).collect();
+            let want: std::collections::BTreeMap<Lv, u8> = copies::levels(&log, &at)
+                .into_iter()
+                .filter(|(item, _)| copies::identities(&log, &at).contains(item))
+                .collect();
+            prop_assert_eq!(levels, want, "outline at {:?}\n{}", at, describe(&log));
+        }
+        // Everything lost, reported once each, at some merge.
+        let end = books.version().to_vec();
+        let mut want: Vec<Lv> = copies::losses(&log, &end).into_iter().map(|l| l.op).collect();
+        want.sort_unstable();
+        lost.sort_unstable();
+        lost.dedup();
+        for op in &want {
+            prop_assert!(lost.contains(op), "{} lost but never reported\n{}", op, describe(&log));
+        }
+    }
+}
+
 // ---- The rules ----
 
 fn text_at(log: &OpLog<char>, v: &[Lv]) -> String {
@@ -576,4 +670,38 @@ fn a_copy_that_gave_way_moved_again_moves_nothing() {
     let lost = copies::losses(&log, &all);
     assert_eq!(lost.len(), 1);
     assert_eq!((lost[0].op, lost[0].lost_to), (again[0], Some(inner[0])));
+}
+
+#[test]
+fn scratch_lost_mark() {
+    let mut log: OpLog<char> = OpLog::new();
+    let (a, b) = (log.agent("a"), log.agent("b"));
+    let v0 = log.add_insert(a, &[], 0, ['a']);
+    let mut v = log.add_insert(a, &v0, 0, ['a']);
+    v = log.add_insert(a, &v, 0, ['a']);
+    let v3 = log.add_mark(a, &v, 2, 0);
+    let v4 = log.add_mark(b, &v0, 0, 0);
+    eprintln!(
+        "losses at end: {:?}",
+        copies::losses(&log, &log.union(&v3, &v4))
+    );
+    for order in [[v3.clone(), v4.clone()], [v4.clone(), v3.clone()]] {
+        let mut books = mamre_egg_walker::Accountant::new();
+        for v in &order {
+            let changes = books.merge(&log, v);
+            eprintln!(
+                "merge {:?}: {:?}",
+                v,
+                changes
+                    .iter()
+                    .map(|c| match c {
+                        mamre_egg_walker::Change::Lost { op, .. } => format!("lost {op}"),
+                        mamre_egg_walker::Change::Mark { item, level, .. } =>
+                            format!("mark {item}={level}"),
+                        _ => "edit".into(),
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }

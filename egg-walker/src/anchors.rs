@@ -242,7 +242,7 @@ impl Anchors {
             }
             Change::Delete { range } => self.delete(range.clone()),
             Change::Move { range, to } => self.move_range(range.clone(), *to),
-            Change::Mark { .. } => {}
+            Change::Mark { .. } | Change::Lost { .. } => {}
         }
     }
 

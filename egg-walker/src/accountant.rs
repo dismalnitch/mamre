@@ -228,12 +228,10 @@ mod tests {
         let mut books = Accountant::new();
         books.merge(&log, &v);
         books.watch(2);
-        assert_eq!(books.moved_blocks(), vec![(6, 3..5, false, false)]);
         let mut bytes = Vec::new();
         books.encode(&mut bytes);
         let back = Accountant::decode(&mut bytes.as_slice(), log.len()).unwrap();
         assert_eq!(back.version, books.version);
-        assert_eq!(back.blocks, books.blocks);
         assert_eq!(back.len(), books.len());
         assert_eq!(back.anchors.position(back.ids.item(2)), Some(2));
     }

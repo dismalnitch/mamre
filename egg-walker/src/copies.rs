@@ -1,6 +1,12 @@
-//! The reference for moves as copies (#20): slow and obviously right, by
-//! definition, replaying every event against its own version of the
-//! document rebuilt from scratch.
+//! Moves as copies (#20): the reference, slow and obviously right, and
+//! the same rules replaying a window of a merge.
+//!
+//! The reference replays every event against its own version of the
+//! document, rebuilt from scratch, by definition. A merge's window replays
+//! only the events after a version every one of them saw (the window's
+//! start, where the document is known), the same way, but builds each
+//! event's version from the one before where it can: an event that saw
+//! everything before it changes its version's document flatly.
 //!
 //! # Records
 //!
@@ -8,7 +14,9 @@
 //! covers, in a run at its destination, and *takes* the originals: they
 //! don't show any more. A record has a place (its key: where it is) and a
 //! root (the insert it descends from: who it is). Deletes, undeletes and
-//! marks act on the root, so they follow an item wherever it's moved.
+//! marks act on the root, so they follow an item wherever it's moved. A
+//! window's starting document is a record for each item, its key the
+//! item's root.
 //!
 //! A move is fixed when it's made, at its own version: it covers every
 //! record drawn from the first visible item of its range to the last,
@@ -19,8 +27,8 @@
 //! # At the same time
 //!
 //! Something done without seeing a move, whose visible neighbours (at its
-//! own version) the move both took, goes with it: its origins are
-//! redirected to their copies. So typing in a section someone is moving
+//! own version) the move both took or both went with it, goes with it: its
+//! origins are redirected to their copies. So typing in a section someone is moving
 //! goes where the section goes. At an edge (one neighbour taken, one not,
 //! or the document's end) it stays: what decides is what its author saw
 //! either side, not where ties among concurrent inserts happen to put it.
@@ -42,9 +50,11 @@
 //! A copy off the path is laid out but never drawn, and so is any copy of
 //! it: a later move of only such copies moves nothing.
 //!
-//! A move that doesn't stand makes no copies, so a copy of a copy it made
-//! is no copy either: whatever's aimed at one is aimed at what it copied,
-//! and a later move of only such copies moves nothing.
+//! A move that doesn't stand still lays out its copies, but never draws
+//! them: something put beside one stays there. Put between two, it goes
+//! with whatever took what they copied: what decides is what the copies
+//! stood for, so typing in a moved section someone else moved too goes
+//! where the winner put it.
 //!
 //! Every move or mark discarded is a [`Loss`]: what was lost, to what, and
 //! where its items are now.
@@ -56,8 +66,12 @@ use crate::oplog::{Lv, Op, OpLog};
 use crate::order::{Placed, place};
 use crate::walk::tie_break;
 
-/// A record's key: an insert's own event, or past the log's events, a copy.
+/// A record's key: an insert's own event (for the window's starting
+/// document, the item's root), or past the log's events, a copy.
 type Key = usize;
+
+/// An event, numbered in the replay: the window's events in order.
+type Ix = usize;
 
 /// Where an insert, or a move's copies, go: its origins, and the visible
 /// neighbours that decide what it goes with.
@@ -88,11 +102,13 @@ enum Info {
     Delete {
         root: Lv,
     },
+    /// Undoing delete `target` (an event of the window).
     Undelete {
-        target: Lv,
+        target: Ix,
     },
     Mark {
         root: Lv,
+        level: u8,
     },
     Move(Move),
     /// A move of nothing, or to where it is.
@@ -126,66 +142,114 @@ impl Placed for Rec {
     }
 }
 
-struct Replay<'a, T> {
+/// Why a window can't be replayed from its start alone.
+#[derive(Debug)]
+pub(crate) struct Unsupported;
+
+pub(crate) struct Replay<'a, T> {
     log: &'a OpLog<T>,
-    /// Where copies' keys start: the log's length.
-    base: Key,
+    /// The starting document's records, in order: each item's root.
+    base: Vec<Key>,
+    /// The replayed events, in order, and where each is.
+    events: Vec<Lv>,
+    ix: HashMap<Lv, Ix>,
     info: Vec<Info>,
-    /// What each event saw: its parents' closure.
+    /// What each event saw, of the replayed ones.
     past: Vec<Vec<bool>>,
-    lamport: Vec<u64>,
-    /// Each copy (by key less the log's length): its move, and its source.
-    copies: Vec<(Lv, Key)>,
+    /// Where copies' keys start: the log's length.
+    copy_base: Key,
+    /// Each copy (by key less `copy_base`): its move, and its source.
+    copies: Vec<(Ix, Key)>,
+    /// Each event's own version, as a set of replayed events.
+    versions: Vec<Vec<bool>>,
+    /// Where each event goes, among the active moves it was worked out
+    /// for: each depends only on earlier ones, so it's found once.
+    redirects: std::cell::RefCell<(Vec<Ix>, HashMap<Ix, (Spot, Vec<Ix>)>)>,
 }
 
 /// The document drawn at a version.
-struct View {
+#[derive(Clone)]
+pub(crate) struct View {
     /// Every record laid out, in order, drawn or not.
     order: Vec<Key>,
     /// Every record that shows or is a tombstone where it lies, in order,
     /// and whether it shows.
     drawn: Vec<(Key, bool)>,
-    losses: Vec<Loss>,
+    /// The roots deleted (and not undone).
+    deleted: HashSet<Lv>,
+    pub(crate) losses: Vec<Loss>,
+    active: Vec<Ix>,
 }
 
-impl<T: Clone> Replay<'_, T> {
-    fn events(&self) -> usize {
+impl View {
+    /// The items that show, by root, in order.
+    pub(crate) fn roots<T: Clone>(&self, r: &Replay<'_, T>) -> Vec<Lv> {
+        self.drawn
+            .iter()
+            .filter(|(_, shows)| *shows)
+            .map(|&(k, _)| r.root(k))
+            .collect()
+    }
+}
+
+impl<'a, T: Clone> Replay<'a, T> {
+    fn n(&self) -> usize {
         self.info.len()
     }
 
-    /// The event that made record `key`.
-    fn by(&self, key: Key) -> Lv {
-        if key < self.base {
-            key
+    /// The replayed event that made record `key`, if one did.
+    fn by(&self, key: Key) -> Option<Ix> {
+        if key >= self.copy_base {
+            Some(self.copies[key - self.copy_base].0)
         } else {
-            self.copies[key - self.base].0
+            self.ix.get(&key).copied()
+        }
+    }
+
+    /// The log's event that made record `key` (for a starting record, its
+    /// insert): what ties are broken by.
+    fn made_by(&self, key: Key) -> Lv {
+        match self.by(key) {
+            Some(i) => self.events[i],
+            None => key,
         }
     }
 
     /// Who record `key` is: the insert it descends from.
     fn root(&self, mut key: Key) -> Lv {
-        while key >= self.base {
-            key = self.copies[key - self.base].1;
+        while key >= self.copy_base {
+            key = self.copies[key - self.copy_base].1;
         }
         key
     }
 
-    fn mv(&self, m: Lv) -> &Move {
+    fn mv(&self, m: Ix) -> &Move {
         match &self.info[m] {
             Info::Move(mv) => mv,
             _ => unreachable!("{m} is a move"),
         }
     }
 
-    fn concurrent(&self, a: Lv, b: Lv) -> bool {
+    fn concurrent(&self, a: Ix, b: Ix) -> bool {
         a != b && !self.past[a][b] && !self.past[b][a]
+    }
+
+    /// Whether the record made by `by` (none: one the window started with)
+    /// is concurrent with event `m`.
+    fn concurrent_with(&self, by: Option<Ix>, m: Ix) -> bool {
+        by.is_some_and(|b| self.concurrent(b, m))
+    }
+
+    fn key(&self, i: Ix) -> (u64, (&str, u64)) {
+        let lv = self.events[i];
+        (self.log.lamport(lv), self.log.order_key(lv))
     }
 
     /// Whether record `key` is laid out among the `active` moves: an
     /// insert's always is; a copy is if its move stands and its source is.
-    fn lives(&self, mut key: Key, active: &[Lv]) -> bool {
-        while key >= self.base {
-            let (m, source) = self.copies[key - self.base];
+    fn lives(&self, mut key: Key, active: &[Ix]) -> bool {
+        while key >= self.copy_base {
+            let (m, source) = self.copies[key - self.copy_base];
             if !active.contains(&m) {
                 return false;
             }
@@ -195,14 +259,14 @@ impl<T: Clone> Replay<'_, T> {
     }
 
     /// `key`, or if it isn't laid out, the nearest thing it copied that is.
-    fn live(&self, mut key: Key, active: &[Lv]) -> Key {
+    fn live(&self, mut key: Key, active: &[Ix]) -> Key {
         while !self.lives(key, active) {
-            key = self.copies[key - self.base].1;
+            key = self.copies[key - self.copy_base].1;
         }
         key
     }
 
-    fn spot(&self, x: Lv) -> Spot {
+    fn spot(&self, x: Ix) -> Spot {
         match &self.info[x] {
             Info::Insert(spot) => *spot,
             Info::Move(mv) => mv.to,
@@ -214,7 +278,22 @@ impl<T: Clone> Replay<'_, T> {
     /// moves: its origins and neighbours, redirected through each move it
     /// didn't see that took both neighbours, innermost first; and those
     /// moves.
-    fn redirect(&self, x: Lv, active: &[Lv]) -> (Spot, Vec<Lv>) {
+    fn redirect(&self, x: Ix, active: &[Ix]) -> (Spot, Vec<Ix>) {
+        {
+            let mut memo = self.redirects.borrow_mut();
+            if memo.0 != active {
+                *memo = (active.to_vec(), HashMap::new());
+            } else if let Some(found) = memo.1.get(&x) {
+                return found.clone();
+            }
+        }
+        let found = self.find_redirect(x, active);
+        self.redirects.borrow_mut().1.insert(x, found.clone());
+        found
+    }
+
+    fn find_redirect(&self, x: Ix, active: &[Ix]) -> (Spot, Vec<Ix>) {
+        // What a copy that's not drawn stood for, to decide with.
         let live = |k: Option<Key>| k.map(|k| self.live(k, active));
         let raw = self.spot(x);
         let mut spot = Spot {
@@ -223,33 +302,71 @@ impl<T: Clone> Replay<'_, T> {
             before: live(raw.before),
             after: live(raw.after),
         };
-        let mut through: Vec<Lv> = Vec::new();
+        let mut through: Vec<Ix> = Vec::new();
         loop {
             let holder = active
                 .iter()
                 .copied()
-                .filter(|&m| m != x && self.concurrent(x, m) && !through.contains(&m))
+                .filter(|&m| self.concurrent(x, m) && !through.contains(&m))
                 .filter(|&m| {
-                    let set = &self.mv(m).set;
-                    spot.before.is_some_and(|k| set.contains(&k))
-                        && spot.after.is_some_and(|k| set.contains(&k))
+                    // What the move took, or what went with it.
+                    let inside = |k: Key| {
+                        self.mv(m).set.contains(&k)
+                            || self.by(k).is_some_and(|b| {
+                                b != x
+                                    && self.concurrent(b, m)
+                                    && self.redirect(b, active).1.contains(&m)
+                            })
+                    };
+                    spot.before.is_some_and(inside) && spot.after.is_some_and(inside)
                 })
                 .min_by_key(|&m| self.mv(m).sources.len());
             let Some(m) = holder else {
-                return (spot, through);
+                if !through.is_empty() {
+                    return (spot, through);
+                }
+                // Not redirected: where its author put it, among what
+                // stayed. An origin carried off by a move it didn't see is
+                // passed over for that origin's own, and so on.
+                let carried = |k: Key| {
+                    let by = self.by(k)?;
+                    let (_, gone) = self.redirect(by, active);
+                    gone.iter().any(|&g| !self.past[x][g]).then_some(by)
+                };
+                let mut left = raw.left;
+                while let Some(k) = left {
+                    let Some(by) = carried(k) else { break };
+                    left = if k >= self.copy_base && k != self.mv(by).first_copy {
+                        Some(k - 1)
+                    } else {
+                        self.spot(by).left
+                    };
+                }
+                let mut right = raw.right;
+                while let Some(k) = right {
+                    let Some(by) = carried(k) else { break };
+                    right = self.spot(by).right;
+                }
+                return (Spot { left, right, ..raw }, through);
             };
             let mv = self.mv(m);
             let map = |k: Option<Key>| {
-                k.map(|k| match mv.sources.iter().position(|&s| s == k) {
-                    Some(i) => self.live(mv.first_copy + i, active),
-                    None => k,
+                k.and_then(|k| {
+                    mv.sources
+                        .iter()
+                        .position(|&s| s == k)
+                        .map(|i| mv.first_copy + i)
                 })
             };
+            // Among the copies: after the copy of what was left of it,
+            // before the copy of what was right (or, if what was next
+            // isn't among them, of what showed next).
+            let after = map(spot.after);
             spot = Spot {
-                left: map(spot.left),
-                right: map(spot.right),
+                left: map(spot.left).or(spot.left),
+                right: map(spot.right).or(after),
                 before: map(spot.before),
-                after: map(spot.after),
+                after,
             };
             through.push(m);
         }
@@ -257,15 +374,14 @@ impl<T: Clone> Replay<'_, T> {
 
     /// Which moves stand at `at`, by the rules above, leaving out
     /// `dropped` (moves that made a loop), and the losses.
-    fn active(&self, at: &[bool], dropped: &HashSet<Lv>, losses: &mut Vec<Loss>) -> Vec<Lv> {
-        let key = |m: Lv| (self.lamport[m], self.log.order_key(m));
-        let mut moves: Vec<Lv> = (0..self.info.len())
-            .filter(|&lv| at[lv] && !dropped.contains(&lv))
-            .filter(|&lv| match &self.info[lv] {
+    fn active(&self, at: &[bool], dropped: &HashSet<Ix>, losses: &mut Vec<Loss>) -> Vec<Ix> {
+        let mut moves: Vec<Ix> = (0..self.n())
+            .filter(|&i| at[i] && !dropped.contains(&i))
+            .filter(|&i| match &self.info[i] {
                 Info::Move(_) => true,
                 Info::Inert => {
                     losses.push(Loss {
-                        op: lv,
+                        op: self.events[i],
                         lost_to: None,
                         ranges: Vec::new(),
                     });
@@ -274,8 +390,8 @@ impl<T: Clone> Replay<'_, T> {
                 _ => false,
             })
             .collect();
-        moves.sort_by_key(|&m| key(m));
-        let mut active: Vec<Lv> = Vec::new();
+        moves.sort_by_key(|&m| self.key(m));
+        let mut active: Vec<Ix> = Vec::new();
         'next: for m in moves {
             let set = &self.mv(m).set;
             let mut replaced = None;
@@ -291,8 +407,8 @@ impl<T: Clone> Replay<'_, T> {
                     && !set.is_subset(theirs)
                 {
                     losses.push(Loss {
-                        op: m,
-                        lost_to: Some(a),
+                        op: self.events[m],
+                        lost_to: Some(self.events[a]),
                         ranges: Vec::new(),
                     });
                     continue 'next;
@@ -301,8 +417,8 @@ impl<T: Clone> Replay<'_, T> {
             if let Some(i) = replaced {
                 let a = active.remove(i);
                 losses.push(Loss {
-                    op: a,
-                    lost_to: Some(m),
+                    op: self.events[a],
+                    lost_to: Some(self.events[m]),
                     ranges: Vec::new(),
                 });
             }
@@ -313,14 +429,14 @@ impl<T: Clone> Replay<'_, T> {
 
     /// The roots deleted at `at`: by a delete there that isn't undone.
     fn deleted(&self, at: &[bool]) -> HashSet<Lv> {
-        let undone: HashSet<Lv> = (0..self.events())
+        let undone: HashSet<Ix> = (0..self.n())
             .filter(|&u| at[u])
             .filter_map(|u| match self.info[u] {
                 Info::Undelete { target } => Some(target),
                 _ => None,
             })
             .collect();
-        (0..self.events())
+        (0..self.n())
             .filter(|&d| at[d] && !undone.contains(&d))
             .filter_map(|d| match self.info[d] {
                 Info::Delete { root } => Some(root),
@@ -329,22 +445,22 @@ impl<T: Clone> Replay<'_, T> {
             .collect()
     }
 
-    fn view(&self, at: &[bool]) -> View {
+    /// The document at `at` (a set of replayed events), from scratch.
+    pub(crate) fn rebuild(&self, at: &[bool]) -> View {
         // Moves dropped for making a loop, and what each would have gone
         // with.
-        let mut dropped: HashMap<Lv, Lv> = HashMap::new();
+        let mut dropped: HashMap<Ix, Ix> = HashMap::new();
         let (active, order, mut losses) = loop {
             let mut losses = Vec::new();
-            let skip: HashSet<Lv> = dropped.keys().copied().collect();
+            let skip: HashSet<Ix> = dropped.keys().copied().collect();
             let active = self.active(at, &skip, &mut losses);
             match self.build(at, &active) {
                 Ok(order) => break (active, order, losses),
                 Err(cycle) => {
-                    let key = |m: &Lv| (self.lamport[*m], self.log.order_key(*m));
                     let (k, &latest) = cycle
                         .iter()
                         .enumerate()
-                        .max_by_key(|(_, m)| key(m))
+                        .max_by_key(|(_, m)| self.key(**m))
                         .unwrap();
                     dropped.insert(latest, cycle[(k + 1) % cycle.len()]);
                 }
@@ -352,15 +468,15 @@ impl<T: Clone> Replay<'_, T> {
         };
         for (&m, &with) in &dropped {
             losses.push(Loss {
-                op: m,
-                lost_to: Some(with),
+                op: self.events[m],
+                lost_to: Some(self.events[with]),
                 ranges: Vec::new(),
             });
         }
         let deleted = self.deleted(at);
 
         // What doesn't show where it lies: what an active move took, and
-        // copies of what an inner move made at the same time took instead.
+        // copies off their item's path.
         let taken: HashSet<Key> = active
             .iter()
             .flat_map(|&m| self.mv(m).sources.iter().copied())
@@ -374,15 +490,17 @@ impl<T: Clone> Replay<'_, T> {
         let mut view = View {
             order,
             drawn,
+            deleted,
             losses,
+            active,
         };
-        self.more_losses(at, &active, &mut view);
+        self.more_losses(at, &mut view);
         view
     }
 
     /// The move record `key` goes with: the innermost active one that
     /// took it.
-    fn winner(&self, key: Key, active: &[Lv]) -> Option<Lv> {
+    fn winner(&self, key: Key, active: &[Ix]) -> Option<Ix> {
         active
             .iter()
             .copied()
@@ -392,9 +510,9 @@ impl<T: Clone> Replay<'_, T> {
 
     /// Whether record `key` is on its item's path: each copy from the
     /// insert down to it made by the move that won what it copied.
-    fn on_path(&self, mut key: Key, active: &[Lv]) -> bool {
-        while key >= self.base {
-            let (m, source) = self.copies[key - self.base];
+    fn on_path(&self, mut key: Key, active: &[Ix]) -> bool {
+        while key >= self.copy_base {
+            let (m, source) = self.copies[key - self.copy_base];
             if !active.contains(&m) || self.winner(source, active) != Some(m) {
                 return false;
             }
@@ -405,37 +523,37 @@ impl<T: Clone> Replay<'_, T> {
 
     /// Why copy `key` isn't on its path: the move that won what's above it
     /// instead, or replaced its move. `None` if it is.
-    fn blocker(&self, mut key: Key, active: &[Lv], losses: &[Loss]) -> Option<Lv> {
-        while key >= self.base {
-            let (m, source) = self.copies[key - self.base];
+    fn blocker(&self, mut key: Key, active: &[Ix], losses: &[Loss]) -> Option<Lv> {
+        while key >= self.copy_base {
+            let (m, source) = self.copies[key - self.copy_base];
             if !active.contains(&m) {
-                return losses.iter().find(|l| l.op == m).and_then(|l| l.lost_to);
+                return losses
+                    .iter()
+                    .find(|l| l.op == self.events[m])
+                    .and_then(|l| l.lost_to);
             }
             match self.winner(source, active) {
-                Some(w) if w != m => return Some(w),
+                Some(w) if w != m => return Some(self.events[w]),
                 _ => key = source,
             }
         }
         None
     }
 
-    /// Lays out every record in `at` and every copy the `active` moves
-    /// make: their keys, in order. Or, if moves' copies would each go with
-    /// another's, a loop of them, each going with the next.
-    fn build(&self, at: &[bool], active: &[Lv]) -> Result<Vec<Key>, Vec<Lv>> {
-        let mut spots: HashMap<Lv, Spot> = HashMap::new();
-        let mut goes_with: HashMap<Lv, Vec<Lv>> = HashMap::new();
-        for lv in (0..self.info.len()).filter(|&lv| at[lv]) {
-            let puts = match self.info[lv] {
-                Info::Insert(_) => true,
-                Info::Move(_) => active.contains(&lv),
-                _ => false,
-            };
+    /// Lays out the starting document's records, every record in `at` and
+    /// every copy the `active` moves make: their keys, in order. Or, if
+    /// moves' copies would each go with another's, a loop of them, each
+    /// going with the next.
+    fn build(&self, at: &[bool], active: &[Ix]) -> Result<Vec<Key>, Vec<Ix>> {
+        let mut spots: HashMap<Ix, Spot> = HashMap::new();
+        let mut goes_with: HashMap<Ix, Vec<Ix>> = HashMap::new();
+        for i in (0..self.n()).filter(|&i| at[i]) {
+            let puts = matches!(self.info[i], Info::Insert(_) | Info::Move(_));
             if puts {
-                let (spot, through) = self.redirect(lv, active);
-                spots.insert(lv, spot);
-                if matches!(self.info[lv], Info::Move(_)) {
-                    goes_with.insert(lv, through);
+                let (spot, through) = self.redirect(i, active);
+                spots.insert(i, spot);
+                if active.contains(&i) {
+                    goes_with.insert(i, through);
                 }
             }
         }
@@ -456,34 +574,43 @@ impl<T: Clone> Replay<'_, T> {
             }
         }
         let origins = |key: Key| -> (Option<Key>, Option<Key>) {
-            let by = self.by(key);
+            let by = self.by(key).expect("a replayed record");
             let spot = spots[&by];
-            if key < self.base {
+            if key < self.copy_base {
                 return (spot.left, spot.right);
             }
-            // A run: after the copy before it that's laid out.
-            let first = self.mv(by).first_copy;
-            let left = (first..key).rev().find(|&c| self.lives(c, active));
-            (left.or(spot.left), spot.right)
+            // A run, after the copy before it.
+            if key == self.mv(by).first_copy {
+                (spot.left, spot.right)
+            } else {
+                (Some(key - 1), spot.right)
+            }
         };
         let mut todo: Vec<Key> = Vec::new();
-        for lv in (0..self.info.len()).filter(|lv| spots.contains_key(lv)) {
-            match &self.info[lv] {
-                Info::Insert(_) => todo.push(lv),
-                Info::Move(mv) => todo.extend(
-                    (mv.first_copy..mv.first_copy + mv.sources.len())
-                        .filter(|&c| self.lives(c, active)),
-                ),
+        for i in (0..self.n()).filter(|i| spots.contains_key(i)) {
+            match &self.info[i] {
+                Info::Insert(_) => todo.push(self.events[i]),
+                Info::Move(mv) => todo.extend(mv.first_copy..mv.first_copy + mv.sources.len()),
                 _ => {}
             }
         }
-        let mut list: Vec<Rec> = Vec::new();
-        let mut placed: HashSet<Key> = HashSet::new();
+        // The starting document, as if typed in order.
+        let mut list: Vec<Rec> = Vec::with_capacity(self.base.len() + todo.len());
+        let mut index: HashMap<Key, usize> = HashMap::with_capacity(self.base.len() + todo.len());
+        for (i, &k) in self.base.iter().enumerate() {
+            let left = i.checked_sub(1).map(|p| self.base[p]);
+            list.push(Rec {
+                key: k,
+                left,
+                right: None,
+            });
+            index.insert(k, i);
+        }
         // Each record after its origins.
         for key in todo {
             let mut stack = vec![key];
             while let Some(&k) = stack.last() {
-                if placed.contains(&k) {
+                if index.contains_key(&k) {
                     stack.pop();
                     continue;
                 }
@@ -491,20 +618,20 @@ impl<T: Clone> Replay<'_, T> {
                 let waiting: Vec<Key> = [left, right]
                     .into_iter()
                     .flatten()
-                    .filter(|o| !placed.contains(o))
+                    .filter(|o| !index.contains_key(o))
                     .collect();
                 if !waiting.is_empty() {
-                    assert!(stack.len() <= 4 * self.base + 8, "origins in a loop");
+                    assert!(stack.len() <= 4 * self.n() + 8, "origins in a loop");
                     stack.extend(waiting);
                     continue;
                 }
-                let by = self.by(k);
+                let by = self.made_by(k);
                 let dest = place(
                     &list,
                     left,
                     right,
-                    |id| list.iter().position(|r| r.key == id).unwrap(),
-                    |other| tie_break(self.log, by, self.by(other)),
+                    |id| index[&id],
+                    |other| tie_break(self.log, by, self.made_by(other)),
                 );
                 list.insert(
                     dest,
@@ -514,51 +641,82 @@ impl<T: Clone> Replay<'_, T> {
                         right,
                     },
                 );
-                placed.insert(k);
+                for (i, r) in list.iter().enumerate().skip(dest) {
+                    index.insert(r.key, i);
+                }
                 stack.pop();
             }
         }
         Ok(list.into_iter().map(|r| r.key).collect())
     }
 
-    /// Whether some insert or move, made without seeing a move, was put at
-    /// that move's edge, or among what it took that the insert didn't see:
-    /// where ties among concurrent inserts could put it inside what moved
-    /// though its author's neighbours weren't both. The portals decide those
-    /// by where ties put it; this reference by the neighbours.
-    fn edge_ties(&self) -> bool {
-        (0..self.info.len()).any(|x| {
-            let spot = match self.info[x] {
-                Info::Insert(_) | Info::Move(_) => self.spot(x),
-                _ => return false,
-            };
-            (0..self.info.len()).any(|m| {
-                let Info::Move(mv) = &self.info[m] else {
-                    return false;
-                };
-                if !self.concurrent(x, m) {
-                    return false;
-                }
-                let inside = |k: Option<Key>| k.is_some_and(|k| mv.set.contains(&k));
-                inside(spot.before) != inside(spot.after)
-                    || mv.sources.iter().any(|&k| self.concurrent(self.by(k), x))
-            })
-        })
-    }
-
     /// The losses that need the drawing: moves whose every item was
-    /// deleted by something that didn't see them moved, and marks a later
-    /// mark made without seeing them overrode. And where the lost things'
-    /// items are now.
-    fn more_losses(&self, at: &[bool], active: &[Lv], view: &mut View) {
-        let visible: Vec<Lv> = view
-            .drawn
-            .iter()
-            .filter(|(_, shows)| *shows)
-            .map(|&(k, _)| self.root(k))
+    /// deleted by something that didn't see them moved, or that only took
+    /// copies off their items' paths; and marks a later mark made without
+    /// seeing them overrode. And where the lost things' items are now.
+    fn more_losses(&self, at: &[bool], view: &mut View) {
+        let active = view.active.clone();
+        let undone: HashSet<Ix> = (0..self.n())
+            .filter(|&u| at[u])
+            .filter_map(|u| match self.info[u] {
+                Info::Undelete { target } => Some(target),
+                _ => None,
+            })
             .collect();
-        let position: HashMap<Lv, usize> =
-            visible.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+        let mut deletes: HashMap<Lv, Vec<Ix>> = HashMap::new();
+        for d in (0..self.n()).filter(|&d| at[d] && !undone.contains(&d)) {
+            if let Info::Delete { root } = self.info[d] {
+                deletes.entry(root).or_default().push(d);
+            }
+        }
+        for &m in &active {
+            let mv = self.mv(m);
+            if mv.sources.iter().all(|&k| !self.on_path(k, &active)) {
+                let lost_to = self.blocker(mv.sources[0], &active, &view.losses);
+                view.losses.push(Loss {
+                    op: self.events[m],
+                    lost_to,
+                    ranges: Vec::new(),
+                });
+                continue;
+            }
+            let mut by = Vec::new();
+            let all = mv.shown.iter().all(|&k| {
+                let killer = deletes
+                    .get(&self.root(k))
+                    .and_then(|ds| ds.iter().copied().filter(|&d| self.concurrent(d, m)).max());
+                by.extend(killer);
+                killer.is_some()
+            });
+            if all && !mv.shown.is_empty() {
+                view.losses.push(Loss {
+                    op: self.events[m],
+                    lost_to: by
+                        .into_iter()
+                        .max_by_key(|&d| self.key(d))
+                        .map(|d| self.events[d]),
+                    ranges: Vec::new(),
+                });
+            }
+        }
+        for (root, (winner, ks)) in self.marks(at) {
+            let _ = root;
+            for k in ks {
+                if k != winner && !self.past[winner][k] {
+                    view.losses.push(Loss {
+                        op: self.events[k],
+                        lost_to: Some(self.events[winner]),
+                        ranges: Vec::new(),
+                    });
+                }
+            }
+        }
+        let position: HashMap<Lv, usize> = view
+            .roots(self)
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| (r, i))
+            .collect();
         let ranges = |roots: &[Lv]| -> Vec<Range<usize>> {
             let mut at: Vec<usize> = roots
                 .iter()
@@ -574,104 +732,202 @@ impl<T: Clone> Replay<'_, T> {
             }
             out
         };
-        // Deletes, not undone, by root.
-        let undone = |d: Lv| {
-            (0..self.events())
-                .any(|u| at[u] && matches!(self.info[u], Info::Undelete { target } if target == d))
-        };
-        let mut deletes: HashMap<Lv, Vec<Lv>> = HashMap::new();
-        for d in (0..self.events()).filter(|&d| at[d]) {
-            if let Info::Delete { root } = self.info[d]
-                && !undone(d)
-            {
-                deletes.entry(root).or_default().push(d);
-            }
-        }
-        for &m in active {
-            let mv = self.mv(m);
-            // Only copies off their items' paths: nothing moves.
-            if mv.sources.iter().all(|&k| !self.on_path(k, active)) {
-                let lost_to = self.blocker(mv.sources[0], active, &view.losses);
-                view.losses.push(Loss {
-                    op: m,
-                    lost_to,
-                    ranges: Vec::new(),
-                });
-                continue;
-            }
-            let shown = &self.mv(m).shown;
-            let mut by = Vec::new();
-            let all = shown.iter().all(|&k| {
-                let killer = deletes
-                    .get(&self.root(k))
-                    .and_then(|ds| ds.iter().copied().filter(|&d| self.concurrent(d, m)).max());
-                by.extend(killer);
-                killer.is_some()
-            });
-            if all && !shown.is_empty() {
-                view.losses.push(Loss {
-                    op: m,
-                    lost_to: by
-                        .into_iter()
-                        .max_by_key(|&d| (self.lamport[d], self.log.order_key(d))),
-                    ranges: Vec::new(),
-                });
-            }
-        }
-        let key = |m: Lv| (self.lamport[m], self.log.order_key(m));
-        let mut marks: BTreeMap<Lv, Vec<Lv>> = BTreeMap::new();
-        for k in (0..self.events()).filter(|&k| at[k]) {
-            if let Info::Mark { root } = self.info[k] {
-                marks.entry(root).or_default().push(k);
-            }
-        }
-        for ks in marks.values() {
-            let winner = *ks.iter().max_by_key(|&&k| key(k)).unwrap();
-            for &k in ks {
-                if k != winner && !self.past[winner][k] {
-                    view.losses.push(Loss {
-                        op: k,
-                        lost_to: Some(winner),
-                        ranges: Vec::new(),
-                    });
-                }
-            }
-        }
         for loss in &mut view.losses {
-            let roots: Vec<Lv> = match &self.info[loss.op] {
+            let roots: Vec<Lv> = match &self.info[self.ix[&loss.op]] {
                 Info::Move(mv) => mv.shown.iter().map(|&k| self.root(k)).collect(),
-                Info::Mark { root } => vec![*root],
+                Info::Mark { root, .. } => vec![*root],
                 _ => Vec::new(),
             };
             loss.ranges = ranges(&roots);
         }
         view.losses.sort_by_key(|l| l.op);
     }
+
+    /// The marks at `at`, by root: the latest, and all of them.
+    fn marks(&self, at: &[bool]) -> BTreeMap<Lv, (Ix, Vec<Ix>)> {
+        let mut marks: BTreeMap<Lv, (Ix, Vec<Ix>)> = BTreeMap::new();
+        for k in (0..self.n()).filter(|&k| at[k]) {
+            if let Info::Mark { root, .. } = self.info[k] {
+                let e = marks.entry(root).or_insert((k, Vec::new()));
+                if self.key(k) > self.key(e.0) {
+                    e.0 = k;
+                }
+                e.1.push(k);
+            }
+        }
+        marks
+    }
+
+    /// The level the latest mark at `at` gives each marked root.
+    pub(crate) fn levels(&self, at: &[bool]) -> BTreeMap<Lv, (Lv, u8)> {
+        self.marks(at)
+            .into_iter()
+            .map(|(root, (winner, _))| match self.info[winner] {
+                Info::Mark { level, .. } => (root, (self.events[winner], level)),
+                _ => unreachable!("a mark"),
+            })
+            .collect()
+    }
+
+    /// The document after event `x`, from the document at its own
+    /// version: flatly, as `x` saw everything there.
+    fn after(&self, view: &View, x: Ix) -> View {
+        let mut v = View {
+            order: view.order.clone(),
+            drawn: view.drawn.clone(),
+            deleted: view.deleted.clone(),
+            losses: Vec::new(),
+            active: view.active.clone(),
+        };
+        let place_after = |v: &mut View, left: Option<Key>, keys: &[(Key, bool)]| {
+            let o = left.map_or(0, |l| v.order.iter().position(|&k| k == l).unwrap() + 1);
+            v.order.splice(o..o, keys.iter().map(|&(k, _)| k));
+            let d = left.map_or(0, |l| {
+                v.drawn.iter().position(|&(k, _)| k == l).unwrap() + 1
+            });
+            v.drawn.splice(d..d, keys.iter().copied());
+        };
+        match &self.info[x] {
+            Info::Insert(spot) => place_after(&mut v, spot.left, &[(self.events[x], true)]),
+            Info::Delete { root } => {
+                v.deleted.insert(*root);
+                for d in &mut v.drawn {
+                    if self.root(d.0) == *root {
+                        d.1 = false;
+                    }
+                }
+            }
+            Info::Undelete { target } => {
+                let Info::Delete { root } = self.info[*target] else {
+                    unreachable!("an undelete undoes a delete")
+                };
+                let mut at = self.versions[x].clone();
+                at[x] = true;
+                if !self.deleted(&at).contains(&root) {
+                    v.deleted.remove(&root);
+                    for d in &mut v.drawn {
+                        if self.root(d.0) == root {
+                            d.1 = true;
+                        }
+                    }
+                }
+            }
+            Info::Mark { .. } | Info::Inert => {}
+            Info::Move(mv) => {
+                v.active.push(x);
+                let taken: HashSet<Key> = mv.sources.iter().copied().collect();
+                let shows: HashMap<Key, bool> = v.drawn.iter().copied().collect();
+                v.drawn.retain(|(k, _)| !taken.contains(k));
+                let copies: Vec<(Key, bool)> = mv
+                    .sources
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (mv.first_copy + i, shows[s]))
+                    .collect();
+                place_after(&mut v, mv.to.left, &copies);
+            }
+        }
+        v
+    }
 }
 
-fn replay<T: Clone>(log: &OpLog<T>) -> Replay<'_, T> {
-    let n = log.len();
+/// A replay of `events` (sorted, every one of them after a version every
+/// one of them saw) from the document there, whose items are `base`, by
+/// root. With `flat`, each event's
+/// version is built from the one before where it can; without, from
+/// scratch every time, as the reference does.
+pub(crate) fn replay<'a, T: Clone>(
+    log: &'a OpLog<T>,
+    base: Vec<Lv>,
+    events: Vec<Lv>,
+    flat: bool,
+) -> Result<Replay<'a, T>, Unsupported> {
+    replay_checked(log, base, events, flat, false)
+}
+
+/// As [`replay`]; with `check`, each flat step is checked against the
+/// document rebuilt from scratch.
+fn replay_checked<'a, T: Clone>(
+    log: &'a OpLog<T>,
+    base: Vec<Lv>,
+    events: Vec<Lv>,
+    flat: bool,
+    check: bool,
+) -> Result<Replay<'a, T>, Unsupported> {
+    let n = events.len();
+    let ix: HashMap<Lv, Ix> = events.iter().enumerate().map(|(i, &lv)| (lv, i)).collect();
     let mut r = Replay {
         log,
-        base: n,
+        base,
+        events,
+        ix,
         info: Vec::with_capacity(n),
         past: Vec::with_capacity(n),
-        lamport: Vec::with_capacity(n),
+        copy_base: log.len(),
         copies: Vec::new(),
+        versions: Vec::with_capacity(n),
+        redirects: Default::default(),
     };
-    for lv in 0..n {
-        let event = log.event(lv);
-        let lamport = 1 + event
+    // The document after each event, while a later one still builds on it.
+    let mut after: HashMap<Ix, View> = HashMap::new();
+    let mut uses: Vec<usize> = vec![0; n];
+    let parents_of = |lv: Lv, ix: &HashMap<Lv, Ix>| -> Vec<Ix> {
+        let mut p: Vec<Ix> = log
+            .event(lv)
             .parents
             .iter()
-            .map(|&p| r.lamport[p])
-            .max()
-            .unwrap_or(0);
-        r.lamport.push(lamport);
-        let at = log.closure(&event.parents);
+            .filter_map(|p| ix.get(p).copied())
+            .collect();
+        p.sort_unstable();
+        p
+    };
+    if flat {
+        for i in 0..n {
+            if let [p] = parents_of(r.events[i], &r.ix)[..] {
+                uses[p] += 1;
+            }
+        }
+    }
+    let empty = View {
+        order: r.base.clone(),
+        drawn: r.base.iter().map(|&k| (k, true)).collect(),
+        deleted: HashSet::new(),
+        losses: Vec::new(),
+        active: Vec::new(),
+    };
+    for i in 0..n {
+        let lv = r.events[i];
+        let event = log.event(lv);
+        let parents = parents_of(lv, &r.ix);
+        let mut at = vec![false; n];
+        for &p in &parents {
+            at[p] = true;
+            for (j, &seen) in r.past[p].iter().enumerate() {
+                if seen {
+                    at[j] = true;
+                }
+            }
+        }
         // Its own version, drawn from what came before it.
-        let view = r.view(&at);
-        r.past.push(at);
+        let view = match (&parents[..], flat) {
+            ([], _) => empty.clone(),
+            ([p], true) => {
+                uses[*p] -= 1;
+                if uses[*p] == 0 {
+                    after.remove(p).expect("kept for it")
+                } else {
+                    after[p].clone()
+                }
+            }
+            _ => r.rebuild(&at),
+        };
+        if check && flat && parents.len() == 1 {
+            let from_scratch = r.rebuild(&at);
+            assert_eq!(view.order, from_scratch.order, "laid out flatly at {lv}");
+            assert_eq!(view.drawn, from_scratch.drawn, "drawn flatly at {lv}");
+        }
+        r.past.push(at.clone());
+        r.versions.push(at);
         let vis: Vec<usize> = (0..view.drawn.len()).filter(|&i| view.drawn[i].1).collect();
         let spot_at = |pos: usize| -> Spot {
             assert!(pos <= vis.len(), "position {pos} is past the end");
@@ -700,16 +956,19 @@ fn replay<T: Clone>(log: &OpLog<T>) -> Replay<'_, T> {
             Op::Delete { pos } => Info::Delete {
                 root: r.root(item_at(*pos)),
             },
-            Op::Mark { pos, .. } => Info::Mark {
-                root: r.root(item_at(*pos)),
+            &Op::Mark { pos, level } => Info::Mark {
+                root: r.root(item_at(pos)),
+                level,
             },
-            Op::Undelete { target } => {
-                assert!(
-                    r.past[lv][*target],
-                    "undelete {lv} undoes a delete it includes"
-                );
-                Info::Undelete { target: *target }
-            }
+            Op::Undelete { target } => match r.ix.get(target) {
+                Some(&t) => {
+                    assert!(r.past[i][t], "undelete {lv} undoes a delete it includes");
+                    Info::Undelete { target: t }
+                }
+                // A delete from before the start: where its item lay, the
+                // start doesn't say.
+                None => return Err(Unsupported),
+            },
             &Op::Move { pos, len, to } => {
                 if len == 0 || (pos..=pos + len).contains(&to) || pos + len > vis.len() {
                     Info::Inert
@@ -722,8 +981,8 @@ fn replay<T: Clone>(log: &OpLog<T>) -> Replay<'_, T> {
                         .filter(|(_, s)| *s)
                         .map(|&(k, _)| k)
                         .collect();
-                    let first_copy = n + r.copies.len();
-                    r.copies.extend(sources.iter().map(|&s| (lv, s)));
+                    let first_copy = r.copy_base + r.copies.len();
+                    r.copies.extend(sources.iter().map(|&s| (i, s)));
                     Info::Move(Move {
                         set: sources.iter().copied().collect(),
                         sources,
@@ -735,18 +994,80 @@ fn replay<T: Clone>(log: &OpLog<T>) -> Replay<'_, T> {
             }
         };
         r.info.push(info);
+        if flat && uses[i] > 0 {
+            let next = r.after(&view, i);
+            after.insert(i, next);
+        }
     }
-    r
+    Ok(r)
+}
+
+impl<T: Clone> Replay<'_, T> {
+    /// The set of replayed events that are in `version`.
+    pub(crate) fn at(&self, version: &[Lv]) -> Vec<bool> {
+        self.events
+            .iter()
+            .map(|&lv| self.log.contains(version, lv))
+            .collect()
+    }
+
+    /// Every replayed event.
+    pub(crate) fn all(&self) -> Vec<bool> {
+        vec![true; self.n()]
+    }
+
+    /// Which delete removed each item gone at `at`, for those the window
+    /// deleted: (delete, root).
+    pub(crate) fn deletes_of(&self, at: &[bool]) -> HashMap<Lv, Lv> {
+        let deleted = self.deleted(at);
+        let mut out = HashMap::new();
+        for d in (0..self.n()).filter(|&d| at[d]) {
+            if let Info::Delete { root } = self.info[d]
+                && deleted.contains(&root)
+            {
+                out.insert(root, self.events[d]);
+            }
+        }
+        out
+    }
+
+    fn edge_ties(&self) -> bool {
+        (0..self.n()).any(|x| {
+            let spot = match self.info[x] {
+                Info::Insert(_) | Info::Move(_) => self.spot(x),
+                _ => return false,
+            };
+            (0..self.n()).any(|m| {
+                let Info::Move(mv) = &self.info[m] else {
+                    return false;
+                };
+                if !self.concurrent(x, m) {
+                    return false;
+                }
+                let inside = |k: Option<Key>| k.is_some_and(|k| mv.set.contains(&k));
+                inside(spot.before) != inside(spot.after)
+                    || mv
+                        .sources
+                        .iter()
+                        .any(|&k| self.concurrent_with(self.by(k), x))
+            })
+        })
+    }
+}
+
+/// The whole log, as the reference replays it.
+fn reference<T: Clone>(log: &OpLog<T>) -> Replay<'_, T> {
+    replay(log, Vec::new(), (0..log.len()).collect(), false)
+        .expect("from nothing, every delete is replayed")
 }
 
 /// The document at `version`.
 pub fn checkout<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<T> {
-    let r = replay(log);
-    let view = r.view(&log.closure(version));
-    view.drawn
-        .iter()
-        .filter(|(_, shows)| *shows)
-        .map(|&(k, _)| match log.event(r.root(k)).op {
+    let r = reference(log);
+    r.rebuild(&r.at(version))
+        .roots(&r)
+        .into_iter()
+        .map(|root| match log.event(root).op {
             Op::Insert { item, .. } => item,
             _ => unreachable!("a root is an insert"),
         })
@@ -755,55 +1076,56 @@ pub fn checkout<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<T> {
 
 /// Who each item at `version` is, in order: the insert it descends from.
 pub fn identities<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<Lv> {
-    let r = replay(log);
-    let view = r.view(&log.closure(version));
-    view.drawn
-        .iter()
-        .filter(|(_, shows)| *shows)
-        .map(|&(k, _)| r.root(k))
-        .collect()
+    let r = reference(log);
+    r.rebuild(&r.at(version)).roots(&r)
 }
 
 /// Each item in `version` with a level that isn't 0 there, deleted or not.
 pub fn levels<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> BTreeMap<Lv, u8> {
-    let r = replay(log);
-    let at = log.closure(version);
-    let key = |m: Lv| (r.lamport[m], log.order_key(m));
-    let mut latest: BTreeMap<Lv, Lv> = BTreeMap::new();
-    for k in (0..log.len()).filter(|&k| at[k]) {
-        if let Info::Mark { root } = r.info[k] {
-            let e = latest.entry(root).or_insert(k);
-            if key(k) > key(*e) {
-                *e = k;
-            }
-        }
-    }
-    latest
+    let r = reference(log);
+    r.levels(&r.at(version))
         .into_iter()
-        .filter_map(|(root, k)| match log.event(k).op {
-            Op::Mark { level, .. } if level > 0 => Some((root, level)),
-            _ => None,
-        })
+        .filter(|(_, (_, level))| *level > 0)
+        .map(|(root, (_, level))| (root, level))
         .collect()
 }
 
 /// Every move and mark discarded at `version`, by op.
 pub fn losses<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<Loss> {
-    let r = replay(log);
-    r.view(&log.closure(version)).losses
+    let r = reference(log);
+    r.rebuild(&r.at(version)).losses
 }
 
 /// Whether the history has an edge tie (see the docs above): where this
 /// reference and the portals may differ.
 #[doc(hidden)]
 pub fn edge_ties<T: Clone>(log: &OpLog<T>) -> bool {
-    replay(log).edge_ties()
+    reference(log).edge_ties()
 }
 
 /// The moves inert from the start: of nothing, or to where they are.
 pub fn inert<T: Clone>(log: &OpLog<T>) -> Vec<Lv> {
-    let r = replay(log);
+    let r = reference(log);
     (0..log.len())
         .filter(|&lv| matches!(r.info[lv], Info::Inert))
         .collect()
+}
+
+/// The items at `version`, by root, replayed from `start` flatly (every
+/// event after `start` must include it), each flat step checked against a
+/// rebuild: for testing the window against the reference.
+#[doc(hidden)]
+pub fn from_start<T: Clone>(log: &OpLog<T>, start: &[Lv], version: &[Lv]) -> Option<Vec<Lv>> {
+    let base = identities(log, start);
+    let events: Vec<Lv> = (0..log.len())
+        .filter(|&lv| log.contains(version, lv) && !log.contains(start, lv))
+        .collect();
+    assert!(
+        events
+            .iter()
+            .all(|&lv| start.iter().all(|&s| log.contains(&[lv], s))),
+        "every event after the start includes it"
+    );
+    let r = replay_checked(log, base, events, true, true).ok()?;
+    Some(r.rebuild(&r.all()).roots(&r))
 }

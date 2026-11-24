@@ -61,6 +61,7 @@ mod encode;
 pub mod file;
 mod ids;
 mod key;
+mod merge;
 mod oplog;
 mod order;
 mod outline;
