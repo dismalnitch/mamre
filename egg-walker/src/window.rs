@@ -28,7 +28,7 @@
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use mamre::cursor::Bias;
@@ -298,6 +298,12 @@ pub(crate) struct Window<'a, T> {
     active_cache: RefCell<[Option<(Vec<Moved>, Rc<Vec<Moved>>, Rc<Frames>)>; 2]>,
     /// Each marked item's winning mark among those replayed.
     marks: HashMap<usize, (u64, (&'a str, u64))>,
+    /// Each base block's length and hidden edges, as laid.
+    laid: Map<Lv, (usize, Edges)>,
+    /// Where what the effect version shows has changed: records put in,
+    /// deleted or brought back, and the ends of moves replayed. A base
+    /// block with none of these inside it shows what it did.
+    changed: BTreeSet<Key>,
 }
 
 impl<'a, T: Clone> Window<'a, T> {
@@ -326,6 +332,8 @@ impl<'a, T: Clone> Window<'a, T> {
             base_active: Vec::new(),
             active_cache: RefCell::new([None, None]),
             marks: HashMap::new(),
+            laid: Map::default(),
+            changed: BTreeSet::new(),
         };
         w.lay_base(blocks);
         w
@@ -335,6 +343,11 @@ impl<'a, T: Clone> Window<'a, T> {
     /// the base document's items, cut where blocks start and end, with a
     /// marker at each hidden edge; and the blocks as in-place moves.
     fn lay_base(&mut self, blocks: &Blocks) {
+        self.laid = blocks
+            .0
+            .iter()
+            .map(|b| (b.lv, (b.span.len(), b.hidden)))
+            .collect();
         let laid = blocks.lay();
         // Built at once: every merge lays its base anew.
         let mut records: Vec<Record> = Vec::with_capacity(laid.pieces.len());
@@ -1175,6 +1188,7 @@ impl<'a, T: Clone> Window<'a, T> {
             None => self.records.push(record),
         }
         self.keys.insert(lv, key.clone());
+        self.changed.insert(key.clone());
         key
     }
 
@@ -1195,6 +1209,7 @@ impl<'a, T: Clone> Window<'a, T> {
         let (record, _) = self.record_at(&key);
         self.update(&key, |r| r.prepare = Prepare::Deleted(1));
         self.targets.insert(lv, record.id);
+        self.changed.insert(key.clone());
         let Some(out) = out else {
             self.update(&key, |r| r.dead += 1);
             return;
@@ -1234,6 +1249,8 @@ impl<'a, T: Clone> Window<'a, T> {
             r.dead -= 1;
             alive = r.dead == 0;
         });
+        // (Its place is noted as changed already: a merge replays the
+        // delete an undelete undoes, and the delete noted it.)
         if alive && let Some(out) = out {
             let id = self.identity(&key);
             out.insert(self.effect_pos(&key), id);
@@ -1310,6 +1327,8 @@ impl<'a, T: Clone> Window<'a, T> {
         };
         let (left, right) = self.origins(to);
         self.put(lv, left, right, true);
+        self.changed.insert(self.item_key(first));
+        self.changed.insert(self.item_key(last));
         let (before, _) = self.active(In::Effect);
         self.add_move(Moved {
             id: lv,
@@ -1470,34 +1489,73 @@ impl<'a, T: Clone> Window<'a, T> {
             debug_assert_eq!(counted, drawn, "the blocks, counted and drawn");
         }
         // Whether a block's first record is where its first visible element
-        // starts, and its last where its last ends.
+        // starts, and its last where its last ends: as it was laid, for a
+        // base block nothing changed inside.
         let mut blocks: Vec<(Block, usize)> = blocks
             .into_iter()
             .map(|(k, span)| {
                 let a = &frames.active[k];
-                let (first, _) = self.drawn_at(v, &frames, &totals, span.start);
-                let (last, _) = self.drawn_at(v, &frames, &totals, span.end - 1);
-                let fp = self.path(&frames, &first.key);
-                let lp = self.path(&frames, &last.key);
-                let depth = fp.iter().position(|&x| x == a.m.id).unwrap();
-                let starts = match fp.get(depth + 1) {
-                    None => first.key.clone(),
-                    Some(g) => frames.location(frames.by_id[g]).0,
-                };
-                let ends = match lp.get(depth + 1) {
-                    None => last.last.clone(),
-                    Some(g) => frames.location(frames.by_id[g]).1,
-                };
-                let hidden = Edges {
-                    head: starts != a.lo,
-                    tail: ends != a.hi,
-                };
-                let block = Block::new(a.m.id, span, hidden);
-                (block, depth)
+                if a.portal.is_none()
+                    && self
+                        .changed
+                        .range(a.lo.clone()..=a.hi.clone())
+                        .next()
+                        .is_none()
+                {
+                    let (len, hidden) = self.laid[&a.m.id];
+                    debug_assert_eq!(span.len(), len, "a block nothing changed in");
+                    let depth = self
+                        .path(&frames, &a.lo)
+                        .iter()
+                        .position(|&x| x == a.m.id)
+                        .unwrap();
+                    #[cfg(all(debug_assertions, not(feature = "perf")))]
+                    assert_eq!(
+                        (hidden, depth),
+                        self.hidden_edges(&frames, &totals, k, &span),
+                        "the hidden edges of a block nothing changed in"
+                    );
+                    return (Block::new(a.m.id, span, hidden), depth);
+                }
+                let (hidden, depth) = self.hidden_edges(&frames, &totals, k, &span);
+                (Block::new(a.m.id, span, hidden), depth)
             })
             .collect();
         blocks.sort_by_key(|(b, depth)| (b.span.start, std::cmp::Reverse(b.span.end), *depth));
         Blocks(blocks.into_iter().map(|(b, _)| b).collect())
+    }
+
+    /// Which ends of active block `k`, showing `span` in the effect
+    /// version, hide records: whether its first record is where its first
+    /// visible element starts, and its last where its last ends. And how
+    /// deep it's drawn.
+    fn hidden_edges(
+        &self,
+        frames: &Frames,
+        totals: &[usize],
+        k: usize,
+        span: &std::ops::Range<usize>,
+    ) -> (Edges, usize) {
+        let v = In::Effect;
+        let a = &frames.active[k];
+        let (first, _) = self.drawn_at(v, frames, totals, span.start);
+        let (last, _) = self.drawn_at(v, frames, totals, span.end - 1);
+        let fp = self.path(frames, &first.key);
+        let lp = self.path(frames, &last.key);
+        let depth = fp.iter().position(|&x| x == a.m.id).unwrap();
+        let starts = match fp.get(depth + 1) {
+            None => first.key.clone(),
+            Some(g) => frames.location(frames.by_id[g]).0,
+        };
+        let ends = match lp.get(depth + 1) {
+            None => last.last.clone(),
+            Some(g) => frames.location(frames.by_id[g]).1,
+        };
+        let hidden = Edges {
+            head: starts != a.lo,
+            tail: ends != a.hi,
+        };
+        (hidden, depth)
     }
 }
 
