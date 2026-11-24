@@ -33,6 +33,7 @@ use crate::walk::{Change, Changes};
 /// A map keyed by ids or indices, hashed cheaply: the walk looks records
 /// up all the time, and nothing here is chosen by an adversary.
 type Map<K, V> = HashMap<K, V, BuildHasherDefault<IdHasher>>;
+type Set = HashSet<Lv, BuildHasherDefault<IdHasher>>;
 
 #[derive(Default)]
 struct IdHasher(u64);
@@ -135,13 +136,13 @@ enum In {
 struct Walk<'a, T> {
     log: &'a OpLog<T>,
     records: Vec<Record>,
-    /// The prepare version, as a set.
-    prepared: Vec<bool>,
+    /// The prepare version beyond the base, as a set.
+    prepared: Set,
     /// The events stepped so far, in order: all the prepare version can
     /// hold beyond the base.
     stepped: Vec<Lv>,
-    /// The effect version, as a set: the base, and everything stepped.
-    effect: Vec<bool>,
+    /// The effect version beyond the base, as a set: everything stepped.
+    effect: Set,
     /// Which record each delete replayed so far removed.
     targets: HashMap<Lv, usize>,
     /// How many undeletes of each delete the prepare version holds.
@@ -150,7 +151,10 @@ struct Walk<'a, T> {
     undone: HashSet<Lv>,
     /// Which insert each base item came from, once asked.
     base_ids: BaseIds,
-    base: Vec<bool>,
+    /// The base, as a set, for the oracle walk. A window doesn't keep it:
+    /// every replayed event's history is the base and what was stepped
+    /// before it, so what wasn't stepped is the base's.
+    base: Option<Vec<bool>>,
     /// The moves that do something, in the order activity is decided in.
     moves: Vec<Moved>,
     /// Each marked record's winning mark among those replayed.
@@ -221,8 +225,7 @@ impl<'a, T: Clone> Window<'a, T> {
         ids: Option<Ids>,
         blocks: &Blocks,
     ) -> Self {
-        let base = log.closure(&frontier);
-        let mut walk = Walk::new(log, base, BaseIds::Given { frontier, ids });
+        let mut walk = Walk::new(log, None, BaseIds::Given { frontier, ids });
         walk.lay_base(blocks.0.clone());
         Window(walk)
     }
@@ -276,7 +279,7 @@ impl<T: Clone> OpLog<T> {
             return Vec::new();
         }
         let base = self.base_simple(&have, &want);
-        let mut walk = Walk::new(self, base.clone(), BaseIds::Reference(None));
+        let mut walk = Walk::new(self, Some(base.clone()), BaseIds::Reference(None));
         walk.lay_base(crate::reference::blocks(self, &base));
         // First what the document already holds past the base, to set up
         // its state, then what's new. Parents come first either way:
@@ -328,13 +331,13 @@ impl<T: Clone> OpLog<T> {
 
 impl<'a, T: Clone> Walk<'a, T> {
     /// A walk from `base`, with nothing laid yet.
-    fn new(log: &'a OpLog<T>, base: Vec<bool>, base_ids: BaseIds) -> Self {
+    fn new(log: &'a OpLog<T>, base: Option<Vec<bool>>, base_ids: BaseIds) -> Self {
         Walk {
             log,
             records: Vec::new(),
-            prepared: base.clone(),
+            prepared: Set::default(),
             stepped: Vec::new(),
-            effect: base.clone(),
+            effect: Set::default(),
             targets: HashMap::new(),
             undos: HashMap::new(),
             undone: HashSet::new(),
@@ -439,22 +442,22 @@ impl<'a, T: Clone> Walk<'a, T> {
         let mut above: HashSet<Lv, BuildHasherDefault<IdHasher>> = HashSet::default();
         let mut stack: Vec<Lv> = event.parents.clone();
         while let Some(x) = stack.pop() {
-            if !self.base[x] && above.insert(x) {
+            if !self.in_base(x) && above.insert(x) {
                 stack.extend(self.log.parents(x));
             }
         }
         for k in (0..self.stepped.len()).rev() {
             let x = self.stepped[k];
-            if self.prepared[x] && !above.contains(&x) {
+            if self.prepared.contains(&x) && !above.contains(&x) {
                 self.retreat(x);
-                self.prepared[x] = false;
+                self.prepared.remove(&x);
             }
         }
         for k in 0..self.stepped.len() {
             let x = self.stepped[k];
-            if !self.prepared[x] && above.contains(&x) {
+            if !self.prepared.contains(&x) && above.contains(&x) {
                 self.advance(x);
-                self.prepared[x] = true;
+                self.prepared.insert(x);
             }
         }
         let at = self.stepped.partition_point(|&x| x < lv);
@@ -466,8 +469,17 @@ impl<'a, T: Clone> Walk<'a, T> {
             &Op::Move { pos, len, to } => self.move_(lv, pos, len, to, out),
             &Op::Mark { pos, level } => self.mark(lv, pos, level, out),
         }
-        self.prepared[lv] = true;
-        self.effect[lv] = true;
+        self.prepared.insert(lv);
+        self.effect.insert(lv);
+    }
+
+    /// Whether event `x`, in the history of an event being stepped, is in
+    /// the base.
+    fn in_base(&self, x: Lv) -> bool {
+        match &self.base {
+            Some(base) => base[x],
+            None => self.stepped.binary_search(&x).is_err(),
+        }
     }
 
     fn index_of(&self, id: usize) -> usize {
@@ -610,9 +622,12 @@ impl<'a, T: Clone> Walk<'a, T> {
         }
         let (log, base) = (self.log, &self.base);
         match &mut self.base_ids {
-            BaseIds::Reference(ids) => {
-                ids.get_or_insert_with(|| crate::reference::visible_ids(log, base))[id - BASE_ITEM]
-            }
+            BaseIds::Reference(ids) => ids.get_or_insert_with(|| {
+                crate::reference::visible_ids(
+                    log,
+                    base.as_ref().expect("the oracle keeps its base"),
+                )
+            })[id - BASE_ITEM],
             BaseIds::Given { frontier, ids } => ids
                 .get_or_insert_with(|| log.ids_at(frontier))
                 .get(id - BASE_ITEM),
@@ -624,7 +639,7 @@ impl<'a, T: Clone> Walk<'a, T> {
     fn present(&self, r: &Record, v: In) -> bool {
         match v {
             In::Prepare => r.prepare != Prepare::NotYet,
-            In::Effect => !r.portal || self.effect[r.id],
+            In::Effect => !r.portal || self.effect.contains(&r.id),
         }
     }
 
@@ -650,8 +665,8 @@ impl<'a, T: Clone> Walk<'a, T> {
     /// Which moves are active in version `v`, by the reference's rules.
     fn active(&self, v: In) -> Vec<Moved> {
         let has = |id: Lv| match v {
-            In::Prepare => self.prepared[id],
-            In::Effect => self.effect[id],
+            In::Prepare => self.prepared.contains(&id),
+            In::Effect => self.effect.contains(&id),
         };
         let candidates: Vec<Moved> = self
             .moves
@@ -1151,7 +1166,7 @@ impl<'a, T: Clone> Walk<'a, T> {
             in_place: false,
         });
         // Counted in the effect version for the question that follows.
-        self.effect[lv] = true;
+        self.effect.insert(lv);
         let after = self.active(In::Effect);
         if let Some(out) = out {
             self.emit(&before, &after, out);

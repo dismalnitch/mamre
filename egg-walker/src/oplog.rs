@@ -17,7 +17,7 @@
 //! how a document's whole history stays small. Single events are rebuilt
 //! when asked for; nothing about their numbering changes.
 
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ops::Range;
 
 /// What an event does, without its details.
@@ -842,10 +842,33 @@ impl<T> OpLog<T> {
         }
         // An entry another includes is before that one: in what all the
         // entries' parents include, as nothing includes itself. One walk
-        // back from all the parents at once finds them.
-        let parents: Vec<Lv> = all.iter().flat_map(|&lv| self.parents(lv)).collect();
-        let before = self.closure(&parents);
-        all.into_iter().filter(|&lv| !before[lv]).collect()
+        // back from all the parents at once finds them, latest first, a run
+        // at a time; as events come after their parents, it stops below the
+        // earliest entry.
+        let mut dropped = vec![false; all.len()];
+        let mut next: BinaryHeap<Lv> = all.iter().flat_map(|&lv| self.parents(lv)).collect();
+        let mut seen: HashSet<Lv> = HashSet::new();
+        while let Some(x) = next.pop() {
+            if x < all[0] {
+                break;
+            }
+            // Latest first, so the first time a run is reached is from
+            // its latest event reached at all.
+            let run = self.run_of(x);
+            if !seen.insert(run.start) {
+                continue;
+            }
+            let (i, j) = (
+                all.partition_point(|&e| e < run.start),
+                all.partition_point(|&e| e <= x),
+            );
+            dropped[i..j].fill(true);
+            next.extend(&run.parents);
+        }
+        all.into_iter()
+            .zip(dropped)
+            .filter_map(|(lv, gone)| (!gone).then_some(lv))
+            .collect()
     }
 
     /// How an event's inserts are ordered against concurrent ones at the

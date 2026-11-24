@@ -1364,3 +1364,32 @@ fn a_block_ending_in_a_run() {
     // (the fresh accountant shares the code that finds it).
     assert_eq!(books.moved_blocks(), [(k1[0], 4..6)]);
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The union of any writers' versions, and of single events in them:
+    /// every event either includes, with none another includes.
+    #[test]
+    fn a_union_keeps_only_the_latest(actions in actions(), picks in prop::collection::vec(any::<prop::sample::Index>(), 4)) {
+        let (log, versions) = history(actions);
+        if log.len() == 0 {
+            return Ok(());
+        }
+        let mut sets: Vec<Vec<Lv>> = versions.clone();
+        sets.extend(picks.iter().map(|p| vec![p.index(log.len())]));
+        for a in &sets {
+            for b in &sets {
+                let mut all: Vec<Lv> = a.iter().chain(b).copied().collect();
+                all.sort_unstable();
+                all.dedup();
+                let want: Vec<Lv> = all
+                    .iter()
+                    .copied()
+                    .filter(|&lv| !all.iter().any(|&o| o != lv && log.contains(&[o], lv)))
+                    .collect();
+                prop_assert_eq!(log.union(a, b), want, "{:?} with {:?}", a, b);
+            }
+        }
+    }
+}
