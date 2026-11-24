@@ -335,6 +335,8 @@ impl<'a, T: Clone> Window<'a, T> {
     /// marker at each hidden edge; and the blocks as in-place moves.
     fn lay_base(&mut self, blocks: &Blocks) {
         let laid = blocks.lay();
+        // Built at once: every merge lays its base anew.
+        let mut records: Vec<Record> = Vec::with_capacity(laid.pieces.len());
         for (i, piece) in laid.pieces.iter().enumerate() {
             let record = match piece {
                 Piece::Items(r) => Record {
@@ -355,7 +357,7 @@ impl<'a, T: Clone> Window<'a, T> {
                         Piece::Items(r) => Some(Key::base_item(r.start)),
                         Piece::Marker(_) => None,
                     });
-                    let prev = self.records.last().map(|r| r.last.clone());
+                    let prev = records.last().map(|r| r.last.clone());
                     let key = Key::between(prev.as_ref(), next.as_ref());
                     self.keys.insert(id, key.clone());
                     Record {
@@ -371,8 +373,9 @@ impl<'a, T: Clone> Window<'a, T> {
                     }
                 }
             };
-            self.records.push(record);
+            records.push(record);
         }
+        self.records = SumTree::from_items(records);
         // In the order activity is decided in, as `add_move` would put
         // them.
         let order = |id: Lv| (self.log.lamport(id), self.log.order_key(id));
