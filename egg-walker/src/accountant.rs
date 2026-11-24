@@ -116,10 +116,12 @@ impl Accountant {
     /// The moved blocks the document shows, sorted: each active move with
     /// something visible in it, and the positions it covers. For tests.
     #[doc(hidden)]
-    pub fn moved_blocks(&self) -> Vec<(Lv, std::ops::Range<usize>)> {
-        let mut blocks = self.blocks.0.clone();
-        blocks.sort_by_key(|(lv, r)| (*lv, r.start, r.end));
-        blocks
+    pub fn moved_blocks(&self) -> Vec<(Lv, std::ops::Range<usize>, bool, bool)> {
+        self.blocks
+            .sorted()
+            .into_iter()
+            .map(|b| (b.lv, b.span, b.head, b.tail))
+            .collect()
     }
 
     /// The level of the section `item` starts: 0 if none.
@@ -226,7 +228,7 @@ mod tests {
         let mut books = Accountant::new();
         books.merge(&log, &v);
         books.watch(2);
-        assert_eq!(books.blocks.0, vec![(6, 3..5)]);
+        assert_eq!(books.moved_blocks(), vec![(6, 3..5, false, false)]);
         let mut bytes = Vec::new();
         books.encode(&mut bytes);
         let back = Accountant::decode(&mut bytes.as_slice(), log.len()).unwrap();

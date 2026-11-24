@@ -44,6 +44,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use crate::blocks::{Block, Blocks};
 use crate::oplog::{Lv, Op, OpLog};
 use crate::order::{Placed, place};
 use crate::walk::tie_break;
@@ -152,18 +153,45 @@ pub fn levels<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> std::collections::BTr
 /// The moved blocks the document shows at `at` (a version, as a set):
 /// each active move with something visible in it, and the visible
 /// positions it covers. They nest, and come in no particular order.
-pub(crate) fn blocks<T: Clone>(log: &OpLog<T>, at: &[bool]) -> Vec<(Lv, Range<usize>)> {
+///
+/// And whether each has hidden edges (see `blocks.rs`): its first record
+/// isn't where its first visible element starts, or its last isn't where
+/// its last ends. They come outermost first.
+pub(crate) fn blocks<T: Clone>(log: &OpLog<T>, at: &[bool]) -> Blocks {
     let state = replay(log);
     let view = state.view(at);
     let visible: Vec<&Entry> = view.entries.iter().filter(|e| e.visible).collect();
-    view.active
+    let mut blocks: Vec<(Block, usize)> = view
+        .active
         .iter()
-        .filter_map(|(m, _, _)| {
+        .filter_map(|&(m, lo, hi)| {
             let mut inside = (0..visible.len()).filter(|&k| visible[k].path.contains(&m.id));
             let first = inside.next()?;
             let last = inside.next_back().unwrap_or(first);
-            Some((m.id, first..last + 1))
+            let (f, l) = (visible[first], visible[last]);
+            let depth = f.path.iter().position(|&x| x == m.id).unwrap();
+            let head = state.lifted(f, depth + 1) != lo;
+            let tail = state.lifted(l, depth + 1) != hi;
+            Some((Block::new(m.id, first..last + 1, head, tail), depth))
         })
+        .collect();
+    blocks.sort_by_key(|(b, depth)| (b.span.start, std::cmp::Reverse(b.span.end), *depth));
+    Blocks(blocks.into_iter().map(|(b, _)| b).collect())
+}
+
+/// The moved blocks at `version`, as the reference finds them: each
+/// active move with something visible in it, the visible positions it
+/// covers, and whether its head and tail are hidden. By start, the longer
+/// first, and of the same span, the outer first.
+#[doc(hidden)]
+pub fn moved_blocks<T: Clone>(
+    log: &OpLog<T>,
+    version: &[Lv],
+) -> Vec<(Lv, Range<usize>, bool, bool)> {
+    blocks(log, &log.closure(version))
+        .0
+        .into_iter()
+        .map(|b| (b.lv, b.span, b.head, b.tail))
         .collect()
 }
 

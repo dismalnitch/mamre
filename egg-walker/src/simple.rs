@@ -24,7 +24,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::{ControlFlow, Range};
 use std::rc::Rc;
 
-use crate::blocks::Blocks;
+use crate::blocks::{Block, Blocks, MARKER, Piece};
 use crate::ids::Ids;
 use crate::oplog::{Kind, Lv, Op, OpLog};
 use crate::order::{Placed, place};
@@ -290,7 +290,7 @@ impl<'a, T: Clone> Window<'a, T> {
         blocks: &Blocks,
     ) -> Self {
         let mut walk = Walk::new(log, None, BaseIds::Given { frontier, ids });
-        walk.lay_base(blocks.0.clone());
+        walk.lay_base(blocks);
         Window(walk)
     }
 
@@ -302,27 +302,38 @@ impl<'a, T: Clone> Window<'a, T> {
     pub(crate) fn blocks(&self) -> Blocks {
         let walk = &self.0;
         let (entries, lay) = walk.draw(In::Effect, &walk.active(In::Effect));
-        let mut spans: Vec<(Lv, Option<usize>, usize)> =
-            lay.active.iter().map(|a| (a.m.id, None, 0)).collect();
+        // Each block's first and last visible entry, and where they are.
+        let mut spans: Vec<Option<(usize, usize, usize, usize)>> = vec![None; lay.active.len()];
         let mut pos = 0;
-        for e in entries.iter().filter(|e| e.visible) {
+        for (k, e) in entries.iter().enumerate().filter(|(_, e)| e.visible) {
             let r = &walk.records[e.at];
             if r.id >= BASE_ITEM && r.id + r.len == BASE_ITEM + UNDERWATER {
                 continue;
             }
             for id in e.path.iter() {
-                let (_, start, end) = &mut spans[lay.by_id[id]];
-                start.get_or_insert(pos);
-                *end = pos + r.len;
+                let span = &mut spans[lay.by_id[id]];
+                let (first, start, _, _) = span.unwrap_or((k, pos, k, pos));
+                *span = Some((first, start, k, pos + r.len));
             }
             pos += r.len;
         }
-        Blocks(
-            spans
-                .into_iter()
-                .filter_map(|(id, start, end)| Some((id, start?..end)))
-                .collect(),
-        )
+        // Whether a block's first record is where its first visible
+        // element starts, and its last where its last ends.
+        let mut blocks: Vec<(Block, usize)> = lay
+            .active
+            .iter()
+            .zip(spans)
+            .filter_map(|(a, span)| {
+                let (first, start, last, end) = span?;
+                let (f, l) = (&entries[first], &entries[last]);
+                let depth = f.path.iter().position(|&x| x == a.m.id).unwrap();
+                let head = walk.element(&lay, f, depth + 1).0 != a.lo;
+                let tail = walk.element(&lay, l, depth + 1).1 != a.hi;
+                Some((Block::new(a.m.id, start..end, head, tail), depth))
+            })
+            .collect();
+        blocks.sort_by_key(|(b, depth)| (b.span.start, std::cmp::Reverse(b.span.end), *depth));
+        Blocks(blocks.into_iter().map(|(b, _)| b).collect())
     }
 }
 
@@ -344,7 +355,7 @@ impl<T: Clone> OpLog<T> {
         }
         let base = self.base_simple(&have, &want);
         let mut walk = Walk::new(self, Some(base.clone()), BaseIds::Reference(None));
-        walk.lay_base(crate::reference::blocks(self, &base));
+        walk.lay_base(&crate::reference::blocks(self, &base));
         // First what the document already holds past the base, to set up
         // its state, then what's new. Parents come first either way:
         // `from` holds all its events' parents.
@@ -426,7 +437,7 @@ impl<'a, T: Clone> Walk<'a, T> {
         let mut base = Vec::new();
         for (i, r) in self.records.iter().enumerate() {
             by_id.insert(r.id, i);
-            if !r.portal && r.id >= BASE_ITEM {
+            if !r.portal && (BASE_ITEM..MARKER).contains(&r.id) {
                 base.push((r.id, i));
             }
         }
@@ -451,32 +462,37 @@ impl<'a, T: Clone> Walk<'a, T> {
     /// The placeholder, cut wherever a base block starts or ends (its last
     /// item on its own, so it can be an origin), and the blocks as
     /// in-place moves.
-    fn lay_base(&mut self, blocks: Vec<(Lv, Range<usize>)>) {
-        let mut cuts: Vec<usize> = blocks
-            .iter()
-            .flat_map(|(_, r)| [r.start, r.end - 1, r.end])
-            .collect();
-        cuts.push(0);
-        cuts.sort_unstable();
-        cuts.dedup();
-        cuts.push(UNDERWATER);
-        for w in cuts.windows(2) {
-            self.moved_records();
-            self.records.push(Record {
-                id: BASE_ITEM + w[0],
-                len: w[1] - w[0],
-                left: None,
-                right: None,
-                prepare: Prepare::Inserted,
-                dead: 0,
-                portal: false,
+    fn lay_base(&mut self, blocks: &Blocks) {
+        let laid = blocks.lay();
+        self.moved_records();
+        for piece in laid.pieces {
+            self.records.push(match piece {
+                Piece::Items(r) => Record {
+                    id: BASE_ITEM + r.start,
+                    len: r.len(),
+                    left: None,
+                    right: None,
+                    prepare: Prepare::Inserted,
+                    dead: 0,
+                    portal: false,
+                },
+                // What a block hides at its edge: nothing to show, ever.
+                Piece::Marker(id) => Record {
+                    id,
+                    len: 0,
+                    left: None,
+                    right: None,
+                    prepare: Prepare::Deleted(1),
+                    dead: 1,
+                    portal: false,
+                },
             });
         }
-        for (id, r) in blocks {
+        for (id, first, last) in laid.moves {
             self.add_move(Moved {
                 id,
-                first: BASE_ITEM + r.start,
-                last: BASE_ITEM + r.end - 1,
+                first,
+                last,
                 in_place: true,
             });
         }
@@ -557,7 +573,7 @@ impl<'a, T: Clone> Walk<'a, T> {
     /// The index of the record holding item (or portal) `item`.
     fn index_of_item(&self, item: usize) -> usize {
         let index = self.index();
-        if item < BASE_ITEM {
+        if !(BASE_ITEM..MARKER).contains(&item) {
             return *index.by_id.get(&item).expect("every item is in the list");
         }
         let k = index.base.partition_point(|&(first, _)| first <= item);

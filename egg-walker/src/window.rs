@@ -33,7 +33,7 @@ use std::rc::Rc;
 use mamre::cursor::Bias;
 use mamre::{Item, SeekTarget, SumTree, Summary};
 
-use crate::blocks::Blocks;
+use crate::blocks::{Block, Blocks, MARKER, Piece};
 use crate::ids::Ids;
 use crate::key::Key;
 use crate::oplog::{Kind, Lv, Op, OpLog};
@@ -75,7 +75,7 @@ impl Record {
     /// The key of item `id`, which this record holds.
     fn item_key(&self, id: usize) -> Key {
         debug_assert!(id >= self.id && id < self.id + self.len.max(1));
-        if self.id >= BASE_ITEM {
+        if (BASE_ITEM..MARKER).contains(&self.id) {
             Key::base_item(id - BASE_ITEM)
         } else {
             self.key.clone()
@@ -326,48 +326,67 @@ impl<'a, T: Clone> Window<'a, T> {
             active_cache: RefCell::new([None, None]),
             marks: HashMap::new(),
         };
-        w.lay_base(&blocks.0);
+        w.lay_base(blocks);
         w
     }
 
-    /// The placeholder, cut wherever a base block starts or ends (its last
-    /// item on its own, so it can be an origin), and the blocks as
-    /// in-place moves.
-    fn lay_base(&mut self, blocks: &[(Lv, std::ops::Range<usize>)]) {
-        let mut cuts: Vec<usize> = blocks
-            .iter()
-            .flat_map(|(_, r)| [r.start, r.end - 1, r.end])
-            .collect();
-        cuts.push(0);
-        cuts.sort_unstable();
-        cuts.dedup();
-        cuts.push(UNDERWATER);
-        for w in cuts.windows(2) {
-            self.records.push(Record {
-                key: Key::base_item(w[0]),
-                last: Key::base_item(w[1] - 1),
-                id: BASE_ITEM + w[0],
-                len: w[1] - w[0],
-                left: None,
-                right: None,
-                prepare: Prepare::Inserted,
-                dead: 0,
-                portal: false,
-            });
+    /// The placeholder, laid out from the base's blocks (see `Blocks::lay`):
+    /// the base document's items, cut where blocks start and end, with a
+    /// marker at each hidden edge; and the blocks as in-place moves.
+    fn lay_base(&mut self, blocks: &Blocks) {
+        let laid = blocks.lay();
+        for (i, piece) in laid.pieces.iter().enumerate() {
+            let record = match piece {
+                Piece::Items(r) => Record {
+                    key: Key::base_item(r.start),
+                    last: Key::base_item(r.end - 1),
+                    id: BASE_ITEM + r.start,
+                    len: r.len(),
+                    left: None,
+                    right: None,
+                    prepare: Prepare::Inserted,
+                    dead: 0,
+                    portal: false,
+                },
+                // What a block hides at its edge: nothing to show, ever.
+                // Its key falls just before the items that follow it.
+                &Piece::Marker(id) => {
+                    let next = laid.pieces[i..].iter().find_map(|p| match p {
+                        Piece::Items(r) => Some(Key::base_item(r.start)),
+                        Piece::Marker(_) => None,
+                    });
+                    let prev = self.records.last().map(|r| r.last.clone());
+                    let key = Key::between(prev.as_ref(), next.as_ref());
+                    self.keys.insert(id, key.clone());
+                    Record {
+                        key: key.clone(),
+                        last: key,
+                        id,
+                        len: 0,
+                        left: None,
+                        right: None,
+                        prepare: Prepare::Deleted(1),
+                        dead: 1,
+                        portal: false,
+                    }
+                }
+            };
+            self.records.push(record);
         }
         // In the order activity is decided in, as `add_move` would put
         // them.
         let order = |id: Lv| (self.log.lamport(id), self.log.order_key(id));
-        let mut moves: Vec<(_, Moved)> = blocks
+        let mut moves: Vec<(_, Moved)> = laid
+            .moves
             .iter()
-            .map(|(id, r)| {
+            .map(|&(id, first, last)| {
                 let m = Moved {
-                    id: *id,
-                    first: BASE_ITEM + r.start,
-                    last: BASE_ITEM + r.end - 1,
+                    id,
+                    first,
+                    last,
                     in_place: true,
                 };
-                (order(*id), m)
+                (order(id), m)
             })
             .collect();
         moves.sort_by(|a, b| a.0.cmp(&b.0));
@@ -435,7 +454,7 @@ impl<'a, T: Clone> Window<'a, T> {
 
     /// The key of item (or portal) `id`.
     fn item_key(&self, id: usize) -> Key {
-        if id >= BASE_ITEM {
+        if (BASE_ITEM..MARKER).contains(&id) {
             Key::base_item(id - BASE_ITEM)
         } else {
             self.keys[&id].clone()
@@ -1419,9 +1438,9 @@ impl<'a, T: Clone> Window<'a, T> {
                             ..at + self.local(v, &frames, &totals, d, &a.hi, true)
                     }
                 };
-                (!span.is_empty()).then_some((a.m.id, span))
+                (!span.is_empty()).then_some((k, span))
             })
-            .collect();
+            .collect::<Vec<_>>();
         #[cfg(debug_assertions)]
         {
             let mut spans: Vec<(Lv, Option<usize>, usize)> =
@@ -1439,9 +1458,37 @@ impl<'a, T: Clone> Window<'a, T> {
                 .into_iter()
                 .filter_map(|(id, start, end)| Some((id, start?..end)))
                 .collect();
-            debug_assert_eq!(blocks, drawn, "the blocks, counted and drawn");
+            let counted: Vec<_> = blocks
+                .iter()
+                .map(|(k, span)| (frames.active[*k].m.id, span.clone()))
+                .collect();
+            debug_assert_eq!(counted, drawn, "the blocks, counted and drawn");
         }
-        Blocks(blocks)
+        // Whether a block's first record is where its first visible element
+        // starts, and its last where its last ends.
+        let mut blocks: Vec<(Block, usize)> = blocks
+            .into_iter()
+            .map(|(k, span)| {
+                let a = &frames.active[k];
+                let (first, _) = self.drawn_at(v, &frames, &totals, span.start);
+                let (last, _) = self.drawn_at(v, &frames, &totals, span.end - 1);
+                let fp = self.path(&frames, &first.key);
+                let lp = self.path(&frames, &last.key);
+                let depth = fp.iter().position(|&x| x == a.m.id).unwrap();
+                let starts = match fp.get(depth + 1) {
+                    None => first.key.clone(),
+                    Some(g) => frames.location(frames.by_id[g]).0,
+                };
+                let ends = match lp.get(depth + 1) {
+                    None => last.last.clone(),
+                    Some(g) => frames.location(frames.by_id[g]).1,
+                };
+                let block = Block::new(a.m.id, span, starts != a.lo, ends != a.hi);
+                (block, depth)
+            })
+            .collect();
+        blocks.sort_by_key(|(b, depth)| (b.span.start, std::cmp::Reverse(b.span.end), *depth));
+        Blocks(blocks.into_iter().map(|(b, _)| b).collect())
     }
 }
 
@@ -1499,15 +1546,7 @@ impl<'a, T: Clone> Checked<'a, T> {
         let blocks = self.fast.blocks();
         #[cfg(debug_assertions)]
         {
-            let sorted = |mut b: Blocks| {
-                b.0.sort_by_key(|(lv, r)| (*lv, r.start, r.end));
-                b.0
-            };
-            assert_eq!(
-                sorted(blocks.clone()),
-                sorted(self.simple.0.blocks()),
-                "the windows' blocks"
-            );
+            assert_eq!(blocks, self.simple.0.blocks(), "the windows' blocks");
         }
         blocks
     }

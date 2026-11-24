@@ -1199,6 +1199,14 @@ fn replicas_agree(actions: Vec<(Action, usize)>) -> Result<(), TestCaseError> {
             &v,
             describe(&log)
         );
+        prop_assert_eq!(
+            books[w].moved_blocks(),
+            reference::moved_blocks(&log, &v),
+            "writer {}'s blocks at {:?}, by the reference, in\n{}",
+            w,
+            &v,
+            describe(&log)
+        );
         let levels = reference::levels(&log, &v);
         for item in 0..log.len() {
             let want = levels.get(&item).copied().unwrap_or(0);
@@ -1283,6 +1291,7 @@ proptest! {
                     let mut fresh = Accountant::new();
                     fresh.merge(&log, &both);
                     prop_assert_eq!(books.moved_blocks(), fresh.moved_blocks(), "blocks via {:?}, {:?} to {:?}, in\n{}", earlier, from, to, describe(&log));
+                    prop_assert_eq!(books.moved_blocks(), reference::moved_blocks(&log, &both), "blocks by the reference, via {:?}, {:?} to {:?}, in\n{}", earlier, from, to, describe(&log));
                 }
             }
         }
@@ -1301,6 +1310,11 @@ fn books_agree(log: &OpLog<char>, books: &mamre_egg_walker::Accountant, doc: &[c
     let mut fresh = mamre_egg_walker::Accountant::new();
     fresh.merge(log, &v);
     assert_eq!(books.moved_blocks(), fresh.moved_blocks(), "blocks");
+    assert_eq!(
+        books.moved_blocks(),
+        reference::moved_blocks(log, &v),
+        "blocks, by the reference"
+    );
 }
 
 /// A replica that took in two of b's edits at once merges c's, made after
@@ -1360,9 +1374,9 @@ fn a_block_ending_in_a_run() {
         ch.apply(&mut doc);
     }
     books_agree(&log, &books, &doc);
-    // "zdefab": the block is what's left of it, "ab", worked out by hand
-    // (the fresh accountant shares the code that finds it).
-    assert_eq!(books.moved_blocks(), [(k1[0], 4..6)]);
+    // "zdefab": the block is what's left of it, "ab", worked out by hand,
+    // its tail hidden: its last record, "c", shows nothing.
+    assert_eq!(books.moved_blocks(), [(k1[0], 4..6, false, true)]);
 }
 
 proptest! {
@@ -1401,7 +1415,6 @@ proptest! {
 /// replacing it. A walk from nothing, which sees the deleted item, keeps
 /// both. (Found by `live_replicas_keep_their_books` at 1,000 cases.)
 #[test]
-#[ignore = "the books cannot tell blocks with the same span apart: not fixed yet"]
 fn blocks_showing_the_same_items_stay_two() {
     use mamre_egg_walker::Accountant;
     let mut log = OpLog::new();
@@ -1436,8 +1449,9 @@ fn blocks_showing_the_same_items_stay_two() {
     assert_eq!(doc, reference::checkout(&log, &[17]));
     let mut fresh = Accountant::new();
     fresh.merge(&log, &[17]);
-    assert_eq!(books.moved_blocks(), [(9, 0..3), (10, 0..3)]);
+    assert_eq!(books.moved_blocks().len(), 2);
     assert_eq!(books.moved_blocks(), fresh.moved_blocks());
+    assert_eq!(books.moved_blocks(), reference::moved_blocks(&log, &[17]));
 }
 
 /// A base block whose last item a concurrent move carries away: a later
@@ -1472,4 +1486,39 @@ fn a_block_whose_end_was_moved_away() {
         reference::checkout(&log, &x2).iter().collect::<String>(),
         "fbcdae"
     );
+}
+
+/// Two nested blocks starting at the same item, each with a hidden head:
+/// the outer one's first item deleted, then the inner one's. Their
+/// markers go outer first, so the merge's base nests them as they are,
+/// and typing at their front from two places lands outside both.
+#[test]
+fn nested_blocks_both_hiding_their_heads() {
+    use mamre_egg_walker::Accountant;
+    let mut log = OpLog::new();
+    let (a, y, z) = (log.agent("a"), log.agent("y"), log.agent("z"));
+    let v = log.add_insert(a, &[], 0, "abcdef".chars());
+    // "abefcd", with "cd" moved; then "fcdabe", with "fcd" moved around it.
+    let v = log.add_move(a, &v, 2..4, 6);
+    let v = log.add_move(a, &v, 3..6, 0);
+    // "cdabe", then "dabe": both blocks show "d", and hide their heads.
+    let v = log.add_delete(a, &v, 0..1);
+    let base = log.add_delete(a, &v, 0..1);
+    let mut books = Accountant::new();
+    let mut doc = Vec::new();
+    for ch in books.merge(&log, &base) {
+        ch.apply(&mut doc);
+    }
+    books_agree(&log, &books, &doc);
+    assert_eq!(books.moved_blocks().len(), 2);
+    // y types at the front, unsent, as z types there too.
+    doc.insert(0, 'y');
+    let y1 = log.add_insert(y, books.version(), 0, ['y']);
+    books.record(&log, &y1);
+    let z1 = log.add_insert(z, &base, 0, ['z']);
+    let z2 = log.add_insert(z, &z1, 2, ['!']);
+    for ch in books.merge(&log, &z2) {
+        ch.apply(&mut doc);
+    }
+    books_agree(&log, &books, &doc);
 }
