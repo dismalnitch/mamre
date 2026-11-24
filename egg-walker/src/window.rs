@@ -355,16 +355,41 @@ impl<'a, T: Clone> Window<'a, T> {
                 portal: false,
             });
         }
-        for (id, r) in blocks {
-            self.add_move(Moved {
-                id: *id,
-                first: BASE_ITEM + r.start,
-                last: BASE_ITEM + r.end - 1,
-                in_place: true,
-            });
-        }
+        // In the order activity is decided in, as `add_move` would put
+        // them.
+        let order = |id: Lv| (self.log.lamport(id), self.log.order_key(id));
+        let mut moves: Vec<(_, Moved)> = blocks
+            .iter()
+            .map(|(id, r)| {
+                let m = Moved {
+                    id: *id,
+                    first: BASE_ITEM + r.start,
+                    last: BASE_ITEM + r.end - 1,
+                    in_place: true,
+                };
+                (order(*id), m)
+            })
+            .collect();
+        moves.sort_by(|a, b| a.0.cmp(&b.0));
+        self.moves = moves.into_iter().map(|(_, m)| m).collect();
         self.in_place = self.moves.len();
-        self.base_active = self.decide(&self.moves);
+        // A document's blocks never cross, and a block drawn in place is
+        // never inside itself: so deciding them in order only lets a later
+        // block of the same items replace an earlier one.
+        let mut active: Vec<Moved> = Vec::with_capacity(self.moves.len());
+        let mut spans: HashMap<(usize, usize), ()> = HashMap::new();
+        for &m in &self.moves {
+            if spans.insert((m.first, m.last), ()).is_some() {
+                let k = active
+                    .iter()
+                    .position(|o| (o.first, o.last) == (m.first, m.last))
+                    .expect("seen");
+                active.remove(k);
+            }
+            active.push(m);
+        }
+        debug_assert_eq!(active, self.decide(&self.moves), "the base's moves");
+        self.base_active = active;
     }
 
     /// Adds a move, in the order activity is decided in: Lamport time, then
@@ -1367,25 +1392,56 @@ impl<'a, T: Clone> Window<'a, T> {
     }
 
     /// The moved blocks of the document so far.
+    ///
+    /// Each active move with something showing: a block in place covers
+    /// its elements of the frame it lies in, and a portaled one what it
+    /// draws at its portal.
     pub(crate) fn blocks(&self) -> Blocks {
-        let (_, frames) = self.active(In::Effect);
-        let mut spans: Vec<(Lv, Option<usize>, usize)> =
-            frames.active.iter().map(|a| (a.m.id, None, 0)).collect();
-        let mut pos = 0;
-        for (r, path) in self.drawing(In::Effect, &frames) {
-            for id in &path {
-                let (_, start, end) = &mut spans[frames.by_id[id]];
-                start.get_or_insert(pos);
-                *end = pos + r.len;
+        let v = In::Effect;
+        let (_, frames) = self.active(v);
+        let totals = self.totals(v, &frames);
+        let blocks = frames
+            .active
+            .iter()
+            .enumerate()
+            .filter_map(|(k, a)| {
+                let span = match &a.portal {
+                    Some(p) => {
+                        let g = frames.pasted_in[k];
+                        let at = self.offset(v, &frames, &totals, g)
+                            + self.local(v, &frames, &totals, g, p, false);
+                        at..at + totals[k]
+                    }
+                    None => {
+                        let d = frames.cut_from[k];
+                        let at = self.offset(v, &frames, &totals, d);
+                        at + self.local(v, &frames, &totals, d, &a.lo, false)
+                            ..at + self.local(v, &frames, &totals, d, &a.hi, true)
+                    }
+                };
+                (!span.is_empty()).then_some((a.m.id, span))
+            })
+            .collect();
+        #[cfg(debug_assertions)]
+        {
+            let mut spans: Vec<(Lv, Option<usize>, usize)> =
+                frames.active.iter().map(|a| (a.m.id, None, 0)).collect();
+            let mut pos = 0;
+            for (r, path) in self.drawing(v, &frames) {
+                for id in &path {
+                    let (_, start, end) = &mut spans[frames.by_id[id]];
+                    start.get_or_insert(pos);
+                    *end = pos + r.len;
+                }
+                pos += r.len;
             }
-            pos += r.len;
-        }
-        Blocks(
-            spans
+            let drawn: Vec<_> = spans
                 .into_iter()
                 .filter_map(|(id, start, end)| Some((id, start?..end)))
-                .collect(),
-        )
+                .collect();
+            debug_assert_eq!(blocks, drawn, "the blocks, counted and drawn");
+        }
+        Blocks(blocks)
     }
 }
 
