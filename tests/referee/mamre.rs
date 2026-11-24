@@ -12,7 +12,7 @@
 
 use std::{cmp::Ordering, fmt};
 
-use mamre::{SeekTarget, SumTree, Summary, cursor, Item};
+use mamre::{Item, SeekTarget, SumTree, Summary, cursor};
 
 use crate::model::{Bias, Line, Lines, Step, Target};
 use crate::subject::Subject;

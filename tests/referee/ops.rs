@@ -68,21 +68,41 @@ pub enum Op {
     KeepRight(Aim),
     /// Replace the items between two seeks with new ones, by splitting and
     /// joining.
-    Splice { from: Aim, to: Aim, insert: Vec<Line> },
+    Splice {
+        from: Aim,
+        to: Aim,
+        insert: Vec<Line>,
+    },
     /// Replace the items between two seeks with new ones, with the tree's
     /// own edit. Both ends use `from`'s bias.
-    Replace { from: Aim, to: Aim, insert: Vec<Line> },
+    Replace {
+        from: Aim,
+        to: Aim,
+        insert: Vec<Line>,
+    },
     /// Put new items in where a seek lands.
-    Insert { at: Aim, insert: Vec<Line> },
+    Insert {
+        at: Aim,
+        insert: Vec<Line>,
+    },
     /// Remove the items between two seeks. Both ends use `from`'s bias.
-    Remove { from: Aim, to: Aim },
+    Remove {
+        from: Aim,
+        to: Aim,
+    },
     /// Change the item a seek lands on, in place.
-    Update { at: Aim, line: Line },
+    Update {
+        at: Aim,
+        line: Line,
+    },
     /// Seek, and check where it lands and the summary before it.
     Seek(Aim),
     /// Seek (or start fresh, before the first item), then step, checking
     /// the item and the summary before it after every step.
-    Walk { start: Option<Aim>, steps: Vec<Step> },
+    Walk {
+        start: Option<Aim>,
+        steps: Vec<Step>,
+    },
 }
 
 /// Applies `op` to both, and returns what went wrong, if anything.
@@ -191,16 +211,25 @@ fn apply<S: Subject>(tree: &mut S, model: &mut Vec<Line>, op: &Op) -> Result<(),
     Ok(())
 }
 
-fn check_seek<S: Subject>(tree: &S, model: &[Line], target: Target, bias: Bias) -> Result<(), String> {
+fn check_seek<S: Subject>(
+    tree: &S,
+    model: &[Line],
+    target: Target,
+    bias: Bias,
+) -> Result<(), String> {
     let want = model::seek(model, target, bias);
     let got = tree.seek(target, bias);
     if got != want {
-        return Err(format!("seek({target:?}, {bias:?}) landed on {got}, want {want}"));
+        return Err(format!(
+            "seek({target:?}, {bias:?}) landed on {got}, want {want}"
+        ));
     }
     let want = model::prefix(model, target, bias);
     let got = tree.prefix(target, bias);
     if got != want {
-        return Err(format!("prefix({target:?}, {bias:?}) is {got:?}, want {want:?}"));
+        return Err(format!(
+            "prefix({target:?}, {bias:?}) is {got:?}, want {want:?}"
+        ));
     }
     Ok(())
 }
@@ -255,7 +284,8 @@ pub fn run<S: Subject>(start: Vec<Line>, ops: &[Op]) -> Result<(), String> {
         let at = |e: String| format!("step {step}, {op:?}: {e}");
         apply(&mut tree, &mut model, op).map_err(at)?;
         verify(&tree, &model).map_err(at)?;
-        verify(&copy, &copy_model).map_err(|e| at(format!("a copy made before it changed: {e}")))?;
+        verify(&copy, &copy_model)
+            .map_err(|e| at(format!("a copy made before it changed: {e}")))?;
     }
     Ok(())
 }
