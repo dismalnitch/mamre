@@ -20,3 +20,7 @@ unicode-segmentation = "1.12"
 [[bench]]
 name = "edits"
 harness = false
+
+[[bench]]
+name = "sections"
+harness = false

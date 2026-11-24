@@ -38,6 +38,7 @@
 mod angela;
 mod graphemes;
 mod measure;
+mod moves;
 mod outline;
 mod scan;
 mod seek;
@@ -54,6 +55,7 @@ use mamre::{Item, SumTree};
 
 pub use angela::Angela;
 pub use measure::{Markdown, Measure, Plain, Prose};
+pub use moves::{MoveError, Moved};
 pub use outline::{Address, Sections};
 pub use scan::Edge;
 pub use summary::{ByteOffset, CharOffset, Point, TextSummary};
