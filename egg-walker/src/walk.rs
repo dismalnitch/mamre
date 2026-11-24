@@ -723,7 +723,8 @@ impl<T: Clone> OpLog<T> {
     /// date by position (see `blocks.rs`). Between, each stretch is merged
     /// the simple walk's way, from the document where it starts, whose
     /// identities and blocks are known by then; the first, from the base,
-    /// finds them from nothing if they aren't.
+    /// finds them if they aren't: from the `recent` books (see `recent.rs`),
+    /// or from nothing.
     fn walk_moves(
         &self,
         from: &[Lv],
