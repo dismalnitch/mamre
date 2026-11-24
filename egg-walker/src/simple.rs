@@ -20,6 +20,7 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -28,6 +29,30 @@ use crate::ids::Ids;
 use crate::oplog::{Kind, Lv, Op, OpLog};
 use crate::order::{Placed, place};
 use crate::walk::{Change, Changes};
+
+/// A map keyed by ids or indices, hashed cheaply: the walk looks records
+/// up all the time, and nothing here is chosen by an adversary.
+type Map<K, V> = HashMap<K, V, BuildHasherDefault<IdHasher>>;
+
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 /// Ids at or above this name items of the base document, by position.
 const BASE_ITEM: usize = 1 << 62;
@@ -97,7 +122,7 @@ struct Active {
 struct Entry {
     at: usize,
     visible: bool,
-    path: Vec<Lv>,
+    path: Rc<[Lv]>,
 }
 
 /// Which version a question is about.
@@ -133,6 +158,8 @@ struct Walk<'a, T> {
     /// Where each record is, by id, once asked: thrown away whenever a
     /// record goes in.
     index: RefCell<Option<Rc<Index>>>,
+    /// The last layout drawn, and its moves: thrown away with the index.
+    layout: RefCell<Option<(Vec<Moved>, Rc<Layout>)>>,
     /// How many of `moves` are the base's, drawn in place, and which of
     /// them are active among themselves: decided once, as they're decided
     /// first (see `decide`).
@@ -145,7 +172,7 @@ struct Walk<'a, T> {
 
 /// The records' indices: by id, and the base runs by their first item.
 struct Index {
-    by_id: HashMap<usize, usize>,
+    by_id: Map<usize, usize>,
     base: Vec<(usize, usize)>,
 }
 
@@ -157,11 +184,20 @@ struct Layout {
     inner: Vec<Option<usize>>,
     /// The innermost other interval holding each interval: its frame.
     parent: Vec<Option<usize>>,
-    /// The intervals starting at each record, in `active`'s order.
-    starts: HashMap<usize, Vec<usize>>,
+    /// The intervals starting at each record, in `active`'s order: those
+    /// at record `i` are `starting[start_at[i]..start_at[i + 1]]`.
+    start_at: Vec<usize>,
+    starting: Vec<usize>,
     /// Each interval by its move, and each portaled move by its portal.
-    by_id: HashMap<Lv, usize>,
-    portal: HashMap<Lv, usize>,
+    by_id: Map<Lv, usize>,
+    portal: Map<Lv, usize>,
+}
+
+impl Layout {
+    /// The intervals starting at record `i`.
+    fn starts(&self, i: usize) -> &[usize] {
+        &self.starting[self.start_at[i]..self.start_at[i + 1]]
+    }
 }
 
 /// Where the base items' identities come from: the reference (the oracle
@@ -207,7 +243,7 @@ impl<'a, T: Clone> Window<'a, T> {
             if r.id >= BASE_ITEM && r.id + r.len == BASE_ITEM + UNDERWATER {
                 continue;
             }
-            for id in &e.path {
+            for id in e.path.iter() {
                 let (_, start, end) = &mut spans[lay.by_id[id]];
                 start.get_or_insert(pos);
                 *end = pos + r.len;
@@ -307,6 +343,7 @@ impl<'a, T: Clone> Walk<'a, T> {
             moves: Vec::new(),
             marks: HashMap::new(),
             index: RefCell::new(None),
+            layout: RefCell::new(None),
             in_place: 0,
             base_active: None,
             active_cache: RefCell::new([None, None]),
@@ -318,7 +355,7 @@ impl<'a, T: Clone> Walk<'a, T> {
         if let Some(index) = &*self.index.borrow() {
             return index.clone();
         }
-        let mut by_id = HashMap::with_capacity(self.records.len());
+        let mut by_id = Map::with_capacity_and_hasher(self.records.len(), Default::default());
         let mut base = Vec::new();
         for (i, r) in self.records.iter().enumerate() {
             by_id.insert(r.id, i);
@@ -335,7 +372,13 @@ impl<'a, T: Clone> Walk<'a, T> {
     /// Puts `record` in at `i`.
     fn insert_record(&mut self, i: usize, record: Record) {
         self.records.insert(i, record);
+        self.moved_records();
+    }
+
+    /// Records went in: indices have changed.
+    fn moved_records(&mut self) {
         *self.index.get_mut() = None;
+        *self.layout.get_mut() = None;
     }
 
     /// The placeholder, cut wherever a base block starts or ends (its last
@@ -351,7 +394,7 @@ impl<'a, T: Clone> Walk<'a, T> {
         cuts.dedup();
         cuts.push(UNDERWATER);
         for w in cuts.windows(2) {
-            *self.index.get_mut() = None;
+            self.moved_records();
             self.records.push(Record {
                 id: BASE_ITEM + w[0],
                 len: w[1] - w[0],
@@ -393,7 +436,7 @@ impl<'a, T: Clone> Walk<'a, T> {
         // The base is in every replayed event's parents, so it never moves,
         // and only stepped events can: what the parents hold above the
         // base is found by walking back to it.
-        let mut above: HashSet<Lv> = HashSet::new();
+        let mut above: HashSet<Lv, BuildHasherDefault<IdHasher>> = HashSet::default();
         let mut stack: Vec<Lv> = event.parents.clone();
         while let Some(x) = stack.pop() {
             if !self.base[x] && above.insert(x) {
@@ -719,11 +762,21 @@ impl<'a, T: Clone> Walk<'a, T> {
             }
             inner.push(stack.last().copied());
         }
-        let mut starts: HashMap<usize, Vec<usize>> = HashMap::new();
-        let mut by_id = HashMap::with_capacity(active.len());
-        let mut portal = HashMap::new();
+        // Counted, then placed: by start, each start's in `active`'s order.
+        let mut start_at = vec![0; self.records.len() + 1];
+        for a in &active {
+            start_at[a.lo + 1] += 1;
+        }
+        for i in 0..self.records.len() {
+            start_at[i + 1] += start_at[i];
+        }
+        let mut fill = start_at.clone();
+        let mut starting = vec![0; active.len()];
+        let mut by_id = Map::with_capacity_and_hasher(active.len(), Default::default());
+        let mut portal = Map::default();
         for (k, a) in active.iter().enumerate() {
-            starts.entry(a.lo).or_default().push(k);
+            starting[fill[a.lo]] = k;
+            fill[a.lo] += 1;
             by_id.insert(a.m.id, k);
             if !a.m.in_place {
                 portal.insert(a.m.id, k);
@@ -733,18 +786,36 @@ impl<'a, T: Clone> Walk<'a, T> {
             active,
             inner,
             parent,
-            starts,
+            start_at,
+            starting,
             by_id,
             portal,
         }
     }
 
     /// The records of version `v`, drawn with `moves` active.
-    fn draw(&self, v: In, moves: &[Moved]) -> (Vec<Entry>, Layout) {
-        let lay = self.layout(moves);
-        let mut out = Vec::new();
+    fn draw(&self, v: In, moves: &[Moved]) -> (Vec<Entry>, Rc<Layout>) {
+        let cached = match &*self.layout.borrow() {
+            Some((m, lay)) if m == moves => Some(lay.clone()),
+            _ => None,
+        };
+        let lay = cached.unwrap_or_else(|| {
+            let lay = Rc::new(self.layout(moves));
+            *self.layout.borrow_mut() = Some((moves.to_vec(), lay.clone()));
+            lay
+        });
+        let mut out = Vec::with_capacity(self.records.len());
         let mut path = Vec::new();
-        self.draw_frame(v, &lay, None, 0..self.records.len(), &mut path, &mut out);
+        let top: Rc<[Lv]> = Rc::from([]);
+        self.draw_frame(
+            v,
+            &lay,
+            None,
+            0..self.records.len(),
+            &mut path,
+            &top,
+            &mut out,
+        );
         (out, lay)
     }
 
@@ -755,6 +826,7 @@ impl<'a, T: Clone> Walk<'a, T> {
         frame: Option<usize>,
         range: Range<usize>,
         path: &mut Vec<Lv>,
+        shared: &Rc<[Lv]>,
         out: &mut Vec<Entry>,
     ) {
         let mut i = range.start;
@@ -766,14 +838,15 @@ impl<'a, T: Clone> Walk<'a, T> {
                         if let Some(&k) = lay.portal.get(&r.id) {
                             let a = &lay.active[k];
                             path.push(a.m.id);
-                            self.draw_frame(v, lay, Some(k), a.lo..a.hi + 1, path, out);
+                            let inner: Rc<[Lv]> = Rc::from(&path[..]);
+                            self.draw_frame(v, lay, Some(k), a.lo..a.hi + 1, path, &inner, out);
                             path.pop();
                         }
                     } else {
                         out.push(Entry {
                             at: i,
                             visible: self.shows(r, v),
-                            path: path.clone(),
+                            path: shared.clone(),
                         });
                     }
                 }
@@ -781,15 +854,16 @@ impl<'a, T: Clone> Walk<'a, T> {
                 continue;
             }
             // A block of the base, drawn where it lies.
-            let here = lay.starts.get(&i).and_then(|ks| {
-                ks.iter()
-                    .copied()
-                    .find(|&k| lay.active[k].m.in_place && lay.parent[k] == frame)
-            });
+            let here = lay
+                .starts(i)
+                .iter()
+                .copied()
+                .find(|&k| lay.active[k].m.in_place && lay.parent[k] == frame);
             if let Some(k) = here {
                 let a = &lay.active[k];
                 path.push(a.m.id);
-                self.draw_frame(v, lay, Some(k), a.lo..a.hi + 1, path, out);
+                let inner: Rc<[Lv]> = Rc::from(&path[..]);
+                self.draw_frame(v, lay, Some(k), a.lo..a.hi + 1, path, &inner, out);
                 path.pop();
                 i = a.hi + 1;
             } else {
@@ -877,9 +951,8 @@ impl<'a, T: Clone> Walk<'a, T> {
         // after, not a tombstone, so an edge is where it looks to be.
         let from = k.map_or(0, |k| k + 1);
         let right = entries[from..].iter().find(|e| e.visible);
-        let empty = Vec::new();
-        let left_path = k.map_or(&empty, |k| &entries[k].path);
-        let right_path = right.map_or(&empty, |e| &e.path);
+        let left_path: &[Lv] = k.map_or(&[], |k| &entries[k].path);
+        let right_path: &[Lv] = right.map_or(&[], |e| &e.path);
         let depth = left_path
             .iter()
             .zip(right_path)
@@ -913,11 +986,8 @@ impl<'a, T: Clone> Walk<'a, T> {
             // Its own record, or where a block in it starts: any block, not
             // just the innermost here, as blocks nest and can start at the
             // same record.
-            let ours = lay.inner[i] == frame
-                || lay
-                    .starts
-                    .get(&i)
-                    .is_some_and(|ks| ks.iter().any(|&g| lay.parent[g] == frame));
+            let ours =
+                lay.inner[i] == frame || lay.starts(i).iter().any(|&g| lay.parent[g] == frame);
             ours.then_some(r.id)
         })
     }
@@ -1017,7 +1087,7 @@ impl<'a, T: Clone> Walk<'a, T> {
         let depth = fe
             .path
             .iter()
-            .zip(&le.path)
+            .zip(le.path.iter())
             .take_while(|(a, b)| a == b)
             .count();
         let prefix = &fe.path[..depth];

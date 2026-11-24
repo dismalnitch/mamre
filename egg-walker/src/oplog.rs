@@ -837,15 +837,15 @@ impl<T> OpLog<T> {
     /// already includes.
     pub fn union(&self, a: &[Lv], b: &[Lv]) -> Vec<Lv> {
         let all = normalize(a.iter().chain(b).copied().collect());
-        let keep: Vec<Lv> = all
-            .iter()
-            .copied()
-            .filter(|&lv| {
-                let others: Vec<Lv> = all.iter().copied().filter(|&o| o != lv).collect();
-                !self.closure(&others)[lv]
-            })
-            .collect();
-        keep
+        if all.len() < 2 {
+            return all;
+        }
+        // An entry another includes is before that one: in what all the
+        // entries' parents include, as nothing includes itself. One walk
+        // back from all the parents at once finds them.
+        let parents: Vec<Lv> = all.iter().flat_map(|&lv| self.parents(lv)).collect();
+        let before = self.closure(&parents);
+        all.into_iter().filter(|&lv| !before[lv]).collect()
     }
 
     /// How an event's inserts are ordered against concurrent ones at the
