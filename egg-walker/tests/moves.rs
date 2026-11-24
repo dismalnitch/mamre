@@ -1075,3 +1075,197 @@ fn moving_a_marked_chapter() {
     assert_eq!(sections[2].item, two);
     assert_eq!(books.section_range(two), Some(sections[2].pos..doc.len()));
 }
+
+// ---- Live replicas: an accountant each, kept edit by edit ----
+
+/// Three writers, each a replica with its own document and accountant, as
+/// `examples/peer.rs` keeps them: typing and deleting are made in the
+/// document and recorded; moves, undos and marks, and everything from
+/// another writer, are merged. After every action, the writer's document
+/// and identities are the reference's at its version. Merges here start
+/// from bases behind the writer's own unsent edits, so their books come
+/// from the accountant's recent ones.
+///
+/// A merge takes in the other writer's version as it is now, or as it was
+/// some actions ago (`back`), as a message that was slow to arrive brings:
+/// then the base is often a version neither writer had.
+fn replicas_agree(actions: Vec<(Action, usize)>) -> Result<(), TestCaseError> {
+    use mamre_egg_walker::Accountant;
+    let mut log: OpLog<char> = OpLog::new();
+    let agents: Vec<_> = ["a", "b", "c"].iter().map(|n| log.agent(n)).collect();
+    let mut books: Vec<Accountant> = (0..3).map(|_| Accountant::new()).collect();
+    let mut docs: Vec<Vec<char>> = vec![Vec::new(); 3];
+    // Each writer's versions so far.
+    let mut had: Vec<Vec<Vec<Lv>>> = vec![vec![Vec::new()]; 3];
+    for (action, back) in actions {
+        let w = match action {
+            Action::Merge(a, b) => {
+                let past = &had[b];
+                let theirs = past[past.len() - 1 - back % past.len()].clone();
+                for c in books[a].merge(&log, &theirs) {
+                    c.apply(&mut docs[a]);
+                }
+                a
+            }
+            Action::Edit(w, edit) => {
+                let v = books[w].version().to_vec();
+                let len = docs[w].len();
+                let agent = agents[w];
+                let (doc, book) = (&mut docs[w], &mut books[w]);
+                match edit {
+                    Edit::Insert(p, c) => {
+                        let at = p.index(len + 1);
+                        doc.insert(at, c);
+                        let v = log.add_insert(agent, &v, at, [c]);
+                        book.record(&log, &v);
+                    }
+                    Edit::Delete(p) if len > 0 => {
+                        let pos = p.index(len);
+                        doc.remove(pos);
+                        let v = log.add_delete(agent, &v, pos..pos + 1);
+                        book.record(&log, &v);
+                    }
+                    Edit::Move(a, b, t) if len > 0 => {
+                        let (a, b) = (a.index(len), b.index(len));
+                        let (a, b) = (a.min(b), a.max(b) + 1);
+                        let to = t.index(len + 1);
+                        if to > a && to < b {
+                            continue;
+                        }
+                        let v = log.add_move(agent, &v, a..b, to);
+                        for c in book.merge(&log, &v) {
+                            c.apply(doc);
+                        }
+                    }
+                    Edit::Undo(k) => {
+                        let deletes: Vec<Lv> = (0..log.len())
+                            .filter(|&lv| {
+                                log.contains(&v, lv)
+                                    && matches!(
+                                        log.event(lv).op,
+                                        mamre_egg_walker::Op::Delete { .. }
+                                    )
+                            })
+                            .collect();
+                        if deletes.is_empty() {
+                            continue;
+                        }
+                        let v = log.add_undelete(agent, &v, [deletes[k.index(deletes.len())]]);
+                        for c in book.merge(&log, &v) {
+                            c.apply(doc);
+                        }
+                    }
+                    Edit::Mark(p, level) if len > 0 => {
+                        let v = log.add_mark(agent, &v, p.index(len), level);
+                        for c in book.merge(&log, &v) {
+                            c.apply(doc);
+                        }
+                    }
+                    _ => continue,
+                }
+                w
+            }
+        };
+        let v = books[w].version().to_vec();
+        had[w].push(v.clone());
+        prop_assert_eq!(
+            &docs[w],
+            &reference::checkout(&log, &v),
+            "writer {} at {:?}, in\n{}",
+            w,
+            &v,
+            describe(&log)
+        );
+        let ids: Vec<Lv> = (0..books[w].len())
+            .map(|i| books[w].identities().item(i))
+            .collect();
+        prop_assert_eq!(
+            ids,
+            reference::identities(&log, &v),
+            "writer {}'s identities at {:?}, in\n{}",
+            w,
+            &v,
+            describe(&log)
+        );
+        let levels = reference::levels(&log, &v);
+        for item in 0..log.len() {
+            let want = levels.get(&item).copied().unwrap_or(0);
+            prop_assert_eq!(
+                books[w].level(item),
+                want,
+                "level of {}, in\n{}",
+                item,
+                describe(&log)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// As `actions`, merging more often, for longer.
+fn replica_actions() -> impl Strategy<Value = Vec<Action>> {
+    let edit = prop_oneof![
+        4 => (any::<prop::sample::Index>(), prop::char::range('a', 'z')).prop_map(|(p, c)| Edit::Insert(p, c)),
+        1 => any::<prop::sample::Index>().prop_map(Edit::Delete),
+        2 => (any::<prop::sample::Index>(), any::<prop::sample::Index>(), any::<prop::sample::Index>())
+            .prop_map(|(a, b, t)| Edit::Move(a, b, t)),
+        1 => any::<prop::sample::Index>().prop_map(Edit::Undo),
+        1 => (any::<prop::sample::Index>(), 0u8..4).prop_map(|(p, l)| Edit::Mark(p, l)),
+    ];
+    let action = prop_oneof![
+        3 => (0..3usize, edit).prop_map(|(w, e)| Action::Edit(w, e)),
+        2 => (0..3usize, 0..3usize).prop_map(|(a, b)| Action::Merge(a, b)),
+    ];
+    prop::collection::vec(action, 1..80)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    #[test]
+    fn live_replicas_keep_their_books(
+        actions in replica_actions().prop_flat_map(|a| {
+            let n = a.len();
+            (Just(a), prop::collection::vec(prop_oneof![1 => Just(0usize), 1 => 0..20usize], n))
+        })
+    ) {
+        let actions = actions.0.into_iter().zip(actions.1).collect();
+        replicas_agree(actions)?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// An accountant that passed through an earlier version on its way to
+    /// a writer's: merging another writer's from there starts from a base
+    /// it may never have been at, found by walking forward from the
+    /// earlier one. The merge must still be the reference's.
+    #[test]
+    fn a_merge_from_books_kept_earlier(actions in actions(), picks in prop::collection::vec(any::<prop::sample::Index>(), 4)) {
+        use mamre_egg_walker::Accountant;
+        let (log, versions) = history(actions);
+        for from in &versions {
+            let before: Vec<Lv> = (0..log.len()).filter(|&lv| log.contains(from, lv)).collect();
+            if before.is_empty() {
+                continue;
+            }
+            for pick in &picks {
+                let earlier = [before[pick.index(before.len())]];
+                for to in &versions {
+                    let mut books = Accountant::new();
+                    let mut doc = Vec::new();
+                    for v in [&earlier[..], from, to] {
+                        for c in books.merge(&log, v) {
+                            c.apply(&mut doc);
+                        }
+                    }
+                    let both = log.union(from, to);
+                    prop_assert_eq!(&doc, &reference::checkout(&log, &both), "via {:?}, {:?} to {:?}, in\n{}", earlier, from, to, describe(&log));
+                    let ids: Vec<Lv> = (0..books.len()).map(|i| books.identities().item(i)).collect();
+                    prop_assert_eq!(ids, reference::identities(&log, &both), "via {:?}, {:?} to {:?}, in\n{}", earlier, from, to, describe(&log));
+                }
+            }
+        }
+    }
+}
