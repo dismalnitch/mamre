@@ -1187,6 +1187,18 @@ fn replicas_agree(actions: Vec<(Action, usize)>) -> Result<(), TestCaseError> {
             &v,
             describe(&log)
         );
+        // Its blocks: those of the document at its version, found from
+        // nothing.
+        let mut fresh = Accountant::new();
+        fresh.merge(&log, &v);
+        prop_assert_eq!(
+            books[w].moved_blocks(),
+            fresh.moved_blocks(),
+            "writer {}'s blocks at {:?}, in\n{}",
+            w,
+            &v,
+            describe(&log)
+        );
         let levels = reference::levels(&log, &v);
         for item in 0..log.len() {
             let want = levels.get(&item).copied().unwrap_or(0);
@@ -1242,7 +1254,7 @@ proptest! {
     /// it may never have been at, found by walking forward from the
     /// earlier one. The merge must still be the reference's.
     #[test]
-    fn a_merge_from_books_kept_earlier(actions in actions(), picks in prop::collection::vec(any::<prop::sample::Index>(), 4)) {
+    fn a_merge_from_books_kept_earlier(actions in actions(), picks in prop::collection::vec(any::<prop::sample::Index>(), 6)) {
         use mamre_egg_walker::Accountant;
         let (log, versions) = history(actions);
         for from in &versions {
@@ -1250,8 +1262,12 @@ proptest! {
             if before.is_empty() {
                 continue;
             }
-            for pick in &picks {
-                let earlier = [before[pick.index(before.len())]];
+            for pick in picks.chunks(2) {
+                // One event's version, or two's together.
+                let earlier = log.union(
+                    &[before[pick[0].index(before.len())]],
+                    &[before[pick[1].index(before.len())]],
+                );
                 for to in &versions {
                     let mut books = Accountant::new();
                     let mut doc = Vec::new();
@@ -1264,8 +1280,87 @@ proptest! {
                     prop_assert_eq!(&doc, &reference::checkout(&log, &both), "via {:?}, {:?} to {:?}, in\n{}", earlier, from, to, describe(&log));
                     let ids: Vec<Lv> = (0..books.len()).map(|i| books.identities().item(i)).collect();
                     prop_assert_eq!(ids, reference::identities(&log, &both), "via {:?}, {:?} to {:?}, in\n{}", earlier, from, to, describe(&log));
+                    let mut fresh = Accountant::new();
+                    fresh.merge(&log, &both);
+                    prop_assert_eq!(books.moved_blocks(), fresh.moved_blocks(), "blocks via {:?}, {:?} to {:?}, in\n{}", earlier, from, to, describe(&log));
                 }
             }
         }
     }
+}
+
+/// The books, as a replica keeps them, against the reference and against
+/// an accountant that found them from nothing.
+fn books_agree(log: &OpLog<char>, books: &mamre_egg_walker::Accountant, doc: &[char]) {
+    let v = books.version().to_vec();
+    assert_eq!(doc, &reference::checkout(log, &v)[..], "document");
+    let ids: Vec<Lv> = (0..books.len())
+        .map(|i| books.identities().item(i))
+        .collect();
+    assert_eq!(ids, reference::identities(log, &v), "identities");
+    let mut fresh = mamre_egg_walker::Accountant::new();
+    fresh.merge(log, &v);
+    assert_eq!(books.moved_blocks(), fresh.moved_blocks(), "blocks");
+}
+
+/// A replica that took in two of b's edits at once merges c's, made after
+/// only the first: the base is between them, where the replica never was.
+/// Its books there are found by walking forward from the version before,
+/// blocks and all: c's typing lands inside a moved block.
+#[test]
+fn a_base_the_replica_never_was_at() {
+    use mamre_egg_walker::Accountant;
+    let mut log = OpLog::new();
+    let (a, b, c) = (log.agent("a"), log.agent("b"), log.agent("c"));
+    let v = log.add_insert(a, &[], 0, "abcdef".chars());
+    // "cdefab", with "ab" a moved block.
+    let k1 = log.add_move(a, &v, 0..2, 6);
+    let b1 = log.add_insert(b, &k1, 0, ['x']);
+    let b2 = log.add_insert(b, &b1, 0, ['y']);
+    // c sees "xcdefab" and types between a and b.
+    let c1 = log.add_insert(c, &b1, 6, ['w']);
+    let mut books = Accountant::new();
+    let mut doc = Vec::new();
+    for v in [&k1, &b2] {
+        for ch in books.merge(&log, v) {
+            ch.apply(&mut doc);
+        }
+    }
+    // An unsent edit of a's own.
+    doc.insert(3, 'z');
+    let a1 = log.add_insert(a, books.version(), 3, ['z']);
+    books.record(&log, &a1);
+    for ch in books.merge(&log, &c1) {
+        ch.apply(&mut doc);
+    }
+    books_agree(&log, &books, &doc);
+}
+
+/// A moved block's last item deleted while the replica types elsewhere:
+/// the block then ends at a run of the base's items, which ends where the
+/// run does.
+#[test]
+fn a_block_ending_in_a_run() {
+    use mamre_egg_walker::Accountant;
+    let mut log = OpLog::new();
+    let (a, b) = (log.agent("a"), log.agent("b"));
+    let v = log.add_insert(a, &[], 0, "abcdef".chars());
+    // "defabc", with "abc" a moved block.
+    let k1 = log.add_move(a, &v, 0..3, 6);
+    let b1 = log.add_delete(b, &k1, 5..6);
+    let mut books = Accountant::new();
+    let mut doc = Vec::new();
+    for ch in books.merge(&log, &k1) {
+        ch.apply(&mut doc);
+    }
+    doc.insert(0, 'z');
+    let a1 = log.add_insert(a, books.version(), 0, ['z']);
+    books.record(&log, &a1);
+    for ch in books.merge(&log, &b1) {
+        ch.apply(&mut doc);
+    }
+    books_agree(&log, &books, &doc);
+    // "zdefab": the block is what's left of it, "ab", worked out by hand
+    // (the fresh accountant shares the code that finds it).
+    assert_eq!(books.moved_blocks(), [(k1[0], 4..6)]);
 }

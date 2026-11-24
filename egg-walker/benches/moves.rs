@@ -4,7 +4,9 @@
 //!
 //! 1. Checking it out: all of it in order, nothing concurrent.
 //! 2. A live merge: two writers each type a few characters at once,
-//!    merging the other's, as a replica does, keeping its identities.
+//!    merging the other's, as a replica does: keeping its identities
+//!    (`changes_with`), or keeping all its books, its own edits recorded
+//!    one by one (an `Accountant`, as `examples/peer.rs` does).
 //! 3. An offline merge: each side edits a lot before they meet.
 //!
 //! `cargo bench -p mamre-egg-walker --bench moves`. `SIZES=10000,100000`
@@ -13,7 +15,7 @@
 
 use std::time::{Duration, Instant};
 
-use mamre_egg_walker::{Identities, Lv, OpLog};
+use mamre_egg_walker::{Accountant, Identities, Lv, OpLog};
 
 /// A small deterministic random source, so every run builds the same book.
 struct Rng(u64);
@@ -85,19 +87,25 @@ fn show(d: Duration) -> String {
 
 /// Two writers, each making `edits` edits (typing a character at a place
 /// through the book) apart from the other: the history, and each side's
-/// version.
-fn apart(mut log: OpLog<char>, v: &[Lv], edits: usize) -> (OpLog<char>, Vec<Lv>, Vec<Lv>) {
+/// version, and writer a's after each of its edits.
+fn apart(
+    mut log: OpLog<char>,
+    v: &[Lv],
+    edits: usize,
+) -> (OpLog<char>, Vec<Lv>, Vec<Lv>, Vec<Vec<Lv>>) {
     let (a, b) = (log.agent("a"), log.agent("b"));
     let len = log.checkout(v).len();
     let mut rng = Rng(11);
     let (mut va, mut vb) = (v.to_vec(), v.to_vec());
+    let mut steps = Vec::new();
     for k in 0..edits {
         let at = rng.next(len + k + 1);
         va = log.add_insert(a, &va, at, ['x']);
+        steps.push(va.clone());
         let at = rng.next(len + k + 1);
         vb = log.add_insert(b, &vb, at, ['y']);
     }
-    (log, va, vb)
+    (log, va, vb, steps)
 }
 
 /// Writer a merging b's edits, as a replica does: keeping its identities
@@ -111,6 +119,20 @@ fn merge(log: &OpLog<char>, va: &[Lv], vb: &[Lv]) -> Duration {
     })
 }
 
+/// Writer a merging b's edits through its accountant: at the book first,
+/// then each of its own edits recorded as it made them.
+fn merge_books(log: &OpLog<char>, v: &[Lv], steps: &[Vec<Lv>], vb: &[Lv]) -> Duration {
+    let mut books = Accountant::new();
+    books.merge(log, v);
+    for step in steps {
+        books.record(log, step);
+    }
+    best(3, || {
+        let mut kept = books.clone();
+        std::hint::black_box(kept.merge(log, vb));
+    })
+}
+
 fn main() {
     let sizes: Vec<usize> = std::env::var("SIZES")
         .ok()
@@ -121,8 +143,8 @@ fn main() {
         .map(|s| s.parse().unwrap())
         .unwrap_or(200);
     println!(
-        "{:>8} {:>6}  {:>12} {:>14} {:>16}",
-        "chars", "moves", "checkout", "live merge", "offline merge"
+        "{:>8} {:>6}  {:>12} {:>14} {:>14} {:>16}",
+        "chars", "moves", "checkout", "live merge", "live, books", "offline merge"
     );
     for &chars in &sizes {
         for moves in [0, 100] {
@@ -130,16 +152,18 @@ fn main() {
             let checkout = best(3, || {
                 std::hint::black_box(log.checkout(&v));
             });
-            let (live_log, la, lb) = apart(log.clone(), &v, 10);
+            let (live_log, la, lb, steps) = apart(log.clone(), &v, 10);
             let live = merge(&live_log, &la, &lb);
-            let (off_log, oa, ob) = apart(log, &v, offline);
+            let books = merge_books(&live_log, &v, &steps, &lb);
+            let (off_log, oa, ob, _) = apart(log, &v, offline);
             let off = merge(&off_log, &oa, &ob);
             println!(
-                "{:>8} {:>6}  {:>12} {:>14} {:>16}",
+                "{:>8} {:>6}  {:>12} {:>14} {:>14} {:>16}",
                 chars,
                 moves,
                 show(checkout),
                 show(live),
+                show(books),
                 show(off)
             );
         }

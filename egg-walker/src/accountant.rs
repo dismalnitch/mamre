@@ -113,6 +113,15 @@ impl Accountant {
         self.outline.range(item)
     }
 
+    /// The moved blocks the document shows, sorted: each active move with
+    /// something visible in it, and the positions it covers. For tests.
+    #[doc(hidden)]
+    pub fn moved_blocks(&self) -> Vec<(Lv, std::ops::Range<usize>)> {
+        let mut blocks = self.blocks.0.clone();
+        blocks.sort_by_key(|(lv, r)| (*lv, r.start, r.end));
+        blocks
+    }
+
     /// The level of the section `item` starts: 0 if none.
     pub fn level(&self, item: Lv) -> u8 {
         self.outline.level(item)
