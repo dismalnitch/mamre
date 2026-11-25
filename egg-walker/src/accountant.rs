@@ -41,6 +41,8 @@ pub struct Accountant {
     pub(crate) history: std::collections::HashMap<crate::oplog::AgentId, crate::undo::History>,
     /// The ranges the author defined (#32).
     pub(crate) ranges: crate::ranges::Ranges,
+    /// Comments (#33).
+    pub(crate) comments: crate::comments::Comments,
 }
 
 impl Default for Accountant {
@@ -67,6 +69,7 @@ impl Accountant {
             recent: Recent::default(),
             history: Default::default(),
             ranges: Default::default(),
+            comments: crate::comments::Comments::new(0),
         }
     }
 
@@ -186,6 +189,31 @@ impl Accountant {
             .collect()
     }
 
+    /// The comments the document shows, by where they start (see
+    /// `comments.rs`): open and resolved, not removed.
+    pub fn comments(&self) -> Vec<crate::Comment> {
+        self.comments.all()
+    }
+
+    /// Comment `id`, if the document shows it.
+    pub fn comment(&self, id: Lv) -> Option<crate::Comment> {
+        self.comments.get(id)
+    }
+
+    /// The comments covering position `pos`.
+    pub fn comments_at(&self, pos: usize) -> Vec<crate::Comment> {
+        self.comments
+            .all()
+            .into_iter()
+            .filter(|c| c.span.contains(&pos))
+            .collect()
+    }
+
+    /// Comment `id`'s body, at this version.
+    pub fn comment_body<T: Clone>(&self, log: &OpLog<T>, id: Lv) -> String {
+        log.comment_body(id, &self.version)
+    }
+
     /// The level of the section `item` starts: 0 if none.
     pub fn level(&self, item: Lv) -> u8 {
         self.outline.level(item)
@@ -206,6 +234,15 @@ impl Accountant {
                 .collect();
             self.ranges.take_in(log, &all, &self.ids);
         }
+        if self.comments.stale {
+            self.comments = crate::comments::Comments::new(self.ids.len());
+            let all: Vec<Lv> = (0..log.len())
+                .filter(|&lv| {
+                    log.kind(lv) == crate::oplog::Kind::Aside && log.contains(&self.version, lv)
+                })
+                .collect();
+            self.comments.take_in(log, &all, &self.ids);
+        }
         let (_, mut new) = log.diff(&self.version, &to);
         new.retain(|&lv| log.kind(lv) == crate::oplog::Kind::Aside);
         new.sort_unstable();
@@ -220,8 +257,10 @@ impl Accountant {
             self.anchors.apply(change);
             self.outline.apply(change);
             self.ranges.apply(change);
+            self.comments.apply(change);
         }
         self.ranges.take_in(log, &new, &self.ids);
+        self.comments.take_in(log, &new, &self.ids);
         self.version = to;
         self.recent.keep(&self.version, &self.ids.ids, &self.blocks);
         out
@@ -290,6 +329,7 @@ impl Accountant {
             recent,
             history: Default::default(),
             ranges: crate::ranges::Ranges::stale(),
+            comments: crate::comments::Comments::stale(),
         })
     }
 }

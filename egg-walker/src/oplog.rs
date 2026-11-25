@@ -81,9 +81,21 @@ pub enum Op<T> {
 }
 
 /// What sits beside the text, in the one log, so it shares the text's
-/// order and its undo history: ranges the author defines (#32).
+/// order and its undo history: ranges the author defines (#32), and
+/// comments (#33).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Aside {
+    /// Adds a comment on items `start` to `end` (both included; insert
+    /// events this one includes). The comment is this event. Its body is a
+    /// small text of its own: see [`OpLog::comment_body`].
+    CommentAdd { start: Lv, end: Lv },
+    /// Sets comment `comment`'s state. The latest set wins, as a range's.
+    CommentSet { comment: Lv, state: CommentState },
+    /// Puts `item` in comment `comment`'s body at `pos`, in the body as
+    /// this event's version has it.
+    BodyInsert { comment: Lv, pos: usize, item: char },
+    /// Removes the item at `pos` from comment `comment`'s body.
+    BodyDelete { comment: Lv, pos: usize },
     /// Adds a range from item `start` to item `end` (both included; insert
     /// events this one includes), tagged `tag`. The range is this event.
     RangeAdd { start: Lv, end: Lv, tag: String },
@@ -92,11 +104,47 @@ pub enum Aside {
     RangeSet { range: Lv, tag: Option<String> },
 }
 
+/// Where a comment stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CommentState {
+    Open,
+    Resolved,
+    /// Taken back: an undo of its adding, say. It shows nowhere.
+    Removed,
+}
+
 impl Aside {
+    /// The comment this event is about, if it's one's.
+    pub(crate) fn comment(&self) -> Option<Lv> {
+        match *self {
+            Aside::CommentSet { comment, .. }
+            | Aside::BodyInsert { comment, .. }
+            | Aside::BodyDelete { comment, .. } => Some(comment),
+            _ => None,
+        }
+    }
+
     /// The same, with every event it names renamed by `f`: for another
     /// log's numbering.
     pub(crate) fn map(self, f: impl Fn(Lv) -> Lv) -> Aside {
         match self {
+            Aside::CommentAdd { start, end } => Aside::CommentAdd {
+                start: f(start),
+                end: f(end),
+            },
+            Aside::CommentSet { comment, state } => Aside::CommentSet {
+                comment: f(comment),
+                state,
+            },
+            Aside::BodyInsert { comment, pos, item } => Aside::BodyInsert {
+                comment: f(comment),
+                pos,
+                item,
+            },
+            Aside::BodyDelete { comment, pos } => Aside::BodyDelete {
+                comment: f(comment),
+                pos,
+            },
             Aside::RangeAdd { start, end, tag } => Aside::RangeAdd {
                 start: f(start),
                 end: f(end),
@@ -390,6 +438,106 @@ impl<T: Clone> OpLog<T> {
         vec![self.push(agent, seq, normalize(parents.to_vec()), op)]
     }
 
+    /// Adds a comment (#33) on items `start` to `end`, both included, in a
+    /// document at `parents`, as `agent`. Returns the version after: its
+    /// only entry is the comment.
+    pub fn add_comment(&mut self, agent: AgentId, parents: &[Lv], start: Lv, end: Lv) -> Vec<Lv> {
+        self.add_aside(agent, parents, Aside::CommentAdd { start, end })
+    }
+
+    /// Sets comment `comment`'s state, in a document at `parents`.
+    pub fn set_comment(
+        &mut self,
+        agent: AgentId,
+        parents: &[Lv],
+        comment: Lv,
+        state: CommentState,
+    ) -> Vec<Lv> {
+        self.add_aside(agent, parents, Aside::CommentSet { comment, state })
+    }
+
+    /// Types `text` into comment `comment`'s body at `pos` (in the body as
+    /// `parents` has it): one event a character, each after the last.
+    pub fn add_body_insert(
+        &mut self,
+        agent: AgentId,
+        parents: &[Lv],
+        comment: Lv,
+        pos: usize,
+        text: &str,
+    ) -> Vec<Lv> {
+        let mut v = normalize(parents.to_vec());
+        for (k, item) in text.chars().enumerate() {
+            let pos = pos + k;
+            v = self.add_aside(agent, &v, Aside::BodyInsert { comment, pos, item });
+        }
+        v
+    }
+
+    /// Deletes `range` from comment `comment`'s body (as `parents` has it).
+    pub fn add_body_delete(
+        &mut self,
+        agent: AgentId,
+        parents: &[Lv],
+        comment: Lv,
+        range: Range<usize>,
+    ) -> Vec<Lv> {
+        let mut v = normalize(parents.to_vec());
+        for _ in range.clone() {
+            let pos = range.start;
+            v = self.add_aside(agent, &v, Aside::BodyDelete { comment, pos });
+        }
+        v
+    }
+
+    fn add_aside(&mut self, agent: AgentId, parents: &[Lv], aside: Aside) -> Vec<Lv> {
+        let seq = self.next_seq[agent.0 as usize];
+        vec![self.push(agent, seq, normalize(parents.to_vec()), Op::Aside(aside))]
+    }
+
+    /// Comment `comment`'s body at `version`: its body's events, as a log
+    /// of their own, checked out. Each body event's parents there are the
+    /// latest body events it came after. It costs the history since the
+    /// comment was made.
+    pub fn comment_body(&self, comment: Lv, version: &[Lv]) -> String {
+        let holds = self.closure(version);
+        let mut body: OpLog<char> = OpLog::new();
+        // Each event's place in the body's history: its body event, or the
+        // latest ones it came after.
+        let mut at: HashMap<Lv, Vec<Lv>> = HashMap::new();
+        for lv in (comment..self.len()).filter(|&lv| holds[lv]) {
+            let mut before: Vec<Lv> = Vec::new();
+            for p in self.parents(lv).filter(|&p| p >= comment) {
+                before.extend(at.get(&p).into_iter().flatten().copied());
+            }
+            let before = body.union(&before, &[]);
+            let event = self.event(lv);
+            let agent = || self.agent_name(event.agent).to_string();
+            let mine = match event.op {
+                Op::Aside(Aside::BodyInsert {
+                    comment: c,
+                    pos,
+                    item,
+                }) if c == comment => {
+                    let a = body.agent(&agent());
+                    Some(body.add_insert(a, &before, pos, [item]))
+                }
+                Op::Aside(Aside::BodyDelete { comment: c, pos }) if c == comment => {
+                    let a = body.agent(&agent());
+                    Some(body.add_delete(a, &before, pos..pos + 1))
+                }
+                _ => None,
+            };
+            at.insert(lv, mine.unwrap_or(before));
+        }
+        let mut end: Vec<Lv> = Vec::new();
+        for &v in version.iter().filter(|&&v| v >= comment) {
+            end.extend(at.get(&v).into_iter().flatten().copied());
+        }
+        let end = body.union(&end, &[]);
+        body.checkout(&end).into_iter().collect()
+    }
+
     /// Moves the items in `range` to `to` (a position in the document as
     /// it is, outside `range`), in a document at `parents`, as `agent`,
     /// keeping their identities. Returns the version after.
@@ -642,6 +790,19 @@ impl<T: Clone> OpLog<T> {
                     && matches!(self.run_of(*range).op, RunOp::Aside(Aside::RangeAdd { .. })),
                 "a range set sets an earlier range"
             ),
+            Op::Aside(Aside::CommentAdd { start, end }) => assert!(
+                [start, end]
+                    .iter()
+                    .all(|&&i| i < lv && matches!(self.run_of(i).op, RunOp::Insert { .. })),
+                "a comment's ends are earlier inserts"
+            ),
+            Op::Aside(a) if a.comment().is_some() => {
+                let c = a.comment().unwrap();
+                assert!(
+                    c < lv && matches!(self.run_of(c).op, RunOp::Aside(Aside::CommentAdd { .. })),
+                    "a comment's events follow its adding"
+                );
+            }
             _ => {}
         }
         let next = &mut self.next_seq[agent.0 as usize];

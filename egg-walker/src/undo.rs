@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
 use crate::accountant::Accountant;
-use crate::oplog::{AgentId, Aside, Kind, Lv, Op, OpLog};
+use crate::oplog::{AgentId, Aside, CommentState, Kind, Lv, Op, OpLog};
 use crate::walk::Change;
 
 /// A local writer's undo and redo stacks, by its steps' first seqs.
@@ -152,6 +152,14 @@ impl Accountant {
             .filter(|&e| matches!(log.event(e).op, Op::Aside(Aside::RangeAdd { .. })))
             .collect();
         let mut sets: Vec<(Lv, Lv)> = Vec::new();
+        // Comments: the step's own taken back; its states put back.
+        let mut comments: Vec<(Lv, CommentState)> = Vec::new();
+        let mut states: Vec<Lv> = Vec::new();
+        let commented: HashSet<Lv> = events
+            .iter()
+            .copied()
+            .filter(|&e| matches!(log.event(e).op, Op::Aside(Aside::CommentAdd { .. })))
+            .collect();
         for &e in &events {
             if cancelled.contains(&e) {
                 continue;
@@ -192,6 +200,23 @@ impl Accountant {
                         sets.push((range, e));
                     }
                 }
+                Op::Aside(Aside::CommentAdd { .. }) => {
+                    if self
+                        .comments
+                        .state(e)
+                        .is_some_and(|s| s != CommentState::Removed)
+                    {
+                        comments.push((e, CommentState::Removed));
+                    }
+                }
+                Op::Aside(Aside::CommentSet { comment, .. }) => {
+                    if !commented.contains(&comment) && self.comments.set_by(comment) == Some(e) {
+                        states.push(comment);
+                    }
+                }
+                // A body's edits aren't undone with the step yet: its
+                // undo needs undeletes of body deletes (a follow-up).
+                Op::Aside(Aside::BodyInsert { .. } | Aside::BodyDelete { .. }) => {}
             }
         }
         let start = log.next_seq[agent.index()];
@@ -224,13 +249,24 @@ impl Accountant {
         if !to_undo.is_empty() {
             v = log.add_undo(agent, &v, to_undo);
         }
-        // A set put back to the tag before the step: the books there.
-        if !sets.is_empty() {
+        // Sets and states put back to what they were before the step: the
+        // books there.
+        if !sets.is_empty() || !states.is_empty() {
             let mut before = Accountant::new();
             before.merge(log, &log.event(events[0]).parents);
             for (range, _) in sets {
                 ranges.push((range, before.ranges.tag(range).flatten()));
             }
+            for comment in states {
+                let was = before
+                    .comments
+                    .state(comment)
+                    .unwrap_or(CommentState::Removed);
+                comments.push((comment, was));
+            }
+        }
+        for (comment, state) in comments {
+            v = log.set_comment(agent, &v, comment, state);
         }
         for (range, tag) in ranges {
             v = log.set_range(agent, &v, range, tag.as_deref());

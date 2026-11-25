@@ -43,6 +43,9 @@ struct Mark {
     before: usize,
     /// A deleted item's place: it counts no item.
     ghost: bool,
+    /// A ghost that text typed at its place goes before (an end's), not
+    /// after (a start's): see [`Anchors::falling_back_left`].
+    left: bool,
 }
 
 /// How many items a stretch of marks covers (theirs and the gaps before
@@ -51,6 +54,8 @@ struct Mark {
 struct Span {
     items: usize,
     last: Option<Key>,
+    /// Whether the last mark is a ghost text goes before.
+    left: bool,
 }
 
 impl Summary for Span {
@@ -61,6 +66,7 @@ impl Summary for Span {
         self.items += other.items;
         if other.last.is_some() {
             self.last.clone_from(&other.last);
+            self.left = other.left;
         }
     }
 }
@@ -71,17 +77,35 @@ impl Item for Mark {
         Span {
             items: self.before + usize::from(!self.ghost),
             last: Some(self.key.clone()),
+            left: self.ghost && self.left,
         }
     }
 }
 
 /// Seeks the mark whose gap holds position `0` or whose item is there:
-/// with `Bias::Right`, the first whose gap reaches it.
+/// with `Bias::Right`, the first whose gap reaches it. Ghosts at a place
+/// stand between the items either side of it: those text goes after
+/// first, then those it goes before. So marks are ordered by twice where
+/// they end, plus one for a ghost text goes before, and `Pos(p)` stops
+/// between the two kinds at `p` (where text typed at `p` goes).
 struct Pos(usize);
+
+/// As [`Pos`], past every ghost at the place: where the item at it is.
+struct PastGhosts(usize);
+
+fn order_of(position: &Span) -> usize {
+    2 * position.items + usize::from(position.left)
+}
 
 impl SeekTarget<Span, Span> for Pos {
     fn cmp_position(&self, position: &Span) -> Ordering {
-        self.0.cmp(&position.items)
+        (2 * self.0).cmp(&order_of(position))
+    }
+}
+
+impl SeekTarget<Span, Span> for PastGhosts {
+    fn cmp_position(&self, position: &Span) -> Ordering {
+        (2 * self.0 + 1).cmp(&order_of(position))
     }
 }
 
@@ -111,6 +135,8 @@ pub struct Anchors {
     parked: BTreeSet<Lv>,
     /// Whether deleted items keep their places, as ghosts.
     fallback: bool,
+    /// Whether text typed at a ghost's place goes before it.
+    left_ghosts: bool,
 }
 
 impl Anchors {
@@ -132,11 +158,23 @@ impl Anchors {
     }
 
     /// For a document of `len` items, watching none, where a deleted item
-    /// keeps its place: see [`place_of`](Self::place_of).
+    /// keeps its place: see [`place_of`](Self::place_of). Text typed at the
+    /// place goes after it: for the start of something.
     pub fn falling_back(len: usize) -> Self {
         Anchors {
             fallback: true,
             ..Anchors::new(len)
+        }
+    }
+
+    /// As [`falling_back`](Self::falling_back), but text typed at a deleted
+    /// item's place goes before it: for the end of something, so a range
+    /// whose items are all deleted holds what's typed where they were
+    /// (#33: a comment on "big" follows it to "large").
+    pub fn falling_back_left(len: usize) -> Self {
+        Anchors {
+            left_ghosts: true,
+            ..Anchors::falling_back(len)
         }
     }
 
@@ -197,7 +235,7 @@ impl Anchors {
     /// The watched item showing at `pos`, if there is one.
     pub fn item_at(&self, pos: usize) -> Option<Lv> {
         let mut cursor = self.marks.cursor::<Span>();
-        cursor.seek(&Pos(pos), Bias::Right);
+        cursor.seek(&PastGhosts(pos), Bias::Right);
         let m = cursor.item()?;
         (!m.ghost && cursor.start().items + m.before == pos).then_some(m.item)
     }
@@ -265,6 +303,7 @@ impl Anchors {
         for m in self.marks.items() {
             let at = pos + m.before;
             gap += m.before;
+            debug_assert!(!m.left, "only anchors rebuilt from the log stick left");
             if m.ghost {
                 ghosts.push((m.item, at));
                 pos = at;
@@ -320,6 +359,7 @@ impl Anchors {
                 item,
                 before,
                 ghost: false,
+                left: false,
             });
             key = Some(k);
         }
@@ -435,24 +475,20 @@ impl Anchors {
                     break;
                 }
                 if at >= range.start {
-                    inside.push((m.item, at - range.start, m.ghost, m.key.clone()));
+                    inside.push((m.item, at - range.start, m.ghost, m.left, m.key.clone()));
                 }
                 cursor.next();
             }
         }
-        for (item, _, ghost, key) in &inside {
+        for (item, _, ghost, _, key) in &inside {
             self.keys.remove(item);
             self.unmark(key, !ghost);
         }
         self.remove(range.clone());
         let at = if to > range.start { to - n } else { to };
         self.insert(at, n);
-        for (item, offset, ghost, _) in inside {
-            if ghost {
-                self.place_ghost(at + offset, item);
-            } else {
-                self.place(at + offset, item);
-            }
+        for (item, offset, ghost, left, _) in inside {
+            self.put_mark(at + offset, item, ghost, left);
         }
     }
 
@@ -483,7 +519,7 @@ impl Anchors {
         while left > 0 {
             let found = {
                 let mut cursor = self.marks.cursor::<Span>();
-                cursor.seek(&Pos(at), Bias::Right);
+                cursor.seek(&PastGhosts(at), Bias::Right);
                 cursor
                     .item()
                     .map(|m| (m.key.clone(), m.item, m.ghost, at - cursor.start().items))
@@ -504,8 +540,11 @@ impl Anchors {
                 self.parked.insert(item);
                 parked.push(item);
                 if self.fallback {
-                    self.marks
-                        .update_at::<Span, _>(&At(&key), Bias::Left, |m| m.ghost = true);
+                    let left = self.left_ghosts;
+                    self.marks.update_at::<Span, _>(&At(&key), Bias::Left, |m| {
+                        m.ghost = true;
+                        m.left = left;
+                    });
                 } else {
                     self.keys.remove(&item);
                     self.unmark(&key, false);
@@ -517,20 +556,26 @@ impl Anchors {
 
     /// Makes a mark for `item` at `pos`, out of the gap that counts it.
     fn place(&mut self, pos: usize, item: Lv) {
-        self.put_mark(pos, item, false);
+        self.put_mark(pos, item, false, false);
     }
 
     /// Makes a ghost for deleted `item` at place `pos`: after any ghosts
     /// there already, before the item there.
     fn place_ghost(&mut self, pos: usize, item: Lv) {
-        self.put_mark(pos, item, true);
+        self.put_mark(pos, item, true, false);
     }
 
-    fn put_mark(&mut self, pos: usize, item: Lv, ghost: bool) {
+    fn put_mark(&mut self, pos: usize, item: Lv, ghost: bool, left: bool) {
         let own = usize::from(!ghost);
         let found = {
             let mut cursor = self.marks.cursor::<Span>();
-            cursor.seek(&Pos(pos), Bias::Right);
+            // A ghost text goes after: before those it goes before. Anything
+            // else: after every ghost there.
+            if ghost && !left {
+                cursor.seek(&Pos(pos), Bias::Right);
+            } else {
+                cursor.seek(&PastGhosts(pos), Bias::Right);
+            }
             let before = cursor.start().items;
             let prev = cursor.start().last.clone();
             cursor.item().map(|m| (m.key.clone(), before, prev))
@@ -544,6 +589,7 @@ impl Anchors {
                     item,
                     before,
                     ghost,
+                    left,
                 };
                 self.marks
                     .splice_at::<Span, _, _>(&At(&next), Bias::Left, |m| {
@@ -563,6 +609,7 @@ impl Anchors {
                     item,
                     before,
                     ghost,
+                    left,
                 });
                 self.keys.insert(item, key);
             }
@@ -681,8 +728,11 @@ mod fallback_tests {
         /// every deleted one at its place, as a plain list of slots does;
         /// and they read back as saved.
         #[test]
-        fn ghosts_keep_their_places(steps in prop::collection::vec(step(), 1..60)) {
-            let mut a = Anchors::falling_back(3);
+        fn ghosts_keep_their_places(steps in prop::collection::vec(step(), 1..60), left in any::<bool>()) {
+            let mut a = if left { Anchors::falling_back_left(3) } else { Anchors::falling_back(3) };
+            // Where new items go at `pos`: after the ghosts there, or (if
+            // they stick left) before them.
+            let ins = |model: &[Slot], pos: usize| if left { ghosts_from(model, pos) } else { slot_of(model, pos) };
             let mut model = vec![Slot::Item(None); 3];
             let mut next_item: Lv = 100;
             for s in steps {
@@ -691,7 +741,7 @@ mod fallback_tests {
                     Step::Insert(p, n) => {
                         let pos = p.index(len + 1);
                         a.insert(pos, n);
-                        let at = slot_of(&model, pos);
+                        let at = ins(&model, pos);
                         model.splice(at..at, vec![Slot::Item(None); n]);
                     }
                     Step::Watch(p) if len > 0 => {
@@ -730,7 +780,7 @@ mod fallback_tests {
                         }
                         let (from, until) = (ghosts_from(&model, start), ghosts_from(&model, end));
                         let block: Vec<Slot> = model[from..until].to_vec();
-                        let at = slot_of(&model, to);
+                        let at = ins(&model, to);
                         if to > start {
                             model.splice(at..at, block);
                             model.drain(from..until);
@@ -750,7 +800,7 @@ mod fallback_tests {
                         let items = ['x'];
                         a.apply(&Change::Insert { pos, items: &items, first: item });
                         model.retain(|s| *s != Slot::Ghost(item));
-                        let at = slot_of(&model, pos);
+                        let at = ins(&model, pos);
                         model.insert(at, Slot::Item(Some(item)));
                     }
                     Step::Unwatch(k) => {
@@ -785,7 +835,11 @@ mod fallback_tests {
                     let want_ghosts: Vec<Lv> = model[at..slot_of(&model, pos)].iter().filter_map(|s| match s { Slot::Ghost(i) => Some(*i), _ => None }).collect();
                     prop_assert_eq!(a.ghosts_at(pos), want_ghosts, "ghosts at {} in {:?}", pos, model);
                 }
-                // Saved and read back: the same places.
+                // Saved and read back: the same places. (Anchors whose
+                // ghosts stick left are rebuilt from the log, never saved.)
+                if left {
+                    continue;
+                }
                 let mut bytes = Vec::new();
                 a.encode(&mut bytes);
                 let back = Anchors::decode(&mut bytes.as_slice(), 1000).unwrap();
