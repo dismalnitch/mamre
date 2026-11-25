@@ -323,7 +323,7 @@ proptest! {
             prop_assert_eq!(text(&doc), text(&copies::checkout(&log, &at)), "replica at {:?}\n{}", at, describe(&log));
             let ids: Vec<Lv> = (0..books.len()).map(|p| books.identities().item(p)).collect();
             prop_assert_eq!(ids, copies::identities(&log, &at), "replica ids at {:?}\n{}", at, describe(&log));
-            let levels: std::collections::BTreeMap<Lv, u8> = books.sections().iter().map(|s| (s.item, s.level)).collect();
+            let levels: std::collections::BTreeMap<Lv, u8> = books.sections().iter().filter(|s| s.start == mamre_egg_walker::Start::Heading).map(|s| (s.item, s.level)).collect();
             let want: std::collections::BTreeMap<Lv, u8> = copies::levels(&log, &at)
                 .into_iter()
                 .filter(|(item, _)| copies::identities(&log, &at).contains(item))

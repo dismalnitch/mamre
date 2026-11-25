@@ -23,7 +23,7 @@ use crate::anchors::Anchors;
 use crate::blocks::Blocks;
 use crate::ids::Identities;
 use crate::oplog::{Lv, OpLog};
-use crate::outline::{Outline, Section};
+use crate::outline::{Ambiguity, Next, Outline, Policies, Policy, Section};
 use crate::recent::Recent;
 use crate::walk::Change;
 
@@ -101,7 +101,7 @@ impl Accountant {
     }
 
     /// The sections the document shows, in order: each marked item, where
-    /// it is, and its level.
+    /// it is (or, its heading deleted, was), its level, and how it starts.
     pub fn sections(&self) -> Vec<Section> {
         self.outline.sections()
     }
@@ -122,6 +122,32 @@ impl Accountant {
             .into_iter()
             .map(|b| (b.lv, b.span, b.hidden.head, b.hidden.tail))
             .collect()
+    }
+
+    /// What's been reported since the last time this was called: each
+    /// heading deleted, and each such ambiguity resolved (see
+    /// [`Ambiguity`]). [`merge`](Self::merge) and [`record`](Self::record)
+    /// both report, in the order of the changes that caused them.
+    pub fn take_ambiguities(&mut self) -> Vec<Ambiguity> {
+        self.outline.take_reports()
+    }
+
+    /// The sections whose heading is deleted, and which this replica keeps
+    /// a place for (whatever the policy shows): the open ambiguities.
+    pub fn headless(&self) -> Vec<Lv> {
+        self.outline.headless()
+    }
+
+    /// What the outline makes of a section whose heading is deleted, for
+    /// each case. The replica's own setting: it isn't saved with the books,
+    /// and replicas needn't agree.
+    pub fn policies(&self) -> Policies {
+        self.outline.policies
+    }
+
+    /// Sets what the outline makes of a deleted heading followed by `next`.
+    pub fn set_policy(&mut self, next: Next, policy: Policy) {
+        self.outline.policies.set(next, policy);
     }
 
     /// The level of the section `item` starts: 0 if none.
@@ -257,6 +283,10 @@ mod outline_tests {
         let back = Accountant::decode(&mut bytes.as_slice(), log.len()).unwrap();
         assert_eq!(back.sections(), books.sections());
         assert_eq!(back.level(4), 1, "a deleted item keeps its mark");
-        assert_eq!(back.sections().len(), 1);
+        // And its section, headless, at its place (#19).
+        assert_eq!(back.sections().len(), 2);
+        assert_eq!(back.sections()[1].start, crate::Start::Headless);
+        assert_eq!(back.sections()[1].pos, 4);
+        assert_eq!(back.headless(), vec![4]);
     }
 }

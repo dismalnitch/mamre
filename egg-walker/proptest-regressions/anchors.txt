@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 493d22e9fcf144c78e1d5df8c7e88e5cddedafb17de0d4921ab4ac86d9759f8c # shrinks to steps = [Insert(Index(0), 1), Insert(Index(0), 1), Insert(Index(0), 1), Insert(Index(0), 1), Insert(Index(0), 1), Watch(Index(2305843009213693952)), Insert(Index(0), 2), Insert(Index(6707906935894382406), 1), Insert(Index(6148914691236517206), 1), Delete(Index(1537228672809129302), 3), Insert(Index(0), 1), Insert(Index(3353953467947191203), 1), Move(Index(3353953467947191203), Index(3353953467947191203), Index(6148914691236517206))]
