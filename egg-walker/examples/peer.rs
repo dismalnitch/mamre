@@ -8,8 +8,8 @@
 //! other's with what it's missing.
 //!
 //! When both are done and have the same events, each checks its document
-//! against a fresh checkout and the reference's, and they swap a hash of
-//! the document: it must match.
+//! against a fresh checkout (and with `REF=1`, the reference's: slow), and
+//! they swap a hash of the document: it must match.
 //!
 //! ```text
 //! cargo run --release -p mamre-egg-walker --example peer -- listen 100.70.81.83:7171 cocchi
@@ -27,7 +27,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use mamre_egg_walker::sync::{Message, Summary};
-use mamre_egg_walker::{Accountant, OpLog, reference};
+use mamre_egg_walker::{Accountant, OpLog, copies};
 
 /// What goes on the wire: a sync message; "I'm done typing"; and, once
 /// both are done and have the same events, the document's hash.
@@ -245,8 +245,9 @@ fn main() {
     let theirs = their_hash.unwrap();
     let v = log.version().to_vec();
     let fresh = log.checkout(&v) == doc;
+    // The reference is slow (cubic): only when asked, with REF=1.
     let t = Instant::now();
-    let refd = reference::checkout(&log, &v) == doc;
+    let refd = std::env::var("REF").is_err() || copies::checkout(&log, &v) == doc;
     let ref_time = t.elapsed();
     println!(
         "{name}: {made} edits ({moves} moves), {} events in the log, {} chars in the document",

@@ -89,6 +89,15 @@ pub enum Change<'a, T> {
         pos: Option<usize>,
         level: u8,
     },
+    /// Move or mark `op` was discarded: it lost to `lost_to` (none: it was
+    /// inert from the start), done at the same time. Its items are at
+    /// `ranges` now. The document's items don't change: this is for
+    /// whoever should hear about it (see [`Sequence::lost`]).
+    Lost {
+        op: Lv,
+        lost_to: Option<Lv>,
+        ranges: Vec<Range<usize>>,
+    },
 }
 
 impl<T> Clone for Change<'_, T> {
@@ -111,6 +120,15 @@ impl<T> Clone for Change<'_, T> {
                 pos: *pos,
                 level: *level,
             },
+            Change::Lost {
+                op,
+                lost_to,
+                ranges,
+            } => Change::Lost {
+                op: *op,
+                lost_to: *lost_to,
+                ranges: ranges.clone(),
+            },
         }
     }
 }
@@ -129,6 +147,13 @@ pub trait Sequence<T> {
     /// The items in `range` move to `to`, a position before the move,
     /// outside the range: the same items, somewhere else.
     fn move_range(&mut self, range: Range<usize>, to: usize);
+    /// Move or mark `op` was discarded, losing to `lost_to` (none: it was
+    /// inert from the start), done at the same time; its items are at
+    /// `ranges`. Nothing changes: a document that tells its user does it
+    /// here.
+    fn lost(&mut self, op: Lv, lost_to: Option<Lv>, ranges: &[Range<usize>]) {
+        let _ = (op, lost_to, ranges);
+    }
 }
 
 impl<T: Clone> Sequence<T> for Vec<T> {
@@ -160,6 +185,11 @@ impl<T> Change<'_, T> {
             Change::Move { range, to } => doc.move_range(range.clone(), *to),
             // A mark changes no items.
             Change::Mark { .. } => {}
+            Change::Lost {
+                op,
+                lost_to,
+                ranges,
+            } => doc.lost(*op, *lost_to, ranges),
         }
     }
 }
@@ -248,6 +278,15 @@ impl<'a, T: Clone> Changes<'a, T> {
         #[cfg(all(debug_assertions, not(feature = "perf")))]
         self.calls.push(Call::Mark(item, pos, level));
         self.out.push(Change::Mark { item, pos, level });
+    }
+
+    /// Move or mark `op` was discarded.
+    pub(crate) fn lost(&mut self, op: Lv, lost_to: Option<Lv>, ranges: Vec<Range<usize>>) {
+        self.out.push(Change::Lost {
+            op,
+            lost_to,
+            ranges,
+        });
     }
 
     /// The items in `range` move to `to`.
@@ -472,7 +511,8 @@ struct Walk<'a, T> {
     /// Each marked item's winning mark among those replayed, by the order
     /// marks are decided in. One from before the base always loses: it's
     /// earlier in Lamport time than anything replayed.
-    marks: HashMap<usize, (u64, (&'a str, u64))>,
+    /// Each marked item's latest mark so far: its order, and the mark.
+    marks: HashMap<usize, ((u64, (&'a str, u64)), Lv)>,
 }
 
 impl<T: Clone> OpLog<T> {
@@ -753,29 +793,21 @@ impl<T: Clone> OpLog<T> {
         &self,
         from: &[Lv],
         to: &[Lv],
-        keep_ids: bool,
+        _keep_ids: bool,
         known: Option<&Ids>,
-        known_blocks: Option<&Blocks>,
+        _known_blocks: Option<&Blocks>,
         recent: Option<&Recent>,
     ) -> (Changes<'_, T>, Stats) {
         let mut out = Changes::new(self);
         let (old, new, base) = self.conflict(from, to);
-        let marks = self.has_marks();
-        if let Some(known) = known {
-            out.ids = Some(known.clone());
-        } else if from.is_empty() && (keep_ids || marks) {
-            out.ids = Some(Ids::default());
-        } else if marks {
-            out.ids = Some(self.ids_at(from));
-        }
-        // The document the changes make: its blocks, as it goes.
-        let mut blocks = match known_blocks {
+        // A window works by identity, so they're always kept here.
+        out.ids = Some(match known {
             Some(known) => known.clone(),
-            None if from.is_empty() => Blocks::default(),
-            None => self.blocks_at(from),
-        };
+            None if from.is_empty() => Ids::default(),
+            None => self.ids_at(from),
+        });
+        out.blocks = Some(Blocks::default());
         if new.is_empty() {
-            out.blocks = Some(blocks);
             return (out, Stats::default());
         }
         let order: Vec<(Range<Lv>, bool)> = old
@@ -785,45 +817,55 @@ impl<T: Clone> OpLog<T> {
             .collect();
         let critical = self.critical_points(&order, &old, &new, &base);
         let mut critical = critical.iter().peekable();
+        // Deletes an undo in the replay brings back: the window must start
+        // before them, where their items still show.
+        let revived: HashSet<Lv> = order
+            .iter()
+            .flat_map(|(span, _)| span.clone())
+            .filter(|&lv| matches!(self.op(lv), Op::Undelete { .. }))
+            .map(|lv| self.undeleted(lv))
+            .collect();
         let old_len: usize = old.iter().map(|span| span.len()).sum();
-        // Where the next window starts, and what's known of it there.
+        // Where the window starts, if it hasn't, and whether the books so
+        // far are the document's there.
         let mut start = base.clone();
-        // Whether the books kept so far are the document's at `start`:
-        // from the document the changes start from, or just after events
-        // applied as they are. (Nothing changes between those and the next
-        // window, so they're taken when it opens.)
         let mut fresh = old_len == 0;
-        let mut window: Option<crate::window::Checked<'_, T>> = None;
+        let mut window: Option<crate::merge::Window> = None;
         let mut at = 0;
         for (span, output) in order {
             let mut lv = span.start;
             while lv < span.end {
                 // The stretch from here that's all critical, or none of it.
                 while critical.next_if(|c| c.end <= at).is_some() {}
-                let (is_critical, until) = match critical.peek() {
+                let (mut is_critical, until) = match critical.peek() {
                     Some(c) if c.start <= at => (true, c.end),
                     Some(c) => (false, c.start),
                     None => (false, usize::MAX),
                 };
-                let n = (span.end - lv).min(until - at);
-                if is_critical && output {
-                    if let Some(w) = window.take() {
-                        blocks = w.blocks();
+                let mut n = (span.end - lv).min(until - at);
+                if is_critical && let Some(r) = (lv..lv + n).find(|d| revived.contains(d)) {
+                    n = r - lv;
+                    if n == 0 {
+                        is_critical = false;
+                        n = 1;
                     }
-                    self.apply_critical(lv, n, &mut out, &mut blocks);
+                }
+                if is_critical && output && window.is_none() {
+                    self.apply_critical(lv, n, &mut out);
                     start = vec![lv + n - 1];
                     fresh = true;
                 } else {
+                    // Once open, a window runs to the end.
                     let w = window.get_or_insert_with(|| {
-                        let (ids, found) = if fresh {
-                            (out.ids.clone(), blocks.clone())
+                        let ids = if fresh {
+                            out.ids.clone().expect("kept")
                         } else {
-                            self.books_at(&start, recent)
+                            self.books_at(&start, recent).0.expect("kept")
                         };
-                        crate::window::Checked::new(self, start.clone(), ids, &found)
+                        crate::merge::Window::new(&ids)
                     });
                     for k in 0..n {
-                        w.step(lv + k, output.then_some(&mut out));
+                        w.step(lv + k, output);
                     }
                 }
                 lv += n;
@@ -831,21 +873,18 @@ impl<T: Clone> OpLog<T> {
             }
         }
         if let Some(w) = window.take() {
-            blocks = w.blocks();
+            w.close(self, &mut out);
         }
-        out.blocks = Some(blocks);
+        out.blocks = Some(Blocks::default());
         (out, Stats::default())
     }
 
     /// Applies events `lv..lv + n`, one run in the log, each of which saw
     /// everything before it and is seen by everything after: their
     /// positions are final.
-    fn apply_critical(&self, lv: Lv, n: usize, out: &mut Changes<'_, T>, blocks: &mut Blocks) {
+    fn apply_critical(&self, lv: Lv, n: usize, out: &mut Changes<'_, T>) {
         match self.op(lv) {
-            Op::Insert { pos, .. } => {
-                out.insert_run(pos, lv, n);
-                blocks.insert(pos, n);
-            }
+            Op::Insert { pos, .. } => out.insert_run(pos, lv, n),
             Op::Delete { pos } => {
                 // Deleting forward: each removes what's moved up to `pos`.
                 if let Some(ids) = &out.ids {
@@ -853,7 +892,6 @@ impl<T: Clone> OpLog<T> {
                     out.learned.extend(gone);
                 }
                 out.delete_run(pos, n);
-                blocks.delete(pos..pos + n);
             }
             Op::Undelete { .. } => unreachable!("an undelete is never critical"),
             Op::Mark { pos, level } => {
@@ -862,19 +900,14 @@ impl<T: Clone> OpLog<T> {
             }
             Op::Move { pos, len, to } => {
                 debug_assert_eq!(n, 1, "moves don't run");
-                if blocks.apply_move(lv, pos..pos + len, to) {
+                // Nothing else is going on: it moves what it names.
+                if len > 0 && !(pos..=pos + len).contains(&to) {
                     out.move_range(pos..pos + len, to);
+                } else {
+                    out.lost(lv, None, Vec::new());
                 }
             }
         }
-    }
-
-    /// The moved blocks of the document at `version`, from nothing.
-    fn blocks_at(&self, version: &[Lv]) -> Blocks {
-        self.walk_moves(&[], version, false, None, None, None)
-            .0
-            .blocks
-            .unwrap_or_default()
     }
 
     /// Where a replay is critical, as ranges of places in it: each event
@@ -1518,15 +1551,37 @@ impl<'a, T: Clone> Walk<'a, T> {
     fn mark(&mut self, lv: Lv, pos: usize, level: u8, out: Option<&mut Changes<'a, T>>) {
         let (key, id) = self.prepared_item(pos, true);
         let me = (self.log.lamport(lv), self.log.order_key(lv));
-        if self.marks.get(&id).is_some_and(|won| *won > me) {
+        let before = self.marks.get(&id).copied();
+        let lost = |this: &Self| {
+            let (record, _) = this.record_at(&key);
+            (record.dead == 0)
+                .then(|| this.effect_pos(&key, id))
+                .map(|p| vec![p..p + 1])
+                .unwrap_or_default()
+        };
+        if let Some((won, winner)) = before
+            && won > me
+        {
+            // Made without seeing the latest: overruled.
+            if let Some(out) = out {
+                let ranges = lost(self);
+                out.lost(lv, Some(winner), ranges);
+            }
             return;
         }
-        self.marks.insert(id, me);
+        self.marks.insert(id, (me, lv));
         if let Some(out) = out {
             let item = self.identity(id);
             let (record, _) = self.record_at(&key);
             let pos = (record.dead == 0).then(|| self.effect_pos(&key, id));
             out.mark(item, pos, level);
+            // The one it overrules, if that didn't see this coming.
+            if let Some((_, was)) = before
+                && !self.log.contains(&[lv], was)
+            {
+                let ranges = pos.map(|p| vec![p..p + 1]).unwrap_or_default();
+                out.lost(was, Some(lv), ranges);
+            }
         }
     }
 
@@ -1986,7 +2041,10 @@ mod tests {
             .iter()
             .map(|c| match c {
                 Change::Insert { items, .. } => items.len(),
-                Change::Delete { .. } | Change::Move { .. } | Change::Mark { .. } => 0,
+                Change::Delete { .. }
+                | Change::Move { .. }
+                | Change::Mark { .. }
+                | Change::Lost { .. } => 0,
             })
             .sum();
         assert_eq!(items, len);

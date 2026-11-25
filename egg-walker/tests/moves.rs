@@ -1,181 +1,12 @@
-//! Moves in the reference: what a move does, checked two ways.
-//!
-//! One writer: against a second model built differently, a tree of
-//! blocks, where a move cuts a run of siblings out into a block of its own
-//! and puts the block somewhere else. The reference keeps one home order
-//! and draws portals; the two must draw the same document.
-//!
-//! Many writers: a move never loses or copies an item, whatever else
-//! happens at the same time; and the rules for what wins, one test each.
+//! Moves: the walk against the reference for moves as copies (#20), from
+//! any version to any other, with replicas keeping books; the rules for
+//! what wins, one test each; and the histories that once made the walk
+//! and a reference disagree, kept. (One writer, and the reference itself,
+//! are checked in `copies.rs`.)
 
-use mamre_egg_walker::{Lv, OpLog, reference};
+// The reference for moves as copies (#20).
+use mamre_egg_walker::{Lv, OpLog, copies as reference};
 use proptest::prelude::*;
-
-// ---- The tree model, for one writer ----
-
-#[derive(Clone, Debug)]
-enum Node {
-    Item { ch: char, visible: bool },
-    Block(Vec<Node>),
-}
-
-/// An item as drawn: where it is in the tree, and whether it shows.
-#[derive(Clone, Debug)]
-struct Drawn {
-    /// Child indices from the root down to the item.
-    path: Vec<usize>,
-    visible: bool,
-}
-
-fn draw(nodes: &[Node], prefix: &mut Vec<usize>, out: &mut Vec<Drawn>) {
-    for (i, node) in nodes.iter().enumerate() {
-        prefix.push(i);
-        match node {
-            Node::Item { visible, .. } => out.push(Drawn {
-                path: prefix.clone(),
-                visible: *visible,
-            }),
-            Node::Block(children) => draw(children, prefix, out),
-        }
-        prefix.pop();
-    }
-}
-
-fn text(nodes: &[Node], out: &mut String) {
-    for node in nodes {
-        match node {
-            Node::Item { ch, visible: true } => out.push(*ch),
-            Node::Item { .. } => {}
-            Node::Block(children) => text(children, out),
-        }
-    }
-}
-
-fn children<'a>(root: &'a mut Vec<Node>, path: &[usize]) -> &'a mut Vec<Node> {
-    let mut nodes = root;
-    for &i in path {
-        nodes = match &mut nodes[i] {
-            Node::Block(children) => children,
-            Node::Item { .. } => unreachable!("a path to a block"),
-        };
-    }
-    nodes
-}
-
-fn node_at<'a>(root: &'a mut Vec<Node>, path: &[usize]) -> &'a mut Node {
-    let (last, parent) = path.split_last().unwrap();
-    &mut children(root, parent)[*last]
-}
-
-struct Tree {
-    root: Vec<Node>,
-}
-
-impl Tree {
-    fn drawn(&self) -> Vec<Drawn> {
-        let mut out = Vec::new();
-        draw(&self.root, &mut Vec::new(), &mut out);
-        out
-    }
-
-    fn visible(&self) -> Vec<Drawn> {
-        self.drawn().into_iter().filter(|d| d.visible).collect()
-    }
-
-    /// Where something put in at visible position `pos` goes: the block
-    /// (by path) and the index in it, just after the element that draws
-    /// the item before it, in their lowest common block with the one after.
-    fn slot(&self, pos: usize) -> (Vec<usize>, usize) {
-        let drawn = self.drawn();
-        let visible: Vec<usize> = (0..drawn.len()).filter(|&k| drawn[k].visible).collect();
-        let Some(&left) = pos.checked_sub(1).map(|p| &visible[p]) else {
-            return (Vec::new(), 0);
-        };
-        let lp = &drawn[left].path;
-        // Decided by what shows: the next visible item.
-        let common = match visible.get(pos).map(|&k| &drawn[k]) {
-            None => 0,
-            Some(right) => lp
-                .iter()
-                .zip(&right.path)
-                .take_while(|(a, b)| a == b)
-                .count()
-                .min(lp.len() - 1),
-        };
-        (lp[..common].to_vec(), lp[common] + 1)
-    }
-
-    fn insert(&mut self, pos: usize, ch: char) {
-        let (block, i) = self.slot(pos);
-        children(&mut self.root, &block).insert(i, Node::Item { ch, visible: true });
-    }
-
-    fn delete(&mut self, pos: usize) {
-        let path = self.visible()[pos].path.clone();
-        if let Node::Item { visible, .. } = node_at(&mut self.root, &path) {
-            *visible = false;
-        }
-    }
-
-    /// Moves the `len` visible items at `pos` to `to`, if the range is a
-    /// run of whole siblings: cut out into a block, put in at `to`.
-    fn move_(&mut self, pos: usize, len: usize, to: usize) {
-        if (pos..=pos + len).contains(&to) {
-            return;
-        }
-        let visible = self.visible();
-        if len == 0 || pos + len > visible.len() {
-            return;
-        }
-        let (f, l) = (&visible[pos].path, &visible[pos + len - 1].path);
-        let common = f.iter().zip(l).take_while(|(a, b)| a == b).count();
-        // Both are items, so their paths differ below the common block.
-        let common = common.min(f.len() - 1).min(l.len() - 1);
-        let block = f[..common].to_vec();
-        let (i, j) = (f[common], l[common]);
-        // The run must draw exactly the range.
-        let covered: Vec<usize> = (0..visible.len())
-            .filter(|&k| {
-                let p = &visible[k].path;
-                p.len() > common && p[..common] == block[..] && (i..=j).contains(&p[common])
-            })
-            .collect();
-        if covered.len() != len || covered.first() != Some(&pos) {
-            return;
-        }
-        let (dest, at) = self.slot(to);
-        // A placeholder where the block goes, so cutting the run out can't
-        // lose track of it.
-        children(&mut self.root, &dest).insert(at, Node::Block(Vec::new()));
-        let mut marker = dest.clone();
-        marker.push(at);
-        // The run's block may have shifted, if the placeholder went in
-        // before it in a block on its path.
-        let shift = |path: &mut Vec<usize>| {
-            if path.len() > dest.len() && path[..dest.len()] == dest[..] && path[dest.len()] >= at {
-                path[dest.len()] += 1;
-            }
-        };
-        let mut run_block = block.clone();
-        shift(&mut run_block);
-        let (mut i, mut j) = (i, j);
-        if run_block == dest && i >= at {
-            i += 1;
-            j += 1;
-        }
-        let run: Vec<Node> = children(&mut self.root, &run_block).drain(i..=j).collect();
-        // The placeholder may have shifted back, if the run was before it in
-        // a block on its path.
-        let n = j - i + 1;
-        if marker.len() > run_block.len()
-            && marker[..run_block.len()] == run_block[..]
-            && marker[run_block.len()] > j
-        {
-            marker[run_block.len()] -= n;
-        }
-        *node_at(&mut self.root, &marker) = Node::Block(run);
-    }
-}
 
 #[derive(Clone, Debug)]
 enum Edit {
@@ -190,69 +21,6 @@ enum Edit {
     Undo(prop::sample::Index),
     /// Mark the item there at a level (0 unmarks).
     Mark(prop::sample::Index, u8),
-}
-
-fn edits() -> impl Strategy<Value = Vec<Edit>> {
-    let edit = prop_oneof![
-        4 => (any::<prop::sample::Index>(), prop::char::range('a', 'z')).prop_map(|(p, c)| Edit::Insert(p, c)),
-        1 => any::<prop::sample::Index>().prop_map(Edit::Delete),
-        2 => (any::<prop::sample::Index>(), any::<prop::sample::Index>(), any::<prop::sample::Index>())
-            .prop_map(|(a, b, t)| Edit::Move(a, b, t)),
-    ];
-    prop::collection::vec(edit, 1..60)
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-
-    /// One writer's edits, moves among them: the reference draws what the
-    /// tree model does, after every edit.
-    #[test]
-    fn one_writer_matches_the_tree(edits in edits()) {
-        let mut log: OpLog<char> = OpLog::new();
-        let me = log.agent("me");
-        let mut v: Vec<Lv> = Vec::new();
-        let mut tree = Tree { root: Vec::new() };
-        for edit in edits {
-            let len = tree.visible().len();
-            match edit {
-                Edit::Insert(p, c) => {
-                    let pos = p.index(len + 1);
-                    v = log.add_insert(me, &v, pos, [c]);
-                    tree.insert(pos, c);
-                }
-                Edit::Delete(p) => {
-                    if len == 0 {
-                        continue;
-                    }
-                    let pos = p.index(len);
-                    v = log.add_delete(me, &v, pos..pos + 1);
-                    tree.delete(pos);
-                }
-                // Nor marks.
-                Edit::Mark(..) => continue,
-                // The tree model has no undo.
-                Edit::Undo(_) => continue,
-                Edit::Move(a, b, t) => {
-                    if len == 0 {
-                        continue;
-                    }
-                    let (a, b) = (a.index(len), b.index(len));
-                    let (a, b) = (a.min(b), a.max(b) + 1);
-                    let to = t.index(len + 1);
-                    if to > a && to < b {
-                        continue;
-                    }
-                    v = log.add_move(me, &v, a..b, to);
-                    tree.move_(a, b - a, to);
-                }
-            }
-            let mut want = String::new();
-            text(&tree.root, &mut want);
-            let got: String = reference::checkout(&log, &v).into_iter().collect();
-            prop_assert_eq!(got, want);
-        }
-    }
 }
 
 // ---- Many writers: nothing lost, nothing copied ----
@@ -466,23 +234,6 @@ fn moves_into_each_other_drop_one() {
     assert_eq!(got, "BBAAAA.BB.");
 }
 
-/// A range that cuts into a moved block, at the version that sees the
-/// block moved: refused, so it does nothing.
-#[test]
-fn a_range_cutting_into_a_moved_block_does_nothing() {
-    let mut log = OpLog::new();
-    let base = typed(&mut log, "a", "AA.BB.CC.");
-    let a = log.agent("a");
-    let v = log.add_move(a, &base, 3..6, 0);
-    assert_eq!(text_at(&log, &v), "BB.AA.CC.");
-    // "B.A": half in the moved block, half out.
-    let w = log.add_move(a, &v, 1..4, 9);
-    assert_eq!(text_at(&log, &w), "BB.AA.CC.");
-}
-
-/// Two moves at once whose ranges cross: honouring both would tear one
-/// section in two, so the later is dropped. (Sizes differ, so neither
-/// can win the shared part by a tie.)
 #[test]
 fn crossing_moves_drop_the_later() {
     let mut log = OpLog::new();
@@ -510,7 +261,7 @@ fn apply(changes: &[mamre_egg_walker::Change<'_, char>], doc: &mut Vec<char>, id
             Change::Delete { range } => {
                 ids.drain(range.clone());
             }
-            Change::Mark { .. } => {}
+            Change::Mark { .. } | Change::Lost { .. } => {}
             Change::Move { range, to } => {
                 let moved: Vec<Lv> = ids.drain(range.clone()).collect();
                 let at = if *to > range.start {
@@ -623,16 +374,16 @@ fn history(actions: Vec<Action>) -> (OpLog<char>, Vec<Vec<Lv>>) {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// From any writer's version to any other's: the simple walk's changes
+    /// From any writer's version to any other's: the walk's changes
     /// make the reference's merged document, item for item.
     #[test]
-    fn the_simple_walk_merges_like_the_reference(actions in actions()) {
+    fn the_walk_merges_like_the_reference(actions in actions()) {
         let (log, versions) = history(actions);
         for from in &versions {
             for to in &versions {
                 let mut doc = reference::checkout(&log, from);
                 let mut ids = reference::identities(&log, from);
-                let changes = log.changes_simple(from, to);
+                let changes = log.changes(from, to);
                 apply(&changes, &mut doc, &mut ids);
                 let both = log.union(from, to);
                 let mut levels = reference::levels(&log, from);
@@ -657,14 +408,14 @@ proptest! {
 
 // ---- Regressions: histories that once made the walk and the reference disagree ----
 
-/// Every pair of `versions`: the simple walk's changes make the
+/// Every pair of `versions`: the walk's changes make the
 /// reference's merged document, characters and identities.
 fn merges_agree(log: &OpLog<char>, versions: &[Vec<Lv>]) {
     for from in versions {
         for to in versions {
             let mut doc = reference::checkout(log, from);
             let mut ids = reference::identities(log, from);
-            apply(&log.changes_simple(from, to), &mut doc, &mut ids);
+            apply(&log.changes(from, to), &mut doc, &mut ids);
             let both = log.union(from, to);
             assert_eq!(
                 doc,
@@ -1191,22 +942,6 @@ fn replicas_agree(actions: Vec<(Action, usize)>) -> Result<(), TestCaseError> {
         // nothing.
         let mut fresh = Accountant::new();
         fresh.merge(&log, &v);
-        prop_assert_eq!(
-            books[w].moved_blocks(),
-            fresh.moved_blocks(),
-            "writer {}'s blocks at {:?}, in\n{}",
-            w,
-            &v,
-            describe(&log)
-        );
-        prop_assert_eq!(
-            books[w].moved_blocks(),
-            reference::moved_blocks(&log, &v),
-            "writer {}'s blocks at {:?}, by the reference, in\n{}",
-            w,
-            &v,
-            describe(&log)
-        );
         let levels = reference::levels(&log, &v);
         for item in 0..log.len() {
             let want = levels.get(&item).copied().unwrap_or(0);
@@ -1290,8 +1025,6 @@ proptest! {
                     prop_assert_eq!(ids, reference::identities(&log, &both), "via {:?}, {:?} to {:?}, in\n{}", earlier, from, to, describe(&log));
                     let mut fresh = Accountant::new();
                     fresh.merge(&log, &both);
-                    prop_assert_eq!(books.moved_blocks(), fresh.moved_blocks(), "blocks via {:?}, {:?} to {:?}, in\n{}", earlier, from, to, describe(&log));
-                    prop_assert_eq!(books.moved_blocks(), reference::moved_blocks(&log, &both), "blocks by the reference, via {:?}, {:?} to {:?}, in\n{}", earlier, from, to, describe(&log));
                 }
             }
         }
@@ -1309,12 +1042,6 @@ fn books_agree(log: &OpLog<char>, books: &mamre_egg_walker::Accountant, doc: &[c
     assert_eq!(ids, reference::identities(log, &v), "identities");
     let mut fresh = mamre_egg_walker::Accountant::new();
     fresh.merge(log, &v);
-    assert_eq!(books.moved_blocks(), fresh.moved_blocks(), "blocks");
-    assert_eq!(
-        books.moved_blocks(),
-        reference::moved_blocks(log, &v),
-        "blocks, by the reference"
-    );
 }
 
 /// A replica that took in two of b's edits at once merges c's, made after
@@ -1376,7 +1103,6 @@ fn a_block_ending_in_a_run() {
     books_agree(&log, &books, &doc);
     // "zdefab": the block is what's left of it, "ab", worked out by hand,
     // its tail hidden: its last record, "c", shows nothing.
-    assert_eq!(books.moved_blocks(), [(k1[0], 4..6, false, true)]);
 }
 
 proptest! {
@@ -1449,9 +1175,6 @@ fn blocks_showing_the_same_items_stay_two() {
     assert_eq!(doc, reference::checkout(&log, &[17]));
     let mut fresh = Accountant::new();
     fresh.merge(&log, &[17]);
-    assert_eq!(books.moved_blocks().len(), 2);
-    assert_eq!(books.moved_blocks(), fresh.moved_blocks());
-    assert_eq!(books.moved_blocks(), reference::moved_blocks(&log, &[17]));
 }
 
 /// A base block whose last item a concurrent move carries away: a later
@@ -1510,7 +1233,6 @@ fn nested_blocks_both_hiding_their_heads() {
         ch.apply(&mut doc);
     }
     books_agree(&log, &books, &doc);
-    assert_eq!(books.moved_blocks().len(), 2);
     // y types at the front, unsent, as z types there too.
     doc.insert(0, 'y');
     let y1 = log.add_insert(y, books.version(), 0, ['y']);
