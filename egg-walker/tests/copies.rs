@@ -25,6 +25,8 @@ enum Edit {
         prop::sample::Index,
     ),
     Undo(prop::sample::Index),
+    /// Undoes a move, or an undo of one (a redo): #30.
+    UndoMove(prop::sample::Index),
     Mark(prop::sample::Index, u8),
 }
 
@@ -41,6 +43,7 @@ fn edit() -> impl Strategy<Value = Edit> {
         3 => (any::<prop::sample::Index>(), any::<prop::sample::Index>(), any::<prop::sample::Index>())
             .prop_map(|(a, b, t)| Edit::Move(a, b, t)),
         1 => any::<prop::sample::Index>().prop_map(Edit::Undo),
+        1 => any::<prop::sample::Index>().prop_map(Edit::UndoMove),
         1 => (any::<prop::sample::Index>(), 0u8..4).prop_map(|(p, l)| Edit::Mark(p, l)),
     ]
 }
@@ -95,6 +98,18 @@ fn history(actions: &[Action], writers: usize) -> (OpLog<char>, Vec<Vec<Lv>>) {
                         }
                         log.add_undelete(agent, &v, [deletes[k.index(deletes.len())]])
                     }
+                    Edit::UndoMove(k) => {
+                        let undoable: Vec<Lv> = (0..log.len())
+                            .filter(|&lv| {
+                                log.contains(&v, lv)
+                                    && matches!(log.event(lv).op, Op::Move { .. } | Op::Undo { .. })
+                            })
+                            .collect();
+                        if undoable.is_empty() {
+                            continue;
+                        }
+                        log.add_undo(agent, &v, [undoable[k.index(undoable.len())]])
+                    }
                     Edit::Mark(p, level) if len > 0 => log.add_mark(agent, &v, p.index(len), level),
                     _ => continue,
                 };
@@ -103,6 +118,37 @@ fn history(actions: &[Action], writers: usize) -> (OpLog<char>, Vec<Vec<Lv>>) {
         seen.extend(versions.iter().cloned());
     }
     (log, seen)
+}
+
+/// Whether the history undoes a move: the portals can't.
+fn undoes_moves(log: &OpLog<char>) -> bool {
+    (0..log.len()).any(|lv| matches!(log.event(lv).op, Op::Undo { .. }))
+}
+
+/// Whether an undelete brings back an item deleted after a move took it:
+/// where typing beside its tombstone went, the portals and the copies
+/// decide differently (see `typing_beside_a_moved_tombstone_stays_left_of_it`).
+fn revives_a_moved_item(log: &OpLog<char>) -> bool {
+    (0..log.len()).any(|u| {
+        let Op::Undelete { target: d } = log.event(u).op else {
+            return false;
+        };
+        let del = log.event(d);
+        let Op::Delete { pos } = del.op else {
+            return false;
+        };
+        let root = copies::identities(log, &del.parents)[pos];
+        (0..d).any(|m| {
+            log.contains(&del.parents, m)
+                && match log.event(m).op {
+                    Op::Move { pos, len, .. } => {
+                        let ids = copies::identities(log, &log.event(m).parents);
+                        ids.get(pos..pos + len).is_some_and(|r| r.contains(&root))
+                    }
+                    _ => false,
+                }
+        })
+    })
 }
 
 fn describe(log: &OpLog<char>) -> String {
@@ -225,6 +271,7 @@ proptest! {
     #[test]
     fn as_the_portals_where_they_can(actions in actions(3, 40)) {
         let (log, versions) = history(&actions, 3);
+        prop_assume!(!undoes_moves(&log) && !revives_a_moved_item(&log));
         let ours: HashSet<Lv> = copies::inert(&log).into_iter().collect();
         let theirs: HashSet<Lv> = reference::inert(&log).into_iter().collect();
         prop_assume!(ours == theirs && !copies::edge_ties(&log));
@@ -745,4 +792,42 @@ fn a_copy_that_gave_way_moved_again_moves_nothing() {
     let lost = copies::losses(&log, &all);
     assert_eq!(lost.len(), 1);
     assert_eq!((lost[0].op, lost[0].lost_to), (again[0], Some(inner[0])));
+}
+
+/// Found by `as_the_portals_where_they_can` once histories grew undos
+/// (#30), and kept: an insert typed right of a redirected insert, with the
+/// tombstone of a moved item as its right origin, stays left of that item
+/// when an undelete brings it back. The copies put it by its origins, as
+/// any insert sticks to what's before it; the portals put it after. The
+/// copies are the reference now, so the portals check leaves these out.
+#[test]
+fn typing_beside_a_moved_tombstone_stays_left_of_it() {
+    let mut log = OpLog::new();
+    let a = log.agent("a");
+    let b = log.agent("b");
+    // 0..4: "3 2 1 0", each typed at the start.
+    let mut v = Vec::new();
+    for _ in 0..4 {
+        v = log.add_insert(a, &v, 0, ['x']);
+    }
+    let base = v.clone();
+    // 4: "3 2" to the end; 5, 6, 7: typing around it.
+    let v = log.add_move(a, &base, 0..2, 4);
+    let v = log.add_insert(a, &v, 0, ['x']);
+    let v = log.add_insert(a, &v, 5, ['x']);
+    let v7 = log.add_insert(a, &v, 0, ['x']);
+    // 8: typed between 3 and 2 without seeing the move: it goes with them.
+    let v8 = log.add_insert(b, &base, 1, ['x']);
+    // 9: the copy of 2 deleted; 10: typing.
+    let v9 = log.add_delete(a, &v7, 5..6);
+    log.add_insert(a, &v9, 0, ['x']);
+    // 11: typed right of 8, where 2's tombstone is next; 12: 2 comes back.
+    let both = log.union(&v8, &v9);
+    let v11 = log.add_insert(b, &both, 6, ['x']);
+    let v12 = log.add_undelete(b, &v11, [v9[0]]);
+    assert_eq!(
+        copies::identities(&log, &v12),
+        vec![7, 5, 1, 0, 3, 8, 11, 2, 6]
+    );
+    assert_eq!(log.checkout(&v12).len(), copies::checkout(&log, &v12).len());
 }

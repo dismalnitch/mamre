@@ -67,6 +67,20 @@
 //!
 //! Every move or mark discarded is a [`Loss`]: what was lost, to what, and
 //! where its items are now.
+//!
+//! # Undoing a move (#30)
+//!
+//! An undo names a move, or an undo of one. An undo is in force at a
+//! version unless an undo of it is in force there, and a move with an undo
+//! in force is *cancelled*: it isn't among the moves that stand, and isn't
+//! lost either. So its originals show where they lie, with their own
+//! keys, and its copies are laid out but never drawn. Its copies stand for
+//! what they copied, as a looped move's do: something put beside one goes
+//! by the original instead, so typing among the copies goes back with the
+//! originals. A redo is an undo of the undo: the move stands again, with
+//! the same copies, so undo and redo never make new ones. A move that had
+//! lost already shows nothing different undone. A later move that took a
+//! cancelled move's copies moves nothing, and is lost (to nothing).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
@@ -119,6 +133,10 @@ enum Info {
         root: Lv,
         level: u8,
     },
+    /// Undoing `target`: a move, or an undo of one (events of the window).
+    Undo {
+        target: Ix,
+    },
     Move(Move),
     /// A move of nothing, or to where it is.
     Inert,
@@ -151,6 +169,10 @@ impl Placed for Rec {
     }
 }
 
+/// Redirects found, and the moves they were found for: those standing,
+/// those dropped for loops, those undone.
+type Redirects = (Vec<Ix>, Vec<Ix>, HashMap<Ix, (Spot, Vec<Ix>)>, Vec<Ix>);
+
 /// Why a window can't be replayed from its start alone.
 #[derive(Debug)]
 pub(crate) struct Unsupported;
@@ -173,9 +195,11 @@ pub(crate) struct Replay<'a, T> {
     versions: Vec<Vec<bool>>,
     /// Where each event goes, among the active moves it was worked out
     /// for: each depends only on earlier ones, so it's found once.
-    redirects: std::cell::RefCell<(Vec<Ix>, Vec<Ix>, HashMap<Ix, (Spot, Vec<Ix>)>)>,
+    redirects: std::cell::RefCell<Redirects>,
     /// The moves dropped for loops, in the layout being built.
     looped: std::cell::RefCell<Vec<Ix>>,
+    /// The moves undone, in the layout being built (#30).
+    cancelled: std::cell::RefCell<Vec<Ix>>,
 }
 
 /// The document drawn at a version.
@@ -293,8 +317,14 @@ impl<'a, T: Clone> Replay<'a, T> {
         {
             let mut memo = self.redirects.borrow_mut();
             let looped = self.looped.borrow();
-            if memo.0 != active || memo.1 != *looped {
-                *memo = (active.to_vec(), looped.clone(), HashMap::new());
+            let cancelled = self.cancelled.borrow();
+            if memo.0 != active || memo.1 != *looped || memo.3 != *cancelled {
+                *memo = (
+                    active.to_vec(),
+                    looped.clone(),
+                    HashMap::new(),
+                    cancelled.clone(),
+                );
             } else if let Some(found) = memo.2.get(&x) {
                 return found.clone();
             }
@@ -361,7 +391,29 @@ impl<'a, T: Clone> Replay<'a, T> {
                         k
                     })
                 };
-                let mut left = unloop(raw.left);
+                // Typed among an undone move's copies (#30), both its
+                // neighbours copies of it: it goes back with the originals,
+                // by what the copies stood for. At an edge of them it stays
+                // where its author put it, beside the copies, which stay
+                // laid out (undrawn).
+                let cancelled = self.cancelled.borrow().clone();
+                let undone_by = |k: Option<Key>| {
+                    k.filter(|&k| k >= self.copy_base)
+                        .map(|k| self.copies[k - self.copy_base].0)
+                        .filter(|m| cancelled.binary_search(m).is_ok())
+                };
+                let among = matches!(
+                    (undone_by(raw.before), undone_by(raw.after)),
+                    (Some(a), Some(b)) if a == b
+                );
+                let uncancel = |k: Option<Key>| -> Option<Key> {
+                    let mut k = k?;
+                    while among && undone_by(Some(k)).is_some() {
+                        k = self.copies[k - self.copy_base].1;
+                    }
+                    Some(k)
+                };
+                let mut left = uncancel(unloop(raw.left));
                 while let Some(k) = left {
                     let Some(by) = carried(k) else { break };
                     left = if k >= self.copy_base && k != self.mv(by).first_copy {
@@ -370,7 +422,7 @@ impl<'a, T: Clone> Replay<'a, T> {
                         self.spot(by).left
                     };
                 }
-                let mut right = unloop(raw.right);
+                let mut right = uncancel(unloop(raw.right));
                 while let Some(k) = right {
                     let Some(by) = carried(k) else { break };
                     right = self.spot(by).right;
@@ -403,8 +455,9 @@ impl<'a, T: Clone> Replay<'a, T> {
     /// Which moves stand at `at`, by the rules above, leaving out
     /// `dropped` (moves that made a loop), and the losses.
     fn active(&self, at: &[bool], dropped: &HashSet<Ix>, losses: &mut Vec<Loss>) -> Vec<Ix> {
+        let cancelled = self.cancelled(at);
         let mut moves: Vec<Ix> = (0..self.n())
-            .filter(|&i| at[i] && !dropped.contains(&i))
+            .filter(|&i| at[i] && !dropped.contains(&i) && !cancelled.contains(&i))
             .filter(|&i| match &self.info[i] {
                 Info::Move(_) => true,
                 Info::Inert => {
@@ -455,6 +508,24 @@ impl<'a, T: Clone> Replay<'a, T> {
         active
     }
 
+    /// The moves cancelled at `at`: each with an undo in force there. An
+    /// undo is in force unless an undo of it is; every undo of an undo
+    /// comes after it, so one pass from the last settles them all.
+    fn cancelled(&self, at: &[bool]) -> HashSet<Ix> {
+        let mut undone: HashSet<Ix> = HashSet::new();
+        for u in (0..self.n()).rev().filter(|&u| at[u]) {
+            if let Info::Undo { target } = self.info[u]
+                && !undone.contains(&u)
+            {
+                undone.insert(target);
+            }
+        }
+        undone
+            .into_iter()
+            .filter(|&m| matches!(self.info[m], Info::Move(_) | Info::Inert))
+            .collect()
+    }
+
     /// The roots deleted at `at`: by a delete there that isn't undone.
     fn deleted(&self, at: &[bool]) -> HashSet<Lv> {
         let undone: HashSet<Ix> = (0..self.n())
@@ -485,6 +556,9 @@ impl<'a, T: Clone> Replay<'a, T> {
             let mut looped: Vec<Ix> = skip.iter().copied().collect();
             looped.sort_unstable();
             *self.looped.borrow_mut() = looped;
+            let mut cancelled: Vec<Ix> = self.cancelled(at).into_iter().collect();
+            cancelled.sort_unstable();
+            *self.cancelled.borrow_mut() = cancelled;
             match self.build(at, &active) {
                 Ok(order) => break (active, order, losses),
                 Err(cycle) => {
@@ -844,6 +918,13 @@ impl<'a, T: Clone> Replay<'a, T> {
                 }
             }
             Info::Mark { .. } | Info::Inert => {}
+            Info::Undo { .. } => {
+                // What it cancels or brings back reaches everything the
+                // move did: drawn again from scratch.
+                let mut at = self.versions[x].clone();
+                at[x] = true;
+                return self.rebuild(&at);
+            }
             Info::Move(mv) => {
                 v.active.push(x);
                 let taken: HashSet<Key> = mv.sources.iter().copied().collect();
@@ -899,6 +980,7 @@ fn replay_checked<'a, T: Clone>(
         versions: Vec::with_capacity(n),
         redirects: Default::default(),
         looped: Default::default(),
+        cancelled: Default::default(),
     };
     // The document after each event, while a later one still builds on it.
     let mut after: HashMap<Ix, View> = HashMap::new();
@@ -998,6 +1080,15 @@ fn replay_checked<'a, T: Clone>(
                     Info::Undelete { target: t }
                 }
                 // A delete from before the start: where its item lay, the
+                // start doesn't say.
+                None => return Err(Unsupported),
+            },
+            Op::Undo { target } => match r.ix.get(target) {
+                Some(&t) => {
+                    assert!(r.past[i][t], "undo {lv} undoes an event it includes");
+                    Info::Undo { target: t }
+                }
+                // A move from before the start: its copies' sources, the
                 // start doesn't say.
                 None => return Err(Unsupported),
             },
