@@ -228,8 +228,6 @@ proptest! {
         let ours: HashSet<Lv> = copies::inert(&log).into_iter().collect();
         let theirs: HashSet<Lv> = reference::inert(&log).into_iter().collect();
         prop_assume!(ours == theirs && !copies::edge_ties(&log));
-        // Typing in a move dropped for a loop: mamre#27, to decide.
-        prop_assume!(versions.iter().all(|v| !copies::loops(&log, v)));
         for v in &versions {
             prop_assert_eq!(
                 copies::checkout(&log, v),
@@ -669,11 +667,10 @@ fn portal_filter_coverage() {
 /// what's decided is a neighbour another move carried off.
 /// b moves EF between A and B, then types X between E and F; a, not
 /// seeing it, moves AB between E and F. The two moves each go with the
-/// other, so b's (the later) is dropped. X should stay between E and F,
-/// as the portals have it; copies sends it to b's move's origin, by the
-/// original A (mamre#27).
+/// other, so b's (the later) is dropped. X stays between E and F, as the
+/// portals have it: the copies it was typed between stand for E and F
+/// (mamre#27).
 #[test]
-#[ignore = "mamre#27: a rule to decide"]
 fn a_dropped_moves_typing_stays_between_its_neighbours() {
     let mut log: OpLog<char> = OpLog::new();
     let (a, b) = (log.agent("a"), log.agent("b"));

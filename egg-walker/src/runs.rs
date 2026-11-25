@@ -205,6 +205,8 @@ struct Active {
     /// Whether any move there doesn't stand: if none, everything's laid
     /// out.
     some_off: bool,
+    /// The moves dropped for loops, sorted.
+    looped: Vec<Ix>,
 }
 
 impl Active {
@@ -221,6 +223,7 @@ impl Active {
             on,
             rank,
             some_off,
+            looped: Vec::new(),
         }
     }
 }
@@ -401,7 +404,7 @@ impl Linked {
 }
 
 /// Where each event goes, among the active moves it was worked out for.
-type Redirects = (Vec<Ix>, HashMap<Ix, (Spot, Vec<Ix>)>);
+type Redirects = (Vec<Ix>, Vec<Ix>, HashMap<Ix, (Spot, Vec<Ix>)>);
 
 pub(crate) use crate::copies::Unsupported;
 
@@ -711,14 +714,14 @@ impl<'a, T: Clone> Replay<'a, T> {
     fn redirect(&self, x: Ix, act: &Active) -> (Spot, Vec<Ix>) {
         {
             let mut memo = self.redirects.borrow_mut();
-            if memo.0 != act.list {
-                *memo = (act.list.clone(), HashMap::new());
-            } else if let Some(found) = memo.1.get(&x) {
+            if memo.0 != act.list || memo.1 != act.looped {
+                *memo = (act.list.clone(), act.looped.clone(), HashMap::new());
+            } else if let Some(found) = memo.2.get(&x) {
                 return found.clone();
             }
         }
         let found = self.find_redirect(x, act);
-        self.redirects.borrow_mut().1.insert(x, found.clone());
+        self.redirects.borrow_mut().2.insert(x, found.clone());
         found
     }
 
@@ -766,12 +769,24 @@ impl<'a, T: Clone> Replay<'a, T> {
                 // A copy carried off is passed over with the rest of its
                 // move's copies, for the move's own origin: copies.rs
                 // steps back one copy at a time, each carried off the same.
-                let mut left = raw.left;
+                // An origin that's a copy made by a move dropped for a
+                // loop stands for what it copied: the copy went where the
+                // other move took it, not where its author put it
+                // (mamre#27).
+                let unloop = |k: Option<Key>| {
+                    k.map(|mut k| {
+                        while k >= self.copy_base && act.looped.contains(&self.copier(k)) {
+                            k = self.source(k);
+                        }
+                        k
+                    })
+                };
+                let mut left = unloop(raw.left);
                 while let Some(k) = left {
                     let Some(by) = carried(k) else { break };
                     left = self.spot(by).left;
                 }
-                let mut right = raw.right;
+                let mut right = unloop(raw.right);
                 while let Some(k) = right {
                     let Some(by) = carried(k) else { break };
                     right = self.spot(by).right;
@@ -880,7 +895,9 @@ impl<'a, T: Clone> Replay<'a, T> {
             let moves = (0..self.n())
                 .filter(|&i| at[i] && matches!(self.info[i], Info::Move(_)))
                 .count();
-            let act = Active::new(self.active(at, &skip, &mut losses), self.n(), moves);
+            let mut act = Active::new(self.active(at, &skip, &mut losses), self.n(), moves);
+            act.looped = skip.iter().copied().collect();
+            act.looped.sort_unstable();
             match self.build(at, &act) {
                 Ok(layout) => break (act, layout, losses),
                 Err(cycle) => {
@@ -1599,7 +1616,7 @@ fn replay_checked<'a, T: Clone>(
         };
         let spot_at = |pos: usize| -> Spot {
             assert!(pos <= total, "position {pos} is past the end");
-            let before = pos.checked_sub(1).and_then(&item).map(|(_, k)| k);
+            let before = pos.checked_sub(1).and_then(item).map(|(_, k)| k);
             // The next record as laid out, whatever it is.
             let right = view.order.next(before);
             Spot {
