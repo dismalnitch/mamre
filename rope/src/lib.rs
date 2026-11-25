@@ -54,7 +54,7 @@ use mamre::cursor::{Bias, Cursor};
 use mamre::{Item, SumTree};
 
 pub use angela::Angela;
-pub use measure::{Markdown, Measure, Plain, Prose};
+pub use measure::{Markdown, Measure, Motions, Plain, Prose, Units};
 pub use moves::{MoveError, Moved, Newline};
 pub use outline::{Address, Sections};
 pub use scan::Edge;

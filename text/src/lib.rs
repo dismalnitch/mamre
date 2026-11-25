@@ -41,12 +41,21 @@ use std::ops::Range;
 
 use mamre_egg_walker::sync::Message;
 use mamre_egg_walker::{Accountant, AgentId, Change, Lv, OpLog, Sequence, file};
-pub use mamre_rope::Rope;
+use mamre_rope::Measure;
+pub use mamre_rope::{Plain, Rope, Unit, Units};
+
+mod units;
 
 /// One writer's replica of a document: the text, its history, and the
 /// books that keep merges cheap.
-pub struct Text {
-    rope: Rope,
+///
+/// What the text counts beyond bytes, chars and lines is its measure `M`,
+/// chosen with its type: a plain `Text` counts nothing more, a
+/// `Text<Units>` counts words, sentences and paragraphs (#31), so it can
+/// count and seek by them (see [`count`](Text::count)) in O(log n). A
+/// document that doesn't use them doesn't pay for bigger summaries.
+pub struct Text<M: Measure = Plain> {
+    rope: Rope<M>,
     log: OpLog<char>,
     books: Accountant,
     me: AgentId,
@@ -181,12 +190,12 @@ impl fmt::Display for OpenError {
 impl std::error::Error for OpenError {}
 
 /// The rope, edited by the CRDT's changes, noting each in bytes.
-struct Applying<'a> {
-    rope: &'a mut Rope,
+struct Applying<'a, M: Measure> {
+    rope: &'a mut Rope<M>,
     edits: &'a mut Vec<Edit>,
 }
 
-impl Sequence<char> for Applying<'_> {
+impl<M: Measure> Sequence<char> for Applying<'_, M> {
     fn insert(&mut self, pos: usize, items: &[char]) {
         let at = self.rope.char_to_offset(pos);
         let text: String = items.iter().collect();
@@ -224,6 +233,21 @@ impl Text {
     /// replicas (two devices, two windows) never share a name. A user on a
     /// device, say, `"zach@aperol"`.
     pub fn new(writer: &str) -> Self {
+        Text::with_measure(writer)
+    }
+
+    /// Opens a file `save` wrote, to be edited by `writer` (see
+    /// [`new`](Self::new)). A save cut off partway is read up to where
+    /// it's whole.
+    pub fn open(writer: &str, bytes: &[u8]) -> Result<Text, OpenError> {
+        Text::open_with_measure(writer, bytes)
+    }
+}
+
+impl<M: Measure> Text<M> {
+    /// An empty text counting what `M` counts, edited by `writer`: as
+    /// [`Text::new`], say `Text::<Units>::with_measure("me")`.
+    pub fn with_measure(writer: &str) -> Self {
         let mut log = OpLog::new();
         let me = log.agent(writer);
         Text {
@@ -237,7 +261,7 @@ impl Text {
     }
 
     /// The text.
-    pub fn rope(&self) -> &Rope {
+    pub fn rope(&self) -> &Rope<M> {
         &self.rope
     }
 
@@ -251,7 +275,7 @@ impl Text {
     }
 
     /// The text in `range`: a rope of its own, sharing this one's chunks.
-    pub fn slice(&self, range: Range<usize>) -> Result<Rope, TextError> {
+    pub fn slice(&self, range: Range<usize>) -> Result<Rope<M>, TextError> {
         self.check_range(&range)?;
         Ok(self.rope.slice(range))
     }
@@ -515,10 +539,10 @@ impl Text {
         self.saved = file::save(file, &self.log, self.saved, self.rope.chars(), &self.books);
     }
 
-    /// Opens a file `save` wrote, to be edited by `writer` (see
-    /// [`new`](Self::new)). A save cut off partway is read up to where
-    /// it's whole.
-    pub fn open(writer: &str, bytes: &[u8]) -> Result<Text, OpenError> {
+    /// Opens a file `save` wrote, counting what `M` counts: as
+    /// [`Text::open`]. The measure isn't in the file: open it however the
+    /// document wants it counted.
+    pub fn open_with_measure(writer: &str, bytes: &[u8]) -> Result<Self, OpenError> {
         let loaded = file::load::<char>(bytes).map_err(|e| match e {
             file::LoadError::NotAFile => OpenError::NotAFile,
             file::LoadError::Version(v) => OpenError::Version(v),
@@ -545,7 +569,7 @@ impl Text {
     }
 }
 
-impl fmt::Display for Text {
+impl<M: Measure> fmt::Display for Text<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for chunk in self.rope.chunks() {
             f.write_str(chunk)?;
