@@ -1018,6 +1018,8 @@ impl<T: Clone> Replay<'_, T> {
 
     /// Which delete removed each item gone at `at`, for those the window
     /// deleted: (delete, root).
+    // For the window's debug check against runs.rs.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn deletes_of(&self, at: &[bool]) -> HashMap<Lv, Lv> {
         let deleted = self.deleted(at);
         let mut out = HashMap::new();
@@ -1045,7 +1047,20 @@ impl<T: Clone> Replay<'_, T> {
                     return false;
                 }
                 let inside = |k: Option<Key>| k.is_some_and(|k| mv.set.contains(&k));
+                // A neighbour that's a copy of something the move took.
+                let carried = |k: Option<Key>| {
+                    let Some(mut k) = k else { return false };
+                    while k >= self.copy_base {
+                        k = self.copies[k - self.copy_base].1;
+                        if mv.set.contains(&k) {
+                            return true;
+                        }
+                    }
+                    false
+                };
                 inside(spot.before) != inside(spot.after)
+                    || carried(spot.before)
+                    || carried(spot.after)
                     || mv
                         .sources
                         .iter()
@@ -1094,6 +1109,17 @@ pub fn levels<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> BTreeMap<Lv, u8> {
 pub fn losses<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<Loss> {
     let r = reference(log);
     r.rebuild(&r.at(version)).losses
+}
+
+/// Whether any move at `version` is dropped for making a loop: where the
+/// portals and this differ on what's typed in it (mamre#27).
+#[doc(hidden)]
+pub fn loops<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> bool {
+    let r = reference(log);
+    let at = r.at(version);
+    let mut losses = Vec::new();
+    let active = r.active(&at, &HashSet::new(), &mut losses);
+    r.build(&at, &active).is_err()
 }
 
 /// Whether the history has an edge tie (see the docs above): where this

@@ -69,6 +69,8 @@ mod order;
 mod outline;
 mod recent;
 pub mod reference;
+#[doc(hidden)]
+pub mod runs;
 // Its moves (portals) retire with #20: it stays the oracle for merges
 // without moves.
 #[allow(dead_code)]

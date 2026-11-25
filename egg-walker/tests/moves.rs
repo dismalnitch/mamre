@@ -1244,3 +1244,42 @@ fn nested_blocks_both_hiding_their_heads() {
     }
     books_agree(&log, &books, &doc);
 }
+
+/// Typing on after a merge: a types X, merges b's Y (which lands after
+/// X), and types Z after X, whose right is now Y, not X's. c, from just X,
+/// types W after it. Z and W both go after X, with different rights: Z
+/// isn't one record with X (#22), or the tie with W goes wrong.
+#[test]
+fn typing_on_after_a_merge_has_its_own_right() {
+    // c's name on either side of a's, so the tie goes both ways.
+    for name in ["0", "c"] {
+        typing_on_after_a_merge(name);
+    }
+}
+
+fn typing_on_after_a_merge(name: &str) {
+    let mut log: OpLog<char> = OpLog::new();
+    let (a, b, c) = (log.agent("a"), log.agent("b"), log.agent(name));
+    let y = log.add_insert(b, &[], 0, ['Y']);
+    let x = log.add_insert(a, &[], 0, ['X']);
+    let both = log.union(&x, &y);
+    let at = reference::identities(&log, &both)
+        .iter()
+        .position(|&i| i == x[0])
+        .unwrap()
+        + 1;
+    let z = log.add_insert(a, &both, at, ['Z']);
+    assert_eq!(z[0], x[0] + 1, "Z carries on X's run");
+    let w = log.add_insert(c, &x, 1, ['W']);
+    // A move somewhere, so the walk opens a window.
+    let m = log.add_move(c, &w, 0..1, 2);
+    let all = log.union(&z, &m);
+    assert_eq!(log.checkout(&all), reference::checkout(&log, &all));
+    for (from, to) in [(z.clone(), all.clone()), (m.clone(), all.clone())] {
+        let mut doc = log.checkout(&from);
+        for ch in log.changes(&from, &to) {
+            ch.apply(&mut doc);
+        }
+        assert_eq!(doc, reference::checkout(&log, &to));
+    }
+}
