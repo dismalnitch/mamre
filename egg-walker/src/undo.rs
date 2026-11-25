@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
 use crate::accountant::Accountant;
-use crate::oplog::{AgentId, Kind, Lv, Op, OpLog};
+use crate::oplog::{AgentId, Aside, Kind, Lv, Op, OpLog};
 use crate::walk::Change;
 
 /// A local writer's undo and redo stacks, by its steps' first seqs.
@@ -149,7 +149,7 @@ impl Accountant {
         let added: HashSet<Lv> = events
             .iter()
             .copied()
-            .filter(|&e| matches!(log.event(e).op, Op::RangeAdd { .. }))
+            .filter(|&e| matches!(log.event(e).op, Op::Aside(Aside::RangeAdd { .. })))
             .collect();
         let mut sets: Vec<(Lv, Lv)> = Vec::new();
         for &e in &events {
@@ -182,12 +182,12 @@ impl Accountant {
                     to_delete.insert(self.deleted_by(log, target));
                 }
                 Op::Mark { .. } => marks.push((e, log.event(e).parents)),
-                Op::RangeAdd { .. } => {
+                Op::Aside(Aside::RangeAdd { .. }) => {
                     if self.ranges.tag(e).is_some_and(|t| t.is_some()) {
                         ranges.push((e, None));
                     }
                 }
-                Op::RangeSet { range, .. } => {
+                Op::Aside(Aside::RangeSet { range, .. }) => {
                     if !added.contains(&range) && self.ranges.set_by(range) == Some(e) {
                         sets.push((range, e));
                     }

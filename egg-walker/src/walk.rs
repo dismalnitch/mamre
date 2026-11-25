@@ -680,7 +680,7 @@ impl<T: Clone> OpLog<T> {
                                 let item = out.ids.as_ref().expect("kept for marks").get(pos);
                                 out.mark(item, Some(pos), level);
                             }
-                            Op::RangeAdd { .. } | Op::RangeSet { .. } => {}
+                            Op::Aside(_) => {}
                         }
                     }
                     let last = lv + n - 1;
@@ -901,7 +901,7 @@ impl<T: Clone> OpLog<T> {
                 let item = out.ids.as_ref().expect("kept for marks").get(pos);
                 out.mark(item, Some(pos), level);
             }
-            Op::RangeAdd { .. } | Op::RangeSet { .. } => {}
+            Op::Aside(_) => {}
             Op::Move { pos, len, to } => {
                 debug_assert_eq!(n, 1, "moves don't run");
                 // Nothing else is going on: it moves what it names.
@@ -1071,7 +1071,7 @@ impl<'a, T: Clone> Walk<'a, T> {
                 unreachable!("a log with moves takes the moves path")
             }
             Op::Mark { pos, level } => self.mark(lv, pos, level, out),
-            Op::RangeAdd { .. } | Op::RangeSet { .. } => {}
+            Op::Aside(_) => {}
         }
         self.prepared = vec![lv];
     }
@@ -1096,7 +1096,7 @@ impl<'a, T: Clone> Walk<'a, T> {
                 true
             }
             // One at a time.
-            Kind::Undelete | Kind::Move | Kind::Mark | Kind::Undo | Kind::Range => false,
+            Kind::Undelete | Kind::Move | Kind::Mark | Kind::Undo | Kind::Aside => false,
         };
         if done {
             self.replayed += n - 1;
@@ -1232,7 +1232,7 @@ impl<'a, T: Clone> Walk<'a, T> {
             }
             // A mark shows nothing and hides nothing, and a range isn't the
             // text's.
-            if matches!(kind, Kind::Mark | Kind::Range) {
+            if matches!(kind, Kind::Mark | Kind::Aside) {
                 i += 1;
                 continue;
             }

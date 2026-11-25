@@ -529,7 +529,7 @@ fn replay<T: Clone>(log: &OpLog<T>) -> State<'_, T> {
                 unimplemented!("undoing a move is the copies reference's (#30)")
             }
             // Not the text's.
-            Op::RangeAdd { .. } | Op::RangeSet { .. } => {}
+            Op::Aside(_) => {}
             Op::Undelete { target } => {
                 assert!(at[*target], "undelete {lv} undoes a delete it includes");
                 state.undone_by.entry(*target).or_default().push(lv);

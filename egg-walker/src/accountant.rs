@@ -201,13 +201,13 @@ impl Accountant {
             self.ranges.resize(self.ids.len());
             let all: Vec<Lv> = (0..log.len())
                 .filter(|&lv| {
-                    log.kind(lv) == crate::oplog::Kind::Range && log.contains(&self.version, lv)
+                    log.kind(lv) == crate::oplog::Kind::Aside && log.contains(&self.version, lv)
                 })
                 .collect();
             self.ranges.take_in(log, &all, &self.ids);
         }
         let (_, mut new) = log.diff(&self.version, &to);
-        new.retain(|&lv| log.kind(lv) == crate::oplog::Kind::Range);
+        new.retain(|&lv| log.kind(lv) == crate::oplog::Kind::Aside);
         new.sort_unstable();
         let out = log.changes_kept(
             &self.version,

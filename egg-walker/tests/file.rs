@@ -168,10 +168,7 @@ fn events(log: &OpLog<char>) -> Events {
                 Op::Move { pos, len, to } => format!("move {pos} {len} {to}"),
                 Op::Mark { pos, level } => format!("mark {pos} {level}"),
                 Op::Undo { target } => format!("undo {:?}", stable(target)),
-                Op::RangeAdd { start, end, tag } => {
-                    format!("range {:?} {:?} {tag}", stable(start), stable(end))
-                }
-                Op::RangeSet { range, tag } => format!("set {:?} {tag:?}", stable(range)),
+                Op::Aside(a) => format!("aside {a:?}"),
             };
             (stable(lv), parents, op)
         })

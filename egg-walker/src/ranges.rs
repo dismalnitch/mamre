@@ -2,10 +2,10 @@
 //! type. They can cross sections, so they sit beside the outline, not in
 //! it.
 //!
-//! A range is an event ([`Op::RangeAdd`]): from one item to another, both
+//! A range is an event ([`Aside::RangeAdd`]): from one item to another, both
 //! included, named by who they are (their inserts), so it follows them
 //! through edits, moves and merges. Setting its tag or removing it is an
-//! event too ([`Op::RangeSet`]), so all of it is undoable with everything
+//! event too ([`Aside::RangeSet`]), so all of it is undoable with everything
 //! else (#14). Of a range's sets, the latest wins: Lamport time, then the
 //! order concurrent inserts use.
 //!
@@ -28,7 +28,7 @@ use std::ops::Range;
 
 use crate::anchors::Anchors;
 use crate::ids::Identities;
-use crate::oplog::{Lv, Op, OpLog};
+use crate::oplog::{Aside, Lv, Op, OpLog};
 use crate::walk::Change;
 
 /// A range the author defined, as the document shows it now.
@@ -92,7 +92,7 @@ impl Ranges {
     pub(crate) fn take_in<T: Clone>(&mut self, log: &OpLog<T>, events: &[Lv], ids: &Identities) {
         for &lv in events {
             match log.event(lv).op {
-                Op::RangeAdd { start, end, tag } => {
+                Op::Aside(Aside::RangeAdd { start, end, tag }) => {
                     self.entries.insert(
                         lv,
                         Entry {
@@ -105,7 +105,7 @@ impl Ranges {
                     self.watch(start, ids);
                     self.watch(end, ids);
                 }
-                Op::RangeSet { range, tag } => {
+                Op::Aside(Aside::RangeSet { range, tag }) => {
                     let key = |e: Lv| (log.lamport(e), log.order_key(e));
                     if let Some(entry) = self.entries.get_mut(&range)
                         && key(lv) > key(entry.set_by)
@@ -191,10 +191,10 @@ pub fn reference<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<(Lv, Lv, Lv, O
     let key = |e: Lv| (log.lamport(e), log.order_key(e));
     for lv in (0..log.len()).filter(|&lv| log.contains(version, lv)) {
         match log.event(lv).op {
-            Op::RangeAdd { start, end, tag } => {
+            Op::Aside(Aside::RangeAdd { start, end, tag }) => {
                 out.insert(lv, (start, end, Some(tag), lv));
             }
-            Op::RangeSet { range, tag } => {
+            Op::Aside(Aside::RangeSet { range, tag }) => {
                 let e = out.get_mut(&range).expect("a set after its add");
                 if key(lv) > key(e.3) {
                     e.2 = tag;

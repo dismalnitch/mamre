@@ -29,8 +29,8 @@ pub(crate) enum Kind {
     Move,
     Mark,
     Undo,
-    /// Adding or setting an author's range (#32): not the text's.
-    Range,
+    /// Beside the text, not in it: see [`Aside`].
+    Aside,
 }
 
 /// A local version: an event's number in this log. Parents always have
@@ -75,14 +75,39 @@ pub enum Op<T> {
     /// the undo, and brings back the same copies. (Deletes are undone by
     /// [`Op::Undelete`]; in a chunk, both are kind 2.)
     Undo { target: Lv },
-    /// Adds a range the author defines (#32): from item `start` to item
-    /// `end` (both included; insert events this one includes), tagged
-    /// `tag`. The range is this event. It sits beside the text, not in it:
-    /// the walk passes over it.
+    /// Something beside the text, not in it: the walk passes over it, and
+    /// the [`Accountant`](crate::Accountant) keeps it.
+    Aside(Aside),
+}
+
+/// What sits beside the text, in the one log, so it shares the text's
+/// order and its undo history: ranges the author defines (#32).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Aside {
+    /// Adds a range from item `start` to item `end` (both included; insert
+    /// events this one includes), tagged `tag`. The range is this event.
     RangeAdd { start: Lv, end: Lv, tag: String },
     /// Sets range `range`'s tag (`None`: removed). The latest set of a
     /// range wins, in Lamport time, then the order concurrent inserts use.
     RangeSet { range: Lv, tag: Option<String> },
+}
+
+impl Aside {
+    /// The same, with every event it names renamed by `f`: for another
+    /// log's numbering.
+    pub(crate) fn map(self, f: impl Fn(Lv) -> Lv) -> Aside {
+        match self {
+            Aside::RangeAdd { start, end, tag } => Aside::RangeAdd {
+                start: f(start),
+                end: f(end),
+                tag,
+            },
+            Aside::RangeSet { range, tag } => Aside::RangeSet {
+                range: f(range),
+                tag,
+            },
+        }
+    }
 }
 
 /// One event, as a log hands it out.
@@ -112,46 +137,20 @@ pub(crate) struct Run<T> {
 #[derive(Clone, Debug)]
 pub(crate) enum RunOp<T> {
     /// Item `k` goes in at `pos + k`: typing forward.
-    Insert {
-        pos: usize,
-        items: Vec<T>,
-    },
+    Insert { pos: usize, items: Vec<T> },
     /// `len` items each removed at `pos`: deleting forward.
-    Delete {
-        pos: usize,
-        len: usize,
-    },
+    Delete { pos: usize, len: usize },
     /// Deletes `target..target + len` undone, in order: undoing a run of
     /// deletes.
-    Undelete {
-        target: Lv,
-        len: usize,
-    },
+    Undelete { target: Lv, len: usize },
     /// One move: moves don't run together.
-    Move {
-        pos: usize,
-        len: usize,
-        to: usize,
-    },
+    Move { pos: usize, len: usize, to: usize },
     /// One mark: marks don't run together either.
-    Mark {
-        pos: usize,
-        level: u8,
-    },
+    Mark { pos: usize, level: u8 },
     /// One undo of a move, or of an undo of one.
-    Undo {
-        target: Lv,
-    },
-    /// One range added, or set.
-    RangeAdd {
-        start: Lv,
-        end: Lv,
-        tag: String,
-    },
-    RangeSet {
-        range: Lv,
-        tag: Option<String>,
-    },
+    Undo { target: Lv },
+    /// One event beside the text.
+    Aside(Aside),
 }
 
 impl<T> Run<T> {
@@ -159,11 +158,7 @@ impl<T> Run<T> {
         match &self.op {
             RunOp::Insert { items, .. } => items.len(),
             RunOp::Delete { len, .. } | RunOp::Undelete { len, .. } => *len,
-            RunOp::Move { .. }
-            | RunOp::Mark { .. }
-            | RunOp::Undo { .. }
-            | RunOp::RangeAdd { .. }
-            | RunOp::RangeSet { .. } => 1,
+            RunOp::Move { .. } | RunOp::Mark { .. } | RunOp::Undo { .. } | RunOp::Aside(_) => 1,
         }
     }
 
@@ -253,8 +248,7 @@ impl<T: Clone> OpLog<T> {
             | RunOp::Move { .. }
             | RunOp::Mark { .. }
             | RunOp::Undo { .. }
-            | RunOp::RangeAdd { .. }
-            | RunOp::RangeSet { .. } => None,
+            | RunOp::Aside(_) => None,
         }
     }
 
@@ -272,15 +266,7 @@ impl<T: Clone> OpLog<T> {
             &RunOp::Move { pos, len, to } => Op::Move { pos, len, to },
             &RunOp::Mark { pos, level } => Op::Mark { pos, level },
             &RunOp::Undo { target } => Op::Undo { target },
-            RunOp::RangeAdd { start, end, tag } => Op::RangeAdd {
-                start: *start,
-                end: *end,
-                tag: tag.clone(),
-            },
-            RunOp::RangeSet { range, tag } => Op::RangeSet {
-                range: *range,
-                tag: tag.clone(),
-            },
+            RunOp::Aside(a) => Op::Aside(a.clone()),
         }
     }
 
@@ -379,11 +365,11 @@ impl<T: Clone> OpLog<T> {
         tag: &str,
     ) -> Vec<Lv> {
         let seq = self.next_seq[agent.0 as usize];
-        let op = Op::RangeAdd {
+        let op = Op::Aside(Aside::RangeAdd {
             start,
             end,
             tag: tag.to_string(),
-        };
+        });
         vec![self.push(agent, seq, normalize(parents.to_vec()), op)]
     }
 
@@ -397,10 +383,10 @@ impl<T: Clone> OpLog<T> {
         tag: Option<&str>,
     ) -> Vec<Lv> {
         let seq = self.next_seq[agent.0 as usize];
-        let op = Op::RangeSet {
+        let op = Op::Aside(Aside::RangeSet {
             range,
             tag: tag.map(str::to_string),
-        };
+        });
         vec![self.push(agent, seq, normalize(parents.to_vec()), op)]
     }
 
@@ -583,19 +569,10 @@ impl<T: Clone> OpLog<T> {
                         .local(other, target)
                         .expect("an undo's target arrives before it"),
                 },
-                Op::RangeAdd { start, end, tag } => Op::RangeAdd {
-                    start: self
-                        .local(other, start)
-                        .expect("a range's ends arrive first"),
-                    end: self.local(other, end).expect("a range's ends arrive first"),
-                    tag,
-                },
-                Op::RangeSet { range, tag } => Op::RangeSet {
-                    range: self
-                        .local(other, range)
-                        .expect("a range arrives before its sets"),
-                    tag,
-                },
+                Op::Aside(a) => Op::Aside(a.map(|lv| {
+                    self.local(other, lv)
+                        .expect("what an aside names arrives before it")
+                })),
                 op => op,
             };
             self.push(agent, event.seq, parents, op);
@@ -654,14 +631,15 @@ impl<T: Clone> OpLog<T> {
             );
         }
         match &op {
-            Op::RangeAdd { start, end, .. } => assert!(
+            Op::Aside(Aside::RangeAdd { start, end, .. }) => assert!(
                 [start, end]
                     .iter()
                     .all(|&&i| i < lv && matches!(self.run_of(i).op, RunOp::Insert { .. })),
                 "a range's ends are earlier inserts"
             ),
-            Op::RangeSet { range, .. } => assert!(
-                *range < lv && matches!(self.run_of(*range).op, RunOp::RangeAdd { .. }),
+            Op::Aside(Aside::RangeSet { range, .. }) => assert!(
+                *range < lv
+                    && matches!(self.run_of(*range).op, RunOp::Aside(Aside::RangeAdd { .. })),
                 "a range set sets an earlier range"
             ),
             _ => {}
@@ -721,8 +699,7 @@ impl<T: Clone> OpLog<T> {
                     Op::Move { pos, len, to } => RunOp::Move { pos, len, to },
                     Op::Mark { pos, level } => RunOp::Mark { pos, level },
                     Op::Undo { target } => RunOp::Undo { target },
-                    Op::RangeAdd { start, end, tag } => RunOp::RangeAdd { start, end, tag },
-                    Op::RangeSet { range, tag } => RunOp::RangeSet { range, tag },
+                    Op::Aside(a) => RunOp::Aside(a),
                 },
             });
             self.spans[agent.0 as usize].insert(seq, (lv, 1));
@@ -751,7 +728,7 @@ impl<T> OpLog<T> {
             RunOp::Undelete { .. } | RunOp::Undo { .. } => {
                 unreachable!("undos go one at a time")
             }
-            RunOp::RangeAdd { .. } | RunOp::RangeSet { .. } => 1,
+            RunOp::Aside(_) => 1,
         };
         debug_assert!(len > 0 && parents.iter().all(|&p| p < lv));
         debug_assert!(self.find(agent, seq).is_none(), "new events");
@@ -912,7 +889,7 @@ impl<T> OpLog<T> {
             RunOp::Move { .. } => Kind::Move,
             RunOp::Mark { .. } => Kind::Mark,
             RunOp::Undo { .. } => Kind::Undo,
-            RunOp::RangeAdd { .. } | RunOp::RangeSet { .. } => Kind::Range,
+            RunOp::Aside(_) => Kind::Aside,
         }
     }
 

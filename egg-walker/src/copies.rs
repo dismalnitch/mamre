@@ -1085,7 +1085,7 @@ fn replay_checked<'a, T: Clone>(
                 // start doesn't say.
                 None => return Err(Unsupported),
             },
-            Op::RangeAdd { .. } | Op::RangeSet { .. } => Info::Other,
+            Op::Aside(_) => Info::Other,
             Op::Undo { target } => match r.ix.get(target) {
                 Some(&t) => {
                     assert!(r.past[i][t], "undo {lv} undoes an event it includes");
