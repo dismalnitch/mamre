@@ -4,4 +4,5 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 5ba4514deacb5c3e2cfb114a93386210367ebaa47e351fb52f5e94436adb8a67 # shrinks to acts = [Insert { a: 0, at: 0, text: "aaa" }, Merge { a: 1, from: 0 }, Delete { a: 0, from: 0, to: 43690 }, Merge { a: 2, from: 1 }, Insert { a: 1, at: 0, text: "a" }, Insert { a: 0, at: 0, text: "b" }]
+cc ce96cc8553016382ab58ad3748038a6175a9f16a73b85b2f5facadbaeabe028b # shrinks to acts = [Insert { a: 1, at: 0, text: "a" }, Insert { a: 1, at: 0, text: "a" }, Merge { a: 0, from: 1 }, Insert { a: 0, at: 0, text: "aa" }, Merge { a: 1, from: 0 }, Delete { a: 1, from: 32768, to: 0 }, Insert { a: 2, at: 0, text: "a" }, Insert { a: 0, at: 0, text: "a" }, Insert { a: 2, at: 0, text: "a" }]
+cc dd2090b358d19ee5b0b6f753085732c4334d1bc482996ffc1362dee28e4ac68e # shrinks to acts = [Insert { a: 1, at: 0, text: "a" }, Merge { a: 0, from: 1 }, Insert { a: 0, at: 0, text: "a" }, Merge { a: 1, from: 0 }, Delete { a: 1, from: 0, to: 32768 }, Insert { a: 2, at: 0, text: "a" }, Insert { a: 0, at: 0, text: "a" }, Insert { a: 2, at: 0, text: "a" }]

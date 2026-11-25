@@ -36,20 +36,49 @@
 //! each merge from the latest point the history narrows to, and moves its
 //! prepare version by walking only as far back as it changes. A simpler walk
 //! over a plain list is kept to check it against, change for change.
+//!
+//! # Built on mamre
+//!
+//! This crate is mamre's CRDT, not a standalone one. The document stays
+//! anyone's (all a merge asks of it is [`Sequence`]), but the CRDT's own
+//! state is built on mamre, on purpose:
+//!
+//! - the walk's records, [`Identities`] and [`Anchors`] are mamre
+//!   `SumTree`s, sought by their summaries;
+//! - the log, sync messages, files and the accountant's books are written
+//!   with `mamre::codec`, whose `DecodeError` the decoding functions return.
+//!
+//! The parts that don't need either are the reference ([`reference`](mod@reference)) and
+//! the simple walk: plain lists, correct and slow. A CRDT without mamre
+//! would start from those and bring its own tree.
 
+mod accountant;
 mod anchors;
+// Kept in the books' format until it's cleaned out (#20): always empty.
+#[allow(dead_code)]
+mod blocks;
+#[doc(hidden)]
+pub mod copies;
 mod encode;
 pub mod file;
 mod ids;
 mod key;
+mod merge;
 mod oplog;
 mod order;
+mod outline;
+mod recent;
 pub mod reference;
+// Its moves (portals) retire with #20: it stays the oracle for merges
+// without moves.
+#[allow(dead_code)]
 mod simple;
 pub mod sync;
 mod walk;
 
+pub use accountant::Accountant;
 pub use anchors::Anchors;
 pub use ids::Identities;
 pub use oplog::{AgentId, Event, Lv, Op, OpLog};
-pub use walk::Change;
+pub use outline::Section;
+pub use walk::{Change, Sequence};

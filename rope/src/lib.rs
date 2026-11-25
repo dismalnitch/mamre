@@ -590,7 +590,12 @@ impl<M: Measure, const N: usize> Rope<M, N> {
         }
     }
 
-    fn is_char_boundary(&self, at: usize) -> bool {
+    /// Whether byte `at` falls between `char`s (or at either end), as
+    /// [`str::is_char_boundary`]. Past the end, it doesn't.
+    pub fn is_char_boundary(&self, at: usize) -> bool {
+        if at > self.len() {
+            return false;
+        }
         let mut cursor = self.tree.cursor::<ByteOffset>();
         cursor.seek(&ByteOffset(at), Bias::Right);
         match cursor.item() {

@@ -17,6 +17,8 @@
 //! op        = 0 insert:   pos, count, items (as a run: text is one UTF-8 string)
 //!             1 delete:   pos, count          (each removes the item at pos)
 //!             2 undelete: count, then each target delete, a ref
+//!             3 move:     pos, count, to   (one event: moves don't run)
+//!             4 mark:     pos, level       (one event)
 //!             (other kinds are reserved for other kinds of event)
 //! target    = varint, never 0. With no target, a run edits the document's
 //!             text, so text costs nothing for this. Other structures (ink,
@@ -60,6 +62,8 @@ enum PlannedOp<T> {
 const INSERT: u64 = 0;
 const DELETE: u64 = 1;
 const UNDELETE: u64 = 2;
+const MOVE: u64 = 3;
+const MARK: u64 = 4;
 
 /// A reference to an event, as read: in this chunk, or from before it.
 #[derive(Clone, Copy)]
@@ -72,6 +76,8 @@ enum RawOp<T> {
     Insert { pos: usize, items: Vec<T> },
     Delete { pos: usize, len: usize },
     Undelete { targets: Vec<Ref> },
+    Move { pos: usize, len: usize, to: usize },
+    Mark { pos: usize, level: u8 },
 }
 
 struct RawRun<T> {
@@ -87,6 +93,7 @@ impl<T> RawRun<T> {
             RawOp::Insert { items, .. } => items.len(),
             RawOp::Delete { len, .. } => *len,
             RawOp::Undelete { targets } => targets.len(),
+            RawOp::Move { .. } | RawOp::Mark { .. } => 1,
         }
     }
 }
@@ -207,6 +214,17 @@ impl<T: Clone + Codec> OpLog<T> {
                         let t = target + k + i;
                         self.put_ref(out, t, first, chunk_index(t), &index);
                     }
+                }
+                RunOp::Move { pos, len, to } => {
+                    put_varint(out, MOVE << 1);
+                    put_usize(out, *pos);
+                    put_usize(out, *len);
+                    put_usize(out, *to);
+                }
+                RunOp::Mark { pos, level } => {
+                    put_varint(out, MARK << 1);
+                    put_usize(out, *pos);
+                    put_usize(out, *level as usize);
                 }
             }
         }
@@ -347,6 +365,14 @@ impl<T: Clone + Codec> OpLog<T> {
                     new_kinds.extend(std::iter::repeat_n(Kind::Delete, n));
                     PlannedOp::Run(RunOp::Delete { pos, len: n })
                 }
+                RawOp::Move { pos, len, to } => {
+                    new_kinds.push(Kind::Move);
+                    PlannedOp::Run(RunOp::Move { pos, len, to })
+                }
+                RawOp::Mark { pos, level } => {
+                    new_kinds.push(Kind::Mark);
+                    PlannedOp::Run(RunOp::Mark { pos, level })
+                }
                 RawOp::Undelete { targets } => {
                     let mut resolved = Vec::with_capacity(n);
                     for &t in &targets[known..] {
@@ -460,6 +486,16 @@ impl<T: Clone + Codec> OpLog<T> {
                     }
                     RawOp::Undelete { targets }
                 }
+                MOVE => RawOp::Move {
+                    pos: get_usize(input)?,
+                    len: get_usize(input)?,
+                    to: get_usize(input)?,
+                },
+                MARK => RawOp::Mark {
+                    pos: get_usize(input)?,
+                    level: u8::try_from(get_usize(input)?)
+                        .map_err(|_| DecodeError::Invalid("a section level past 255"))?,
+                },
                 _ => {
                     return Err(DecodeError::Invalid(
                         "an event kind this version doesn't know",
@@ -535,5 +571,31 @@ mod tests {
         let mut log = OpLog::<char>::new();
         assert!(log.decode_chunk(&bytes).is_err());
         assert_eq!(log.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod move_tests {
+    use crate::oplog::OpLog;
+
+    /// A chunk holding a move reads back as the same events.
+    #[test]
+    fn a_move_round_trips() {
+        let mut log = OpLog::<char>::new();
+        let a = log.agent("a");
+        let v = log.add_insert(a, &[], 0, "abcdef".chars());
+        let v = log.add_move(a, &v, 1..3, 5);
+        log.add_insert(a, &v, 0, "x".chars());
+        let mut bytes = Vec::new();
+        log.encode_chunk(0..log.len(), &mut bytes);
+        let mut back = OpLog::<char>::new();
+        assert_eq!(back.decode_chunk(&bytes), Ok(log.len()));
+        for lv in 0..log.len() {
+            assert_eq!(
+                format!("{:?}", back.event(lv)),
+                format!("{:?}", log.event(lv))
+            );
+        }
+        assert_eq!(back.checkout(back.version()), log.checkout(log.version()));
     }
 }

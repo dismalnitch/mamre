@@ -241,6 +241,40 @@ impl Anchors {
                 }
             }
             Change::Delete { range } => self.delete(range.clone()),
+            Change::Move { range, to } => self.move_range(range.clone(), *to),
+            Change::Mark { .. } | Change::Lost { .. } => {}
+        }
+    }
+
+    /// The items in `range` move to `to` (a position before the move,
+    /// outside the range): watched ones among them go with them.
+    pub fn move_range(&mut self, range: Range<usize>, to: usize) {
+        let n = range.len();
+        if n == 0 || to == range.start || to == range.end {
+            return;
+        }
+        // The watched items inside, and how far in.
+        let mut inside = Vec::new();
+        {
+            let mut cursor = self.marks.cursor::<Span>();
+            cursor.seek(&Pos(range.start), Bias::Right);
+            while let Some(m) = cursor.item() {
+                let at = cursor.start().items + m.before;
+                if at >= range.end {
+                    break;
+                }
+                if at >= range.start {
+                    inside.push((m.item, at - range.start));
+                }
+                cursor.next();
+            }
+        }
+        self.delete(range.clone());
+        let at = if to > range.start { to - n } else { to };
+        self.insert(at, n);
+        for (item, offset) in inside {
+            self.parked.remove(&item);
+            self.place(at + offset, item);
         }
     }
 

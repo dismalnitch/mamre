@@ -1,0 +1,15 @@
+[package]
+name = "mamre-text"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Collaborative text: mamre's rope, kept by its CRDT. Edits in UTF-8 byte offsets; sync, anchors, sections and files."
+repository = "https://github.com/dismalnitch/mamre"
+publish = false
+
+[dependencies]
+mamre-rope = { path = "../rope" }
+mamre-egg-walker = { path = "../egg-walker" }
+
+[dev-dependencies]
+proptest = "1.12"
