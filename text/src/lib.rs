@@ -99,9 +99,12 @@ pub struct SectionId(Lv);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Section {
     pub id: SectionId,
-    /// The byte offset of the character that starts it.
+    /// The byte offset of the character that starts it, or (its heading
+    /// deleted) of its place.
     pub at: usize,
     pub level: u8,
+    /// Whether its heading shows, and if not, how it's shown (#19).
+    pub start: mamre_egg_walker::Start,
 }
 
 /// What came of a message.
@@ -394,13 +397,16 @@ impl Text {
                 id: SectionId(s.item),
                 at: self.rope.char_to_offset(s.pos),
                 level: s.level,
+                start: s.start,
             })
             .collect()
     }
 
     /// Where section `id` runs: from its first character to the next
     /// section at its level or above, or the end. `None` if it isn't a
-    /// section now (unmarked, or its first character deleted).
+    /// section now: unmarked, or its first character deleted and the
+    /// outline's policy folds it (by default a section whose heading is
+    /// deleted stays, headless, at its place).
     pub fn section_range(&self, id: SectionId) -> Option<Range<usize>> {
         let r = self.books.section_range(id.0)?;
         Some(self.rope.char_to_offset(r.start)..self.rope.char_to_offset(r.end))

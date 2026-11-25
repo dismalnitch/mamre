@@ -83,5 +83,5 @@ pub use accountant::Accountant;
 pub use anchors::Anchors;
 pub use ids::Identities;
 pub use oplog::{AgentId, Event, Lv, Op, OpLog};
-pub use outline::Section;
+pub use outline::{Ambiguity, Next, Policies, Policy, Resolution, Section, Start};
 pub use walk::{Change, Sequence};
