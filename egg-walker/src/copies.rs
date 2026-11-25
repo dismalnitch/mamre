@@ -140,6 +140,8 @@ enum Info {
     Move(Move),
     /// A move of nothing, or to where it is.
     Inert,
+    /// Not the text's: a range (#32).
+    Other,
 }
 
 /// A move or mark discarded at a version: what lost, to what (none for a
@@ -917,7 +919,7 @@ impl<'a, T: Clone> Replay<'a, T> {
                     }
                 }
             }
-            Info::Mark { .. } | Info::Inert => {}
+            Info::Mark { .. } | Info::Inert | Info::Other => {}
             Info::Undo { .. } => {
                 // What it cancels or brings back reaches everything the
                 // move did: drawn again from scratch.
@@ -1083,6 +1085,7 @@ fn replay_checked<'a, T: Clone>(
                 // start doesn't say.
                 None => return Err(Unsupported),
             },
+            Op::RangeAdd { .. } | Op::RangeSet { .. } => Info::Other,
             Op::Undo { target } => match r.ix.get(target) {
                 Some(&t) => {
                     assert!(r.past[i][t], "undo {lv} undoes an event it includes");

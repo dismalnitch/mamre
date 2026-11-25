@@ -39,6 +39,8 @@ pub struct Accountant {
     /// Each local writer's undo and redo stacks (see `undo.rs`): this
     /// replica's, not saved.
     pub(crate) history: std::collections::HashMap<crate::oplog::AgentId, crate::undo::History>,
+    /// The ranges the author defined (#32).
+    pub(crate) ranges: crate::ranges::Ranges,
 }
 
 impl Default for Accountant {
@@ -64,6 +66,7 @@ impl Accountant {
             blocks: Blocks::default(),
             recent: Recent::default(),
             history: Default::default(),
+            ranges: Default::default(),
         }
     }
 
@@ -154,6 +157,35 @@ impl Accountant {
         self.outline.policies.set(next, policy);
     }
 
+    /// The ranges the author defined that the document shows, by where they
+    /// start (see `ranges.rs`).
+    pub fn ranges(&self) -> Vec<crate::AuthorRange> {
+        self.ranges.all()
+    }
+
+    /// Range `id`, if the document shows it.
+    pub fn range(&self, id: Lv) -> Option<crate::AuthorRange> {
+        self.ranges.get(id)
+    }
+
+    /// The ranges covering position `pos`.
+    pub fn ranges_at(&self, pos: usize) -> Vec<crate::AuthorRange> {
+        self.ranges
+            .all()
+            .into_iter()
+            .filter(|r| r.span.contains(&pos))
+            .collect()
+    }
+
+    /// The ranges overlapping positions `span`.
+    pub fn ranges_overlapping(&self, span: std::ops::Range<usize>) -> Vec<crate::AuthorRange> {
+        self.ranges
+            .all()
+            .into_iter()
+            .filter(|r| r.span.start < span.end && span.start < r.span.end)
+            .collect()
+    }
+
     /// The level of the section `item` starts: 0 if none.
     pub fn level(&self, item: Lv) -> u8 {
         self.outline.level(item)
@@ -163,6 +195,20 @@ impl Accountant {
     /// and returns the changes that bring the document there.
     pub fn merge<'a, T: Clone>(&mut self, log: &'a OpLog<T>, to: &[Lv]) -> Vec<Change<'a, T>> {
         let to = log.union(&self.version, to);
+        // Ranges read from a file are rebuilt from the log first.
+        if self.ranges.stale {
+            self.ranges = Default::default();
+            self.ranges.resize(self.ids.len());
+            let all: Vec<Lv> = (0..log.len())
+                .filter(|&lv| {
+                    log.kind(lv) == crate::oplog::Kind::Range && log.contains(&self.version, lv)
+                })
+                .collect();
+            self.ranges.take_in(log, &all, &self.ids);
+        }
+        let (_, mut new) = log.diff(&self.version, &to);
+        new.retain(|&lv| log.kind(lv) == crate::oplog::Kind::Range);
+        new.sort_unstable();
         let out = log.changes_kept(
             &self.version,
             &to,
@@ -173,7 +219,9 @@ impl Accountant {
         for change in &out {
             self.anchors.apply(change);
             self.outline.apply(change);
+            self.ranges.apply(change);
         }
+        self.ranges.take_in(log, &new, &self.ids);
         self.version = to;
         self.recent.keep(&self.version, &self.ids.ids, &self.blocks);
         out
@@ -241,6 +289,7 @@ impl Accountant {
             blocks,
             recent,
             history: Default::default(),
+            ranges: crate::ranges::Ranges::stale(),
         })
     }
 }

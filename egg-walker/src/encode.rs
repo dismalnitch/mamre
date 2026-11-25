@@ -456,6 +456,9 @@ impl<T: Clone + Codec> Writer<'_, T> {
                 put_usize(out, 1);
                 self.put_ref(out, *target, first);
             }
+            RunOp::RangeAdd { .. } | RunOp::RangeSet { .. } => unimplemented!(
+                "ranges aren't written to chunks until their encoding is decided (#32)"
+            ),
             RunOp::Move { pos, len, to } => {
                 put_varint(out, MOVE << 1);
                 put_usize(out, *pos);

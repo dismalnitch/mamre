@@ -143,6 +143,15 @@ impl Accountant {
         let mut to_delete: BTreeSet<Lv> = BTreeSet::new();
         let mut to_undo: Vec<Lv> = Vec::new();
         let mut marks: Vec<(Lv, Vec<Lv>)> = Vec::new();
+        // Ranges: the step's own removed; its sets put back, where they're
+        // still the latest.
+        let mut ranges: Vec<(Lv, Option<String>)> = Vec::new();
+        let added: HashSet<Lv> = events
+            .iter()
+            .copied()
+            .filter(|&e| matches!(log.event(e).op, Op::RangeAdd { .. }))
+            .collect();
+        let mut sets: Vec<(Lv, Lv)> = Vec::new();
         for &e in &events {
             if cancelled.contains(&e) {
                 continue;
@@ -173,6 +182,16 @@ impl Accountant {
                     to_delete.insert(self.deleted_by(log, target));
                 }
                 Op::Mark { .. } => marks.push((e, log.event(e).parents)),
+                Op::RangeAdd { .. } => {
+                    if self.ranges.tag(e).is_some_and(|t| t.is_some()) {
+                        ranges.push((e, None));
+                    }
+                }
+                Op::RangeSet { range, .. } => {
+                    if !added.contains(&range) && self.ranges.set_by(range) == Some(e) {
+                        sets.push((range, e));
+                    }
+                }
             }
         }
         let start = log.next_seq[agent.index()];
@@ -204,6 +223,17 @@ impl Accountant {
         // Deletes and moves undone, by identity: one kind-2 run.
         if !to_undo.is_empty() {
             v = log.add_undo(agent, &v, to_undo);
+        }
+        // A set put back to the tag before the step: the books there.
+        if !sets.is_empty() {
+            let mut before = Accountant::new();
+            before.merge(log, &log.event(events[0]).parents);
+            for (range, _) in sets {
+                ranges.push((range, before.ranges.tag(range).flatten()));
+            }
+        }
+        for (range, tag) in ranges {
+            v = log.set_range(agent, &v, range, tag.as_deref());
         }
         log.end_group(agent);
         (start..log.next_seq[agent.index()], v)

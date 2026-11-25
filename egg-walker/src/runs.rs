@@ -205,6 +205,8 @@ enum Info {
     },
     Move(Move),
     Inert,
+    /// Not the text's: a range (#32).
+    Other,
 }
 
 /// The moves that stand, in order, and which they are.
@@ -1420,7 +1422,7 @@ impl<'a, T: Clone> Replay<'a, T> {
                     show(&mut v, root, true);
                 }
             }
-            Info::Mark { .. } | Info::Inert => {}
+            Info::Mark { .. } | Info::Inert | Info::Other => {}
             Info::Undo { .. } => {
                 // It reaches everything the move did: drawn from scratch.
                 let mut at: Vec<bool> = (0..self.n()).map(|j| j < x && self.saw(x, j)).collect();
@@ -1715,6 +1717,7 @@ fn replay_checked<'a, T: Clone>(
                 }
                 None => return Err(Unsupported),
             },
+            Op::RangeAdd { .. } | Op::RangeSet { .. } => Info::Other,
             Op::Undo { target } => match r.ix.get(target) {
                 Some(&t) => {
                     assert!(r.saw(i, t), "undo {lv} undoes an event it includes");
