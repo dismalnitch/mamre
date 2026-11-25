@@ -36,6 +36,9 @@ pub struct Accountant {
     blocks: Blocks,
     /// The books at the latest versions, for a merge to start from.
     recent: Recent,
+    /// Each local writer's undo and redo stacks (see `undo.rs`): this
+    /// replica's, not saved.
+    pub(crate) history: std::collections::HashMap<crate::oplog::AgentId, crate::undo::History>,
 }
 
 impl Default for Accountant {
@@ -60,6 +63,7 @@ impl Accountant {
             outline: Outline::default(),
             blocks: Blocks::default(),
             recent: Recent::default(),
+            history: Default::default(),
         }
     }
 
@@ -210,6 +214,7 @@ impl Accountant {
             outline,
             blocks,
             recent,
+            history: Default::default(),
         })
     }
 }

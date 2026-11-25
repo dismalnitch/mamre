@@ -117,6 +117,20 @@ impl Identities {
         self.ids.get(pos)
     }
 
+    /// Where each of `items` is, of those the document shows: one pass over
+    /// the runs.
+    pub fn positions(&self, items: &std::collections::BTreeSet<Lv>) -> Vec<(Lv, usize)> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        for run in self.ids.runs() {
+            for &item in items.range(run.clone()) {
+                out.push((item, pos + (item - run.start)));
+            }
+            pos += run.len();
+        }
+        out
+    }
+
     /// The item delete `delete` removed, if it's remembered.
     pub fn removed(&self, delete: Lv) -> Option<Lv> {
         self.removed.get(&delete).copied()

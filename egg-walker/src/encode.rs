@@ -4,7 +4,7 @@
 //! it by agent and sequence number.
 //!
 //! ```text
-//! chunk     = compression (byte, 0: none), agents, runs
+//! chunk     = compression (byte, 0: none), agents, runs, [steps]
 //! agents    = count, then each name (length, UTF-8)
 //! runs      = count, then each run
 //! run       = agent (index into agents)
@@ -22,6 +22,17 @@
 //!             3 move:     pos, count, to   (one event: moves don't run)
 //!             4 mark:     pos, level       (one event)
 //!             (other kinds are reserved for other kinds of event)
+//! steps     = only if any step ends here (#14): count, then for each
+//!             agent with some, its index (into agents), a count, then
+//!             each seq where one of its steps ends, delta-coded: the
+//!             first from one before its first seq in the chunk, each
+//!             other from the one before. The ends listed are those of
+//!             the agent's events in the chunk, and the one just before
+//!             them (a step left open by the last save, closed since).
+//!             An agent's events after its last end are an open step.
+//!             After the runs, so a chunk with no step ends is as before,
+//!             and older readers refuse one with them (bytes after the
+//!             runs) cleanly.
 //! target    = varint, never 0. With no target, a run edits the document's
 //!             text, so text costs nothing for this. Other structures (ink,
 //!             comments) share the log, so they share its one order and one
@@ -47,7 +58,7 @@
 //! an event's position fits its document is left to the walk (adversarial
 //! peers are M4's later work).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
 use mamre::codec::{
@@ -225,6 +236,41 @@ impl<T: Clone + Codec> OpLog<T> {
         for piece in &pieces {
             writer.put_run(out, piece, &mut seqs);
         }
+        self.put_steps(out, &pieces, &agents);
+    }
+
+    /// Writes the step ends of the chunk's events, if there are any.
+    /// Mirrors [`get_steps`].
+    fn put_steps(&self, out: &mut Vec<u8>, pieces: &[Piece], agents: &AgentTable) {
+        // Per agent in the chunk: its first seq here, and its step ends.
+        let mut steps: BTreeMap<usize, (u64, BTreeSet<u64>)> = BTreeMap::new();
+        for (r, range) in pieces {
+            let run = &self.runs[*r];
+            let first = run.seq + (range.start - run.start) as u64;
+            let last = first + range.len() as u64 - 1;
+            let entry = steps
+                .entry(agents.index[&run.agent])
+                .or_insert((first, BTreeSet::new()));
+            entry.0 = entry.0.min(first);
+            let ends = &self.step_ends[run.agent.index()];
+            entry
+                .1
+                .extend(ends.range(first.saturating_sub(1)..=last).copied());
+        }
+        steps.retain(|_, (_, ends)| !ends.is_empty());
+        if steps.is_empty() {
+            return;
+        }
+        put_usize(out, steps.len());
+        for (agent, (first, ends)) in steps {
+            put_usize(out, agent);
+            put_usize(out, ends.len());
+            let mut prev = first.checked_sub(1);
+            for end in ends {
+                put_varint(out, end - prev.unwrap_or(0));
+                prev = Some(end);
+            }
+        }
     }
 
     /// The stretches of runs in `spans`, in order.
@@ -296,6 +342,11 @@ impl<T: Clone + Codec> OpLog<T> {
     pub fn decode_chunk(&mut self, mut bytes: &[u8]) -> Result<usize, DecodeError> {
         let input = &mut bytes;
         let (names, runs) = parse_chunk::<T>(input)?;
+        let steps = if input.is_empty() {
+            Vec::new()
+        } else {
+            get_steps(input, &runs)?
+        };
         if !input.is_empty() {
             return Err(DecodeError::Invalid("bytes after the chunk"));
         }
@@ -304,10 +355,20 @@ impl<T: Clone + Codec> OpLog<T> {
         for run in runs {
             planned.extend(planner.plan_run(run)?);
         }
+        // A step ends at an event this log has, or the chunk brings.
+        for (agent, ends) in &steps {
+            if ends.iter().any(|&e| e >= planner.next_seq[*agent]) {
+                return Err(DecodeError::Invalid("a step end past the agent's events"));
+            }
+        }
         let next = planner.next;
         let added = next - self.len();
         self.apply(&names, planned);
         debug_assert_eq!(self.len(), next, "planned numbering");
+        for (agent, ends) in steps {
+            let id = self.agent(&names[agent]);
+            self.step_ends[id.index()].extend(ends);
+        }
         Ok(added)
     }
 
@@ -639,6 +700,45 @@ fn parse_chunk<T: Codec>(input: &mut &[u8]) -> Result<Parsed<T>, DecodeError> {
         runs.push(get_run(input, &mut seqs)?);
     }
     Ok((names, runs))
+}
+
+/// Reads the step ends, given the chunk's runs (for where each agent's
+/// deltas start). Mirrors [`OpLog::put_steps`].
+fn get_steps<T>(
+    input: &mut &[u8],
+    runs: &[RawRun<T>],
+) -> Result<Vec<(usize, Vec<u64>)>, DecodeError> {
+    let n = get_usize(input)?;
+    let mut out = Vec::with_capacity(n.min(input.len()));
+    for _ in 0..n {
+        let agent = get_usize(input)?;
+        let first = runs
+            .iter()
+            .filter(|r| r.agent == agent)
+            .map(|r| r.seq)
+            .min()
+            .ok_or(DecodeError::Invalid(
+                "step ends for an agent with no events here",
+            ))?;
+        let count = get_usize(input)?;
+        let mut ends = Vec::with_capacity(count.min(input.len()));
+        // The first from one before `first`, each other from the last.
+        let mut at: Option<u64> = first.checked_sub(1);
+        for k in 0..count {
+            let delta = get_varint(input)?;
+            let end = match (k, at) {
+                (0, Some(p)) => p.checked_add(delta),
+                (0, None) => Some(delta),
+                (_, Some(p)) if delta > 0 => p.checked_add(delta),
+                _ => None,
+            }
+            .ok_or(DecodeError::Invalid("step ends out of order"))?;
+            ends.push(end);
+            at = Some(end);
+        }
+        out.push((agent, ends));
+    }
+    Ok(out)
 }
 
 /// Reads the compression byte: only 0, none, so far.

@@ -17,7 +17,7 @@
 //! how a document's whole history stays small. Single events are rebuilt
 //! when asked for; nothing about their numbering changes.
 
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::ops::Range;
 
 /// What an event does, without its details.
@@ -143,6 +143,13 @@ pub struct OpLog<T> {
     pub(crate) spans: Vec<BTreeMap<u64, (Lv, usize)>>,
     /// The events nothing else came after: the version of everything.
     frontier: Vec<Lv>,
+    /// Per agent, the seqs where a step ends (#14): the events from just
+    /// after one end to the next are one step, undone as one. An agent's
+    /// events after its last end are an open step.
+    pub(crate) step_ends: Vec<BTreeSet<u64>>,
+    /// Per agent, how deep in [`begin_group`](Self::begin_group)s it is
+    /// here: this replica's, never sent.
+    depth: Vec<u32>,
 }
 
 impl<T> Default for OpLog<T> {
@@ -154,6 +161,8 @@ impl<T> Default for OpLog<T> {
             runs: Vec::new(),
             spans: Vec::new(),
             frontier: Vec::new(),
+            step_ends: Vec::new(),
+            depth: Vec::new(),
         }
     }
 }
@@ -173,6 +182,8 @@ impl<T: Clone> OpLog<T> {
         self.by_name.insert(name.to_string(), id);
         self.next_seq.push(0);
         self.spans.push(BTreeMap::new());
+        self.step_ends.push(BTreeSet::new());
+        self.depth.push(0);
         id
     }
 
@@ -340,6 +351,117 @@ impl<T: Clone> OpLog<T> {
         self.push(agent, seq, normalize(parents.to_vec()), op)
     }
 
+    /// Starts a group (#14): `agent`'s events from here to the matching
+    /// [`end_group`](Self::end_group) are one step, undone as one. Groups
+    /// nest; only the outermost counts. Anything `agent` did since its last
+    /// step ended is a step of its own, ended here.
+    pub fn begin_group(&mut self, agent: AgentId) {
+        let a = agent.index();
+        if self.depth[a] == 0 {
+            self.end_step(agent);
+        }
+        self.depth[a] += 1;
+    }
+
+    /// Ends a group [`begin_group`](Self::begin_group) started: at the
+    /// outermost, `agent`'s events since are one step. Groups never span
+    /// writers: each agent's are its own.
+    pub fn end_group(&mut self, agent: AgentId) {
+        let a = agent.index();
+        assert!(self.depth[a] > 0, "an end_group without a begin_group");
+        self.depth[a] -= 1;
+        if self.depth[a] == 0 {
+            self.end_step(agent);
+        }
+    }
+
+    /// Whether `agent` is inside a group here.
+    pub fn in_group(&self, agent: AgentId) -> bool {
+        self.depth[agent.index()] > 0
+    }
+
+    /// Ends `agent`'s open step at its latest event, if it has one.
+    pub(crate) fn end_step(&mut self, agent: AgentId) {
+        let a = agent.index();
+        let Some(last) = self.next_seq[a].checked_sub(1) else {
+            return;
+        };
+        if self.step_ends[a].last().is_none_or(|&e| e < last) {
+            self.step_ends[a].insert(last);
+        }
+    }
+
+    /// `agent`'s whole steps, in order, as ranges of its seqs.
+    pub fn steps(&self, agent: AgentId) -> Vec<Range<u64>> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        for &end in &self.step_ends[agent.index()] {
+            out.push(start..end + 1);
+            start = end + 1;
+        }
+        out
+    }
+
+    /// The events of `agent`'s seqs `seqs`, in order.
+    pub fn events_of(&self, agent: AgentId, seqs: Range<u64>) -> Vec<Lv> {
+        seqs.map(|s| self.find(agent, s).expect("an event this log has"))
+            .collect()
+    }
+
+    /// The history a step at a time (#14): the versions after each step,
+    /// in this log's order, each holding only whole steps. Where the
+    /// events of a step need part of another (it saw that one half done),
+    /// the timeline waits until that one is whole too. Open steps never
+    /// show.
+    pub fn timeline(&self) -> Vec<Vec<Lv>> {
+        let n = self.len();
+        // Where each event's step ends, if it has.
+        let mut ends_at: Vec<Option<Lv>> = vec![None; n];
+        for (a, ends) in self.step_ends.iter().enumerate() {
+            let agent = AgentId(a as u32);
+            let mut start = 0;
+            for &end in ends {
+                let end_lv = self.find(agent, end).expect("a step ends at an event");
+                for s in start..=end {
+                    ends_at[self.find(agent, s).expect("an event")] = Some(end_lv);
+                }
+                start = end + 1;
+            }
+        }
+        let mut by_end: BTreeMap<Lv, Vec<Lv>> = BTreeMap::new();
+        for (lv, e) in ends_at.iter().enumerate() {
+            if let Some(e) = e {
+                by_end.entry(*e).or_default().push(lv);
+            }
+        }
+        let mut children: Vec<Vec<Lv>> = vec![Vec::new(); n];
+        for lv in 0..n {
+            for p in self.parents(lv) {
+                children[p].push(lv);
+            }
+        }
+        let mut inside = vec![false; n];
+        // Parents of events inside that aren't.
+        let mut missing = 0usize;
+        let mut out: Vec<Vec<Lv>> = Vec::new();
+        for (_, step) in by_end {
+            for &x in &step {
+                inside[x] = true;
+                missing += self.parents(x).filter(|&p| !inside[p]).count();
+                missing -= children[x].iter().filter(|&&c| inside[c]).count();
+            }
+            if missing == 0 {
+                let version: Vec<Lv> = (0..n)
+                    .filter(|&x| inside[x] && !children[x].iter().any(|&c| inside[c]))
+                    .collect();
+                if out.last() != Some(&version) {
+                    out.push(version);
+                }
+            }
+        }
+        out
+    }
+
     /// Adds every event `other` knows and this log doesn't, in `other`'s
     /// order (so parents first). Returns how many were new.
     pub fn pull(&mut self, other: &OpLog<T>) -> usize {
@@ -373,6 +495,11 @@ impl<T: Clone> OpLog<T> {
             };
             self.push(agent, event.seq, parents, op);
             added += 1;
+        }
+        for (a, ends) in other.step_ends.iter().enumerate() {
+            let agent = self.agent(&other.agents[a]);
+            let have = self.next_seq[agent.index()];
+            self.step_ends[agent.index()].extend(ends.iter().copied().filter(|&s| s < have));
         }
         added
     }
