@@ -772,7 +772,8 @@ impl<'a, T: Clone> Replay<'a, T> {
                 // An origin that's a copy made by a move dropped for a
                 // loop stands for what it copied: the copy went where the
                 // other move took it, not where its author put it
-                // (mamre#27).
+                // (mamre#27). Loops only, on purpose: see copies.rs's
+                // module docs before widening it to other losing moves.
                 let unloop = |k: Option<Key>| {
                     k.map(|mut k| {
                         while k >= self.copy_base && act.looped.contains(&self.copier(k)) {

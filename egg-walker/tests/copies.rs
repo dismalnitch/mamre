@@ -670,6 +670,11 @@ fn portal_filter_coverage() {
 /// other, so b's (the later) is dropped. X stays between E and F, as the
 /// portals have it: the copies it was typed between stand for E and F
 /// (mamre#27).
+///
+/// Only a move dropped for a loop works this way. A replaced or crossing
+/// move's copies keep "put beside one, it stays there" (the tests below).
+/// Extending this rule to those moves would be a decision of its own, and
+/// would change what those tests expect.
 #[test]
 fn a_dropped_moves_typing_stays_between_its_neighbours() {
     let mut log: OpLog<char> = OpLog::new();
@@ -693,6 +698,8 @@ fn a_dropped_moves_typing_stays_between_its_neighbours() {
     assert_eq!(text_at(&log, &all), "EABXF");
 }
 
+/// Copies that gave way, not dropped for a loop: typing put among them
+/// stays among them. The loop rule above deliberately doesn't reach here.
 #[test]
 fn typing_among_copies_that_gave_way_stays_among_them() {
     let mut log: OpLog<char> = OpLog::new();

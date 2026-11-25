@@ -59,6 +59,12 @@
 //! put them, so something put beside one goes by what it copied instead
 //! (mamre#27).
 //!
+//! That exception is kept to loops on purpose. It could cover every losing
+//! move (replaced, crossing) by counting those moves in `looped`, but that
+//! changes where typing beside a replaced or crossing move's copies lands,
+//! which the losing-move tests pin as "it stays there". Widen it only as a
+//! decision of its own.
+//!
 //! Every move or mark discarded is a [`Loss`]: what was lost, to what, and
 //! where its items are now.
 
@@ -342,7 +348,8 @@ impl<'a, T: Clone> Replay<'a, T> {
                 // An origin that's a copy made by a move dropped for a
                 // loop stands for what it copied: the copy went where the
                 // other move took it, not where its author put it
-                // (mamre#27).
+                // (mamre#27). Loops only, on purpose: see the module docs
+                // before widening it to other losing moves.
                 let unloop = |k: Option<Key>| {
                     let looped = self.looped.borrow();
                     k.map(|mut k| {
