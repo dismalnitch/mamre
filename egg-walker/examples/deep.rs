@@ -38,6 +38,6 @@ fn main() {
         println!("reference {:?}, matches: {}", t.elapsed(), r == merged);
     }
     let t = Instant::now();
-    let fresh = log.checkout(log.version());
+    let fresh = log.checkout(books.version());
     println!("checkout {:?}, matches: {}", t.elapsed(), fresh == doc);
 }

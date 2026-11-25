@@ -11,6 +11,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use mamre_egg_walker::copies::{self, Loss};
+use mamre_egg_walker::runs;
 use mamre_egg_walker::{Lv, Op, OpLog, reference};
 use proptest::prelude::*;
 
@@ -267,6 +268,10 @@ proptest! {
         for start in [Vec::new(), start] {
             if let Some(got) = copies::from_start(&log, &start, end) {
                 prop_assert_eq!(got, copies::identities(&log, end), "from {:?}\n{}", start, describe(&log));
+            }
+            // And on runs (#22).
+            if let Some(got) = runs::from_start(&log, &start, end) {
+                prop_assert_eq!(got, copies::identities(&log, end), "runs from {:?}\n{}", start, describe(&log));
             }
         }
     }
@@ -653,6 +658,76 @@ fn portal_filter_coverage() {
 /// (inner, so C goes with b), and a, not having seen b, moves its copy of
 /// C again. C shows once, with b; a's second move moves nothing, and is
 /// reported lost to b's.
+/// b moves BCD to the front, then moves AEF in between its copies of B
+/// and C. a, not seeing either, moves BC (inside b's first block) to just
+/// before F. a's move is inner, so it wins B and C, and b's copies of them
+/// give way: laid out, not drawn. AEF stays where b put it among those
+/// copies, before D, with a's BC among them (a put BC before F, which b
+/// moved). The portals put D first: a difference like an edge tie, as
+/// what's decided is a neighbour another move carried off.
+/// b moves EF between A and B, then types X between E and F; a, not
+/// seeing it, moves AB between E and F. The two moves each go with the
+/// other, so b's (the later) is dropped. X stays between E and F, as the
+/// portals have it: the copies it was typed between stand for E and F
+/// (mamre#27).
+///
+/// Only a move dropped for a loop works this way. A replaced or crossing
+/// move's copies keep "put beside one, it stays there" (the tests below).
+/// Extending this rule to those moves would be a decision of its own, and
+/// would change what those tests expect.
+#[test]
+fn a_dropped_moves_typing_stays_between_its_neighbours() {
+    let mut log: OpLog<char> = OpLog::new();
+    let (a, b) = (log.agent("a"), log.agent("b"));
+    let e = log.add_insert(a, &[], 0, ['E']);
+    let f = log.add_insert(b, &[], 0, ['F']);
+    let v = log.add_insert(a, &e, 0, ['D']);
+    let v = log.add_delete(a, &v, 0..1);
+    let v = log.add_insert(a, &v, 0, ['B']);
+    let v = log.add_insert(a, &v, 0, ['A']);
+    let base = log.union(&f, &v);
+    assert_eq!(text_at(&log, &base), "ABEF");
+    let nothing = log.add_move(b, &base, 0..1, 0);
+    let ef = log.add_move(b, &nothing, 2..4, 1);
+    assert_eq!(text_at(&log, &ef), "AEFB");
+    let x = log.add_insert(b, &ef, 2, ['X']);
+    assert_eq!(text_at(&log, &x), "AEXFB");
+    let ab = log.add_move(a, &base, 0..2, 3);
+    assert_eq!(text_at(&log, &ab), "EABF");
+    let all = log.union(&x, &ab);
+    assert_eq!(text_at(&log, &all), "EABXF");
+}
+
+/// Copies that gave way, not dropped for a loop: typing put among them
+/// stays among them. The loop rule above deliberately doesn't reach here.
+#[test]
+fn typing_among_copies_that_gave_way_stays_among_them() {
+    let mut log: OpLog<char> = OpLog::new();
+    let (a, b) = (log.agent("a"), log.agent("b"));
+    let mut v = Vec::new();
+    for c in "EDCBA".chars() {
+        v = log.add_insert(a, &v, 0, [c]);
+    }
+    let f = log.add_insert(b, &[], 0, ['F']);
+    let base = log.union(&v, &f);
+    assert_eq!(text_at(&log, &base), "ABCDEF");
+    let first = log.add_move(b, &base, 1..4, 0);
+    assert_eq!(text_at(&log, &first), "BCDAEF");
+    let second = log.add_move(b, &first, 3..6, 1);
+    assert_eq!(text_at(&log, &second), "BAEFCD");
+    let x = log.add_insert(b, &second, 0, ['X']);
+    let inner = log.add_move(a, &base, 1..3, 5);
+    assert_eq!(text_at(&log, &inner), "ADEBCF");
+    let all = log.union(&x, &inner);
+    assert_eq!(text_at(&log, &all), "XAEBCFD");
+    assert!(copies::losses(&log, &all).is_empty());
+    assert!(copies::edge_ties(&log), "the portals may differ here");
+    assert_eq!(
+        log.checkout(&all).into_iter().collect::<String>(),
+        "XAEBCFD"
+    );
+}
+
 #[test]
 fn a_copy_that_gave_way_moved_again_moves_nothing() {
     let mut log: OpLog<char> = OpLog::new();
@@ -670,38 +745,4 @@ fn a_copy_that_gave_way_moved_again_moves_nothing() {
     let lost = copies::losses(&log, &all);
     assert_eq!(lost.len(), 1);
     assert_eq!((lost[0].op, lost[0].lost_to), (again[0], Some(inner[0])));
-}
-
-#[test]
-fn scratch_lost_mark() {
-    let mut log: OpLog<char> = OpLog::new();
-    let (a, b) = (log.agent("a"), log.agent("b"));
-    let v0 = log.add_insert(a, &[], 0, ['a']);
-    let mut v = log.add_insert(a, &v0, 0, ['a']);
-    v = log.add_insert(a, &v, 0, ['a']);
-    let v3 = log.add_mark(a, &v, 2, 0);
-    let v4 = log.add_mark(b, &v0, 0, 0);
-    eprintln!(
-        "losses at end: {:?}",
-        copies::losses(&log, &log.union(&v3, &v4))
-    );
-    for order in [[v3.clone(), v4.clone()], [v4.clone(), v3.clone()]] {
-        let mut books = mamre_egg_walker::Accountant::new();
-        for v in &order {
-            let changes = books.merge(&log, v);
-            eprintln!(
-                "merge {:?}: {:?}",
-                v,
-                changes
-                    .iter()
-                    .map(|c| match c {
-                        mamre_egg_walker::Change::Lost { op, .. } => format!("lost {op}"),
-                        mamre_egg_walker::Change::Mark { item, level, .. } =>
-                            format!("mark {item}={level}"),
-                        _ => "edit".into(),
-                    })
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
 }

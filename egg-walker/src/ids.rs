@@ -207,6 +207,11 @@ impl Ids {
         self.runs.summary().0
     }
 
+    /// The items, in order, as runs of consecutive inserts.
+    pub(crate) fn runs(&self) -> impl Iterator<Item = std::ops::Range<Lv>> + '_ {
+        self.runs.iter().map(|r| r.first..r.first + r.len)
+    }
+
     /// The insert the item at `pos` came from.
     pub(crate) fn get(&self, pos: usize) -> Lv {
         let mut cursor = self.runs.cursor::<Count>();
@@ -275,27 +280,27 @@ impl Ids {
         if range.is_empty() || to == range.start || to == range.end {
             return;
         }
-        // The moved runs, in order.
-        self.cut(range.start);
-        self.cut(range.end);
-        let mut moved = Vec::new();
-        let mut cursor = self.runs.cursor::<Count>();
-        cursor.seek(&Count(range.start), Bias::Right);
-        while cursor.start().0 < range.end {
-            let run = *cursor.item().expect("the range is in the document");
-            moved.push(run);
-            cursor.next();
-        }
-        self.remove(range.clone());
-        let mut at = if to > range.start {
-            to - range.len()
+        // Cut out, and spliced back in: whole subtrees, so it costs the
+        // tree's height, not the runs moved.
+        let (lo, mid, hi) = if to < range.start {
+            (to, range.start, range.end)
         } else {
-            to
+            (range.start, range.end, to)
         };
-        for run in moved {
-            self.insert(at, run.first, run.len);
-            at += run.len;
+        for p in [lo, mid, hi] {
+            self.cut(p);
         }
+        let mut cursor = self.runs.cursor::<Count>();
+        let a = cursor.slice(&Count(lo), Bias::Right);
+        let b = cursor.slice(&Count(mid), Bias::Right);
+        let c = cursor.slice(&Count(hi), Bias::Right);
+        let d = cursor.suffix();
+        // [a][b][c][d] becomes [a][c][b][d]: the two middle pieces swap.
+        let mut out = a;
+        for piece in [c, b, d] {
+            join(&mut out, piece);
+        }
+        self.runs = out;
     }
 
     /// Makes `pos` a boundary between runs.
@@ -325,6 +330,17 @@ impl Ids {
                 )
             });
     }
+}
+
+/// `b` after `a`, joining the run where they meet if it carries on.
+fn join(a: &mut SumTree<Run>, mut b: SumTree<Run>) {
+    if let (Some(last), Some(first)) = (a.last().copied(), b.first().copied())
+        && last.first + last.len == first.first
+    {
+        a.update_last(|r| r.len += first.len);
+        b.remove_at::<Count>(&Count(0), Bias::Right);
+    }
+    a.append(b);
 }
 
 #[cfg(test)]
@@ -359,6 +375,40 @@ mod tests {
                 for (k, &lv) in want.iter().enumerate() {
                     prop_assert_eq!(ids.get(k), lv);
                 }
+            }
+        }
+
+        /// Moving runs (spliced as subtrees) keeps the same identities as
+        /// moving them in a plain list, and joins runs that meet.
+        #[test]
+        fn moves_match_a_vec(
+            runs in prop::collection::vec((1usize..5, any::<bool>()), 1..60),
+            moves in prop::collection::vec((any::<prop::sample::Index>(), any::<prop::sample::Index>(), any::<prop::sample::Index>()), 1..40),
+        ) {
+            let mut ids = Ids::default();
+            let mut want: Vec<Lv> = Vec::new();
+            let mut next = 0;
+            for (n, gap) in runs {
+                let first = if gap { next + 1 } else { next };
+                ids.insert(want.len(), first, n);
+                want.extend(first..first + n);
+                next = first + n;
+            }
+            for (a, b, t) in moves {
+                let (a, b) = (a.index(want.len()), b.index(want.len()));
+                let range = a.min(b)..a.max(b) + 1;
+                let to = t.index(want.len() + 1);
+                if to > range.start && to < range.end {
+                    continue;
+                }
+                ids.move_range(range.clone(), to);
+                let moved: Vec<Lv> = want.drain(range.clone()).collect();
+                let at = if to > range.start { to - moved.len() } else { to };
+                want.splice(at..at, moved);
+                ids.runs.check().map_err(TestCaseError::fail)?;
+                prop_assert_eq!(ids.runs().flatten().collect::<Vec<_>>(), want.clone());
+                let runs: Vec<_> = ids.runs().collect();
+                prop_assert!(runs.windows(2).all(|w| w[0].end != w[1].start), "runs that meet are joined: {:?}", runs);
             }
         }
     }

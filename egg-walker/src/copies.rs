@@ -54,7 +54,16 @@
 //! them: something put beside one stays there. Put between two, it goes
 //! with whatever took what they copied: what decides is what the copies
 //! stood for, so typing in a moved section someone else moved too goes
-//! where the winner put it.
+//! where the winner put it. A move dropped for a loop is the exception:
+//! its copies went where the other move took them, not where its author
+//! put them, so something put beside one goes by what it copied instead
+//! (mamre#27).
+//!
+//! That exception is kept to loops on purpose. It could cover every losing
+//! move (replaced, crossing) by counting those moves in `looped`, but that
+//! changes where typing beside a replaced or crossing move's copies lands,
+//! which the losing-move tests pin as "it stays there". Widen it only as a
+//! decision of its own.
 //!
 //! Every move or mark discarded is a [`Loss`]: what was lost, to what, and
 //! where its items are now.
@@ -164,7 +173,9 @@ pub(crate) struct Replay<'a, T> {
     versions: Vec<Vec<bool>>,
     /// Where each event goes, among the active moves it was worked out
     /// for: each depends only on earlier ones, so it's found once.
-    redirects: std::cell::RefCell<(Vec<Ix>, HashMap<Ix, (Spot, Vec<Ix>)>)>,
+    redirects: std::cell::RefCell<(Vec<Ix>, Vec<Ix>, HashMap<Ix, (Spot, Vec<Ix>)>)>,
+    /// The moves dropped for loops, in the layout being built.
+    looped: std::cell::RefCell<Vec<Ix>>,
 }
 
 /// The document drawn at a version.
@@ -281,14 +292,15 @@ impl<'a, T: Clone> Replay<'a, T> {
     fn redirect(&self, x: Ix, active: &[Ix]) -> (Spot, Vec<Ix>) {
         {
             let mut memo = self.redirects.borrow_mut();
-            if memo.0 != active {
-                *memo = (active.to_vec(), HashMap::new());
-            } else if let Some(found) = memo.1.get(&x) {
+            let looped = self.looped.borrow();
+            if memo.0 != active || memo.1 != *looped {
+                *memo = (active.to_vec(), looped.clone(), HashMap::new());
+            } else if let Some(found) = memo.2.get(&x) {
                 return found.clone();
             }
         }
         let found = self.find_redirect(x, active);
-        self.redirects.borrow_mut().1.insert(x, found.clone());
+        self.redirects.borrow_mut().2.insert(x, found.clone());
         found
     }
 
@@ -333,7 +345,23 @@ impl<'a, T: Clone> Replay<'a, T> {
                     let (_, gone) = self.redirect(by, active);
                     gone.iter().any(|&g| !self.past[x][g]).then_some(by)
                 };
-                let mut left = raw.left;
+                // An origin that's a copy made by a move dropped for a
+                // loop stands for what it copied: the copy went where the
+                // other move took it, not where its author put it
+                // (mamre#27). Loops only, on purpose: see the module docs
+                // before widening it to other losing moves.
+                let unloop = |k: Option<Key>| {
+                    let looped = self.looped.borrow();
+                    k.map(|mut k| {
+                        while k >= self.copy_base
+                            && looped.contains(&self.copies[k - self.copy_base].0)
+                        {
+                            k = self.copies[k - self.copy_base].1;
+                        }
+                        k
+                    })
+                };
+                let mut left = unloop(raw.left);
                 while let Some(k) = left {
                     let Some(by) = carried(k) else { break };
                     left = if k >= self.copy_base && k != self.mv(by).first_copy {
@@ -342,7 +370,7 @@ impl<'a, T: Clone> Replay<'a, T> {
                         self.spot(by).left
                     };
                 }
-                let mut right = raw.right;
+                let mut right = unloop(raw.right);
                 while let Some(k) = right {
                     let Some(by) = carried(k) else { break };
                     right = self.spot(by).right;
@@ -454,6 +482,9 @@ impl<'a, T: Clone> Replay<'a, T> {
             let mut losses = Vec::new();
             let skip: HashSet<Ix> = dropped.keys().copied().collect();
             let active = self.active(at, &skip, &mut losses);
+            let mut looped: Vec<Ix> = skip.iter().copied().collect();
+            looped.sort_unstable();
+            *self.looped.borrow_mut() = looped;
             match self.build(at, &active) {
                 Ok(order) => break (active, order, losses),
                 Err(cycle) => {
@@ -867,6 +898,7 @@ fn replay_checked<'a, T: Clone>(
         copies: Vec::new(),
         versions: Vec::with_capacity(n),
         redirects: Default::default(),
+        looped: Default::default(),
     };
     // The document after each event, while a later one still builds on it.
     let mut after: HashMap<Ix, View> = HashMap::new();
@@ -1018,6 +1050,8 @@ impl<T: Clone> Replay<'_, T> {
 
     /// Which delete removed each item gone at `at`, for those the window
     /// deleted: (delete, root).
+    // For the window's debug check against runs.rs.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn deletes_of(&self, at: &[bool]) -> HashMap<Lv, Lv> {
         let deleted = self.deleted(at);
         let mut out = HashMap::new();
@@ -1045,7 +1079,20 @@ impl<T: Clone> Replay<'_, T> {
                     return false;
                 }
                 let inside = |k: Option<Key>| k.is_some_and(|k| mv.set.contains(&k));
+                // A neighbour that's a copy of something the move took.
+                let carried = |k: Option<Key>| {
+                    let Some(mut k) = k else { return false };
+                    while k >= self.copy_base {
+                        k = self.copies[k - self.copy_base].1;
+                        if mv.set.contains(&k) {
+                            return true;
+                        }
+                    }
+                    false
+                };
                 inside(spot.before) != inside(spot.after)
+                    || carried(spot.before)
+                    || carried(spot.after)
                     || mv
                         .sources
                         .iter()
