@@ -77,6 +77,7 @@ pub mod runs;
 #[allow(dead_code)]
 mod simple;
 pub mod sync;
+mod undo;
 mod walk;
 
 pub use accountant::Accountant;

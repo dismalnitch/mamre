@@ -20,6 +20,8 @@
 //! Characters are named as `{"agent": "…", "seq": n}` in side data, not by
 //! the core log's back references: side data stands alone.
 
+use std::collections::BTreeMap;
+
 use mamre::codec::{DecodeError, get_str, put_str};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -62,11 +64,16 @@ pub(crate) fn get_trailing<V: DeserializeOwned + Default>(
     Ok(side)
 }
 
-/// What a chunk carries beside its runs. Nothing yet: undo steps (#14)
-/// come next. Written only when there's something in it.
+/// What a chunk carries beside its runs. Written only when there's
+/// something in it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-pub(crate) struct ChunkExt {}
+pub(crate) struct ChunkExt {
+    /// Where undo steps end (#14): for each agent, by name, the seqs of
+    /// the events that end its steps, in order.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) steps: BTreeMap<String, Vec<u64>>,
+}
 
 impl ChunkExt {
     pub(crate) fn is_empty(&self) -> bool {
@@ -105,16 +112,16 @@ mod tests {
 
     #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
     struct Later {
-        steps: Vec<u64>,
+        later: Vec<u64>,
     }
 
     #[test]
     fn json_round_trips() {
         let mut out = Vec::new();
-        put_json(&mut out, &Later { steps: vec![3, 9] });
+        put_json(&mut out, &Later { later: vec![3, 9] });
         assert_eq!(out[0], JSON);
         let mut input = &out[..];
-        assert_eq!(get_json::<Later>(&mut input), Ok(Later { steps: vec![3, 9] }));
+        assert_eq!(get_json::<Later>(&mut input), Ok(Later { later: vec![3, 9] }));
         assert!(input.is_empty());
     }
 
@@ -122,14 +129,14 @@ mod tests {
     #[test]
     fn fields_a_reader_doesnt_know_are_ignored() {
         let mut out = Vec::new();
-        put_json(&mut out, &Later { steps: vec![1] });
-        assert_eq!(get_json::<ChunkExt>(&mut &out[..]), Ok(ChunkExt {}));
+        put_json(&mut out, &Later { later: vec![1] });
+        assert_eq!(get_json::<ChunkExt>(&mut &out[..]), Ok(ChunkExt::default()));
     }
 
     #[test]
     fn another_format_is_refused() {
         let mut out = Vec::new();
-        put_json(&mut out, &ChunkExt {});
+        put_json(&mut out, &ChunkExt::default());
         out[0] = 2;
         assert!(get_json::<ChunkExt>(&mut &out[..]).is_err());
     }

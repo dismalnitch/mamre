@@ -22,13 +22,18 @@
 //!             3 move:     pos, count, to   (one event: moves don't run)
 //!             4 mark:     pos, level       (one event)
 //!             (other kinds are reserved for other kinds of event)
+//! extension = what the chunk carries beside its runs, as JSON (see
+//!             `ext.rs`); only when there's something in it. So far:
+//!             "steps" (#14): for each agent, by name, the seqs where its
+//!             steps end, in order. The ends listed are those of the
+//!             agent's events in the chunk, and the one just before them
+//!             (a step left open by the last save, closed since). An
+//!             agent's events after its last end are an open step.
 //! target    = varint, never 0. With no target, a run edits the document's
 //!             text, so text costs nothing for this. Other structures (ink,
 //!             comments) share the log, so they share its one order and one
 //!             undo history; this version knows none, and refuses a chunk
 //!             that edits one, since a later event could depend on it.
-//! extension = what the chunk carries beside its runs, as JSON (see
-//!             `ext.rs`); only when there's something in it
 //! ref       = varint v:
 //!             v even: an event in this chunk, v / 2 events before this
 //!                     run's first
@@ -49,7 +54,7 @@
 //! an event's position fits its document is left to the walk (adversarial
 //! peers are M4's later work).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
 use mamre::codec::{
@@ -228,10 +233,32 @@ impl<T: Clone + Codec> OpLog<T> {
         for piece in &pieces {
             writer.put_run(out, piece, &mut seqs);
         }
-        let side = ChunkExt::default();
+        let steps = self.chunk_steps(&pieces, &agents);
+        let side = ChunkExt { steps };
         if !side.is_empty() {
             ext::put_json(out, &side);
         }
+    }
+
+    /// The step ends of the chunk's events (and the one just before each
+    /// agent's first, a step left open by the last save), by agent name:
+    /// what the chunk's extension carries for #14. Mirrors [`get_steps`].
+    fn chunk_steps(&self, pieces: &[Piece], agents: &AgentTable) -> BTreeMap<String, Vec<u64>> {
+        let mut steps: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+        for (r, range) in pieces {
+            let run = &self.runs[*r];
+            let first = run.seq + (range.start - run.start) as u64;
+            let last = first + range.len() as u64 - 1;
+            let ends = &self.step_ends[run.agent.index()];
+            let found: Vec<u64> = ends.range(first.saturating_sub(1)..=last).copied().collect();
+            if !found.is_empty() {
+                steps
+                    .entry(self.agent_name(agents.agents[agents.index[&run.agent]]).to_string())
+                    .or_default()
+                    .extend(found);
+            }
+        }
+        steps.into_iter().map(|(name, ends)| (name, ends.into_iter().collect())).collect()
     }
 
     /// The stretches of runs in `spans`, in order.
@@ -302,16 +329,27 @@ impl<T: Clone + Codec> OpLog<T> {
     /// to events this log doesn't have, nothing is added.
     pub fn decode_chunk(&mut self, mut bytes: &[u8]) -> Result<usize, DecodeError> {
         let input = &mut bytes;
-        let (names, runs, _side) = parse_chunk::<T>(input)?;
+        let (names, runs, side) = parse_chunk::<T>(input)?;
+        let steps = get_steps(&side, &names)?;
         let mut planner = Planner::new(self, &names);
         let mut planned = Vec::new();
         for run in runs {
             planned.extend(planner.plan_run(run)?);
         }
+        // A step ends at an event this log has, or the chunk brings.
+        for (agent, ends) in &steps {
+            if ends.iter().any(|&e| e >= planner.next_seq[*agent]) {
+                return Err(DecodeError::Invalid("a step end past the agent's events"));
+            }
+        }
         let next = planner.next;
         let added = next - self.len();
         self.apply(&names, planned);
         debug_assert_eq!(self.len(), next, "planned numbering");
+        for (agent, ends) in steps {
+            let id = self.agent(&names[agent]);
+            self.step_ends[id.index()].extend(ends);
+        }
         Ok(added)
     }
 
@@ -680,7 +718,7 @@ pub(crate) fn dump_chunk<T: Codec + serde::Serialize>(
         let op = match &run.op {
             RawOp::Insert { pos, items } => json!({"insert": {"pos": pos, "items": items_json(items)}}),
             RawOp::Delete { pos, len } => json!({"delete": {"pos": pos, "count": len}}),
-            RawOp::Undelete { targets } => json!({"undelete": {
+            RawOp::Undo { targets } => json!({"undo": {
                 "targets": targets.iter().map(spell).collect::<Result<Vec<_>, _>>()?
             }}),
             RawOp::Move { pos, len, to } => json!({"move": {"pos": pos, "count": len, "to": to}}),
@@ -708,6 +746,24 @@ pub(crate) fn items_json<T: serde::Serialize>(items: &[T]) -> serde_json::Value 
         Some(text) if !items.is_empty() => serde_json::Value::String(text),
         _ => value,
     }
+}
+
+/// The step ends a chunk carries, checked against its agents: each named
+/// in the chunk, in order. Mirrors [`OpLog::chunk_steps`].
+fn get_steps(side: &ChunkExt, names: &[String]) -> Result<Vec<(usize, Vec<u64>)>, DecodeError> {
+    side.steps
+        .iter()
+        .map(|(name, ends)| {
+            let agent = names
+                .iter()
+                .position(|n| n == name)
+                .ok_or(DecodeError::Invalid("step ends for an agent the chunk doesn't name"))?;
+            if !ends.windows(2).all(|w| w[0] < w[1]) {
+                return Err(DecodeError::Invalid("step ends out of order"));
+            }
+            Ok((agent, ends.clone()))
+        })
+        .collect()
 }
 
 /// Reads the compression byte: only 0, none, so far.
