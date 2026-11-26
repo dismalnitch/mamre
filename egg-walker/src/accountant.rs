@@ -21,6 +21,7 @@ use mamre::codec::{DecodeError, get_usize, put_usize};
 
 use crate::anchors::Anchors;
 use crate::blocks::Blocks;
+use crate::ext::{Ghost, SnapshotExt};
 use crate::ids::Identities;
 use crate::oplog::{Lv, OpLog};
 use crate::outline::{Ambiguity, Next, Outline, Policies, Policy, Section};
@@ -211,8 +212,28 @@ impl Accountant {
         self.blocks.encode(out);
     }
 
+    /// What the books carry beside their bytes: side data, written as
+    /// JSON after them (see `ext.rs`).
+    pub(crate) fn side(&self) -> SnapshotExt {
+        SnapshotExt {
+            ghosts: self
+                .outline
+                .ghosts()
+                .into_iter()
+                .map(|(item, place)| Ghost { item, place })
+                .collect(),
+        }
+    }
+
+    /// Puts back what [`side`](Self::side) took out, after
+    /// [`decode`](Self::decode).
+    pub(crate) fn apply_side(&mut self, side: &SnapshotExt) -> Result<(), DecodeError> {
+        let ghosts: Vec<(Lv, usize)> = side.ghosts.iter().map(|g| (g.item, g.place)).collect();
+        self.outline.place_ghosts(&ghosts)
+    }
+
     /// Reads books [`encode`](Self::encode) wrote, for a log of `events`
-    /// events.
+    /// events. Side data comes after: [`apply_side`](Self::apply_side).
     pub(crate) fn decode(input: &mut &[u8], events: usize) -> Result<Self, DecodeError> {
         let n = get_usize(input)?;
         let mut version = Vec::with_capacity(n.min(input.len()));
@@ -280,7 +301,11 @@ mod outline_tests {
         books.merge(&log, &v);
         let mut bytes = Vec::new();
         books.encode(&mut bytes);
-        let back = Accountant::decode(&mut bytes.as_slice(), log.len()).unwrap();
+        let mut back = Accountant::decode(&mut bytes.as_slice(), log.len()).unwrap();
+        // The ghost goes beside the books, as JSON.
+        let side = serde_json::to_string(&books.side()).unwrap();
+        assert_eq!(side, r#"{"ghosts":[{"item":4,"place":4}]}"#);
+        back.apply_side(&serde_json::from_str(&side).unwrap()).unwrap();
         assert_eq!(back.sections(), books.sections());
         assert_eq!(back.level(4), 1, "a deleted item keeps its mark");
         // And its section, headless, at its place (#19).
