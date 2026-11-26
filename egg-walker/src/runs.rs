@@ -207,6 +207,8 @@ struct Active {
     some_off: bool,
     /// The moves dropped for loops, sorted.
     looped: Vec<Ix>,
+    /// Which redirects it was given (see [`Redirects`]).
+    stamp: u64,
 }
 
 impl Active {
@@ -224,6 +226,7 @@ impl Active {
             rank,
             some_off,
             looped: Vec::new(),
+            stamp: 0,
         }
     }
 }
@@ -393,10 +396,49 @@ impl Linked {
         let lo = self.label_or(self.prev[n], 0);
         let hi = self.label_or(self.next[n], u64::MAX);
         if hi - lo < 2 {
-            self.relabel();
+            self.relabel_around(n);
         } else {
             self.label[n] = lo + (hi - lo) / 2;
         }
+    }
+
+    /// Makes room for `n` (linked, unlabelled) by spacing out the labels
+    /// of the smallest stretch around it that isn't crowded: an aligned
+    /// range of 2^i labels may hold up to (2 / 1.5)^i nodes. Relabelling
+    /// everything each time the halving runs out, as nested moves make it
+    /// do at one spot, cost the window's runs every 64 inserts (#29);
+    /// this costs O(log n) amortized (Bender et al.'s order maintenance).
+    fn relabel_around(&mut self, n: usize) {
+        let base = self.label_or(self.prev[n], 0);
+        // The nodes labelled in the range either side of `n`, grown level by
+        // level: each level's range holds the last's.
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        let (mut l_at, mut r_at) = (self.prev[n], self.next[n]);
+        for i in 1..=64u32 {
+            let size: u128 = 1u128 << i;
+            let lo = (base as u128) & !(size - 1);
+            let hi = lo + size - 1;
+            while l_at != NIL && (self.label[l_at] as u128) >= lo && self.label[l_at] > 0 {
+                left.push(l_at);
+                l_at = self.prev[l_at];
+            }
+            while r_at != NIL && (self.label[r_at] as u128) <= hi && self.label[r_at] < u64::MAX {
+                right.push(r_at);
+                r_at = self.next[r_at];
+            }
+            let count = left.len() + right.len() + 1;
+            if (count as f64) * 1.5f64.powi(i as i32) > size as f64 || size < (count as u128 + 1) {
+                continue;
+            }
+            let step = size / (count as u128 + 1);
+            let mut l = lo + step;
+            for &x in left.iter().rev().chain([n].iter()).chain(right.iter()) {
+                self.label[x] = l as u64;
+                l += step;
+            }
+            return;
+        }
+        self.relabel();
     }
 
     fn order(&self) -> Vec<Key> {
@@ -411,7 +453,17 @@ impl Linked {
 }
 
 /// Where each event goes, among the active moves it was worked out for.
-type Redirects = (Vec<Ix>, Vec<Ix>, HashMap<Ix, (Spot, Vec<Ix>)>);
+/// Where events go (see `redirect`), for the standing moves `list` (and
+/// those dropped for loops), stamped `stamp`: checking a stamp costs nothing,
+/// where comparing the lists cost the moves, on every one of the window's
+/// redirects (#29).
+#[derive(Default)]
+struct Redirects {
+    stamp: u64,
+    list: Vec<Ix>,
+    looped: Vec<Ix>,
+    found: HashMap<Ix, (Spot, Vec<Ix>)>,
+}
 
 pub(crate) use crate::copies::Unsupported;
 
@@ -718,17 +770,33 @@ impl<'a, T: Clone> Replay<'a, T> {
         }
     }
 
+    /// Gives `act` the redirects already found for the same moves, or a
+    /// fresh stamp: once for each set of standing moves.
+    fn stamp(&self, act: &mut Active) {
+        let mut memo = self.redirects.borrow_mut();
+        if memo.stamp == 0 || memo.list != act.list || memo.looped != act.looped {
+            memo.stamp += 1;
+            memo.list.clone_from(&act.list);
+            memo.looped.clone_from(&act.looped);
+            memo.found.clear();
+        }
+        act.stamp = memo.stamp;
+    }
+
     fn redirect(&self, x: Ix, act: &Active) -> (Spot, Vec<Ix>) {
-        {
-            let mut memo = self.redirects.borrow_mut();
-            if memo.0 != act.list || memo.1 != act.looped {
-                *memo = (act.list.clone(), act.looped.clone(), HashMap::new());
-            } else if let Some(found) = memo.2.get(&x) {
+        let current = {
+            let memo = self.redirects.borrow();
+            if memo.stamp == act.stamp
+                && let Some(found) = memo.found.get(&x)
+            {
                 return found.clone();
             }
-        }
+            memo.stamp == act.stamp
+        };
         let found = self.find_redirect(x, act);
-        self.redirects.borrow_mut().2.insert(x, found.clone());
+        if current {
+            self.redirects.borrow_mut().found.insert(x, found.clone());
+        }
         found
     }
 
@@ -906,6 +974,7 @@ impl<'a, T: Clone> Replay<'a, T> {
             let mut act = Active::new(self.active(at, &skip, &mut losses), self.n(), moves);
             act.looped = skip.iter().copied().collect();
             act.looped.sort_unstable();
+            self.stamp(&mut act);
             match self.build(at, &act) {
                 Ok(layout) => break (act, layout, losses),
                 Err(cycle) => {
