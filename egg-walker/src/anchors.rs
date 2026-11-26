@@ -291,21 +291,20 @@ impl Anchors {
     }
 
     /// Appends these anchors' bytes: the tail, each visible mark's item
-    /// and gap in order, the parked items (ghosts among them), then the
-    /// ghosts in order, each its item and its place (delta from the last
-    /// ghost's). Order keys are the tree's own, made afresh on load.
+    /// and gap in order, and the parked items (ghosts among them). Order
+    /// keys are the tree's own, made afresh on load. Ghosts' places are
+    /// side data, written as JSON beside the books: see
+    /// [`ghosts`](Self::ghosts).
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         // The visible marks as if there were no ghosts: a ghost's gap goes
         // to the next visible mark's, or the tail.
         let mut shown = Vec::new();
-        let mut ghosts = Vec::new();
         let (mut pos, mut gap) = (0, 0);
         for m in self.marks.items() {
             let at = pos + m.before;
             gap += m.before;
             debug_assert!(!m.left, "only anchors rebuilt from the log stick left");
             if m.ghost {
-                ghosts.push((m.item, at));
                 pos = at;
             } else {
                 shown.push((m.item, gap));
@@ -325,13 +324,42 @@ impl Anchors {
             put_usize(out, item - prev);
             prev = item;
         }
-        put_usize(out, ghosts.len());
-        let mut place = 0;
-        for (item, at) in ghosts {
-            put_usize(out, item);
-            put_usize(out, at - place);
-            place = at;
+    }
+
+    /// Each ghost and its place, in order: what [`encode`](Self::encode)
+    /// leaves out, for [`place_ghosts`](Self::place_ghosts) to put back.
+    pub(crate) fn ghosts(&self) -> Vec<(Lv, usize)> {
+        let mut ghosts = Vec::new();
+        let mut pos = 0;
+        for m in self.marks.items() {
+            let at = pos + m.before;
+            if m.ghost {
+                ghosts.push((m.item, at));
+                pos = at;
+            } else {
+                pos = at + 1;
+            }
         }
+        ghosts
+    }
+
+    /// Puts back the ghosts [`ghosts`](Self::ghosts) listed, after
+    /// [`decode`](Self::decode): each must be a parked item, and fit.
+    pub(crate) fn place_ghosts(&mut self, ghosts: &[(Lv, usize)]) -> Result<(), DecodeError> {
+        let mut last = 0;
+        for &(item, place) in ghosts {
+            if place < last
+                || !self.parked.contains(&item)
+                || self.keys.contains_key(&item)
+                || place > self.len()
+            {
+                return Err(DecodeError::Invalid("a ghost anchor that can't be"));
+            }
+            self.fallback = true;
+            self.place_ghost(place, item);
+            last = place;
+        }
+        Ok(())
     }
 
     /// Reads anchors [`encode`](Self::encode) wrote, for a log of `events`
@@ -376,22 +404,6 @@ impl Anchors {
             }
             anchors.parked.insert(item);
             prev = item;
-        }
-        let n = get_usize(input)?;
-        let mut place: usize = 0;
-        for _ in 0..n {
-            let item = get_usize(input)?;
-            place = place
-                .checked_add(get_usize(input)?)
-                .ok_or(DecodeError::Overflow)?;
-            if !anchors.parked.contains(&item)
-                || anchors.keys.contains_key(&item)
-                || place > anchors.len()
-            {
-                return Err(DecodeError::Invalid("a ghost anchor that can't be"));
-            }
-            anchors.fallback = true;
-            anchors.place_ghost(place, item);
         }
         Ok(anchors)
     }
@@ -842,7 +854,8 @@ mod fallback_tests {
                 }
                 let mut bytes = Vec::new();
                 a.encode(&mut bytes);
-                let back = Anchors::decode(&mut bytes.as_slice(), 1000).unwrap();
+                let mut back = Anchors::decode(&mut bytes.as_slice(), 1000).unwrap();
+                back.place_ghosts(&a.ghosts()).unwrap();
                 prop_assert_eq!(back.len(), a.len());
                 for &(item, pos, ghost) in &want {
                     prop_assert_eq!(back.place_of(item), Some(pos));

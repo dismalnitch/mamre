@@ -6,6 +6,9 @@
 //! - `Rope<Prose>`: words and paragraphs.
 //! - `Rope<Sections>`: markdown headings, for an outline.
 //! - `Rope<Markdown>`, which is `Rope<(Prose, Sections)>`: both.
+//! - `Rope<Motions>`: vim's words, sentences and paragraphs, for motions.
+//! - `Rope<Units>`, which is `Rope<(Prose, Motions)>`: every unit but
+//!   markdown's sections, for prose that's counted and moved through.
 //!
 //! What's counted is what can be found by number, far away, in O(log n):
 //! "paragraph 4,213", "which section is this". Every [`Unit`] can be found
@@ -137,6 +140,53 @@ impl Measure for Prose {
 /// Prose and sections: the counts a markdown document's editor wants.
 pub type Markdown = (Prose, Sections);
 
+/// Vim's word (`w`), sentence (`(` `)`) and paragraph (`{` `}`): what vim
+/// motions seek by, counted so a count (`500}`) costs what one does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Motions {
+    vim_word: Scan<3>,
+    sentence: Scan<4>,
+    vim_paragraph: Scan<4>,
+}
+
+impl Measure for Motions {
+    fn empty() -> Self {
+        Motions {
+            vim_word: Scan::identity(),
+            sentence: Scan::identity(),
+            vim_paragraph: Scan::identity(),
+        }
+    }
+
+    fn measure(text: &str) -> Self {
+        Motions {
+            vim_word: Scan::of(text, Unit::VimWord),
+            sentence: Scan::of(text, Unit::Sentence),
+            vim_paragraph: Scan::of(text, Unit::VimParagraph),
+        }
+    }
+
+    fn concat(&mut self, next: &Self) {
+        self.vim_word = self.vim_word.then(&next.vim_word);
+        self.sentence = self.sentence.then(&next.sentence);
+        self.vim_paragraph = self.vim_paragraph.then(&next.vim_paragraph);
+    }
+
+    fn unit(&self, unit: Unit) -> Option<UnitState> {
+        let start = unit.start_state();
+        match unit {
+            Unit::VimWord => Some(self.vim_word.from(start)),
+            Unit::Sentence => Some(self.sentence.from(start)),
+            Unit::VimParagraph => Some(self.vim_paragraph.from(start)),
+            _ => None,
+        }
+    }
+}
+
+/// Every unit but markdown's sections: words, vim's words, sentences, and
+/// both kinds of paragraph.
+pub type Units = (Prose, Motions);
+
 #[cfg(test)]
 pub(crate) mod tests {
     use proptest::prelude::*;
@@ -203,6 +253,20 @@ pub(crate) mod tests {
                 sum.concat(&md(&text[range]));
             }
             prop_assert_eq!(sum, md(&text));
+        }
+
+        /// Every unit's count agrees with the slow ranges, measured across
+        /// any split.
+        #[test]
+        fn units_count_every_unit(text in text(), cuts in prop::collection::vec(any::<u16>(), 0..6)) {
+            let mut sum = Units::empty();
+            for range in pieces(&text, &cuts) {
+                sum.concat(&Units::measure(&text[range]));
+            }
+            prop_assert_eq!(sum, Units::measure(&text));
+            for unit in [Unit::Word, Unit::VimWord, Unit::Sentence, Unit::Paragraph, Unit::VimParagraph] {
+                prop_assert_eq!(sum.unit(unit).unwrap().starts, unit.ranges(&text).len(), "{:?}", unit);
+            }
         }
 
         /// The counts agree with the slow, one-pass ranges.

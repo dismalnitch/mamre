@@ -61,6 +61,7 @@ mod blocks;
 #[doc(hidden)]
 pub mod copies;
 mod encode;
+mod ext;
 pub mod file;
 mod ids;
 mod key;
