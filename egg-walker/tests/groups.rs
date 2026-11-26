@@ -279,6 +279,9 @@ fn step_ends_round_trip_in_chunks() {
     // ...and closed by the next chunk.
     let mut second = Vec::new();
     log.encode_chunk(4..log.len(), &mut second);
+    // Readable as they're written: each agent's step ends, by name.
+    assert!(first.ends_with(br#"{"steps":{"w":[1]}}"#));
+    assert!(second.ends_with(br#"{"steps":{"w":[3]}}"#));
     let mut back = OpLog::<char>::new();
     assert_eq!(back.decode_chunk(&first), Ok(4));
     let b = back.agent("w");
@@ -293,12 +296,18 @@ fn step_ends_round_trip_in_chunks() {
     let mut bytes = Vec::new();
     plain.encode_chunk(0..1, &mut bytes);
     assert_eq!(bytes, [0, 1, 1, b'p', 1, 0, 0, 0, 0, 0, 1, 1, b'x']);
-    // A step end past the agent's events is refused.
-    let mut bad = bytes.clone();
-    bad.extend([1, 0, 1, 5]);
-    assert!(OpLog::<char>::new().decode_chunk(&bad).is_err());
-    let mut good = bytes;
-    good.extend([1, 0, 1, 0]);
+    // Step ends go beside the runs as JSON: a format byte (1), then the
+    // JSON's length and text. One past the agent's events is refused.
+    let with = |json: &str| {
+        let mut out = bytes.clone();
+        out.push(1);
+        out.push(json.len() as u8);
+        out.extend(json.bytes());
+        out
+    };
+    assert!(OpLog::<char>::new().decode_chunk(&with(r#"{"steps":{"p":[5]}}"#)).is_err());
+    assert!(OpLog::<char>::new().decode_chunk(&with(r#"{"steps":{"q":[0]}}"#)).is_err());
+    let good = with(r#"{"steps":{"p":[0]}}"#);
     let mut back = OpLog::<char>::new();
     assert_eq!(back.decode_chunk(&good), Ok(1));
     let p = back.agent("p");
