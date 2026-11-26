@@ -34,7 +34,14 @@ pub(crate) fn place<P: Placed>(
 ) -> usize {
     let len = list.len() as isize;
     let left_at = left.map_or(-1, |l| index_of(l) as isize);
-    let right_at = right.map_or(len, |r| index_of(r) as isize);
+    // A right origin laid out before the left one (moves' rules can map an
+    // origin far off: see `copies.rs`) says nothing: as if there were none.
+    // Then every pair of origins is in order, and where an item lands
+    // doesn't depend on the order things were laid out in.
+    let right_at = right
+        .map(|r| index_of(r) as isize)
+        .filter(|&r| r > left_at)
+        .unwrap_or(len);
 
     let mut dest = left_at + 1;
     let mut scanning = false;
@@ -48,7 +55,11 @@ pub(crate) fn place<P: Placed>(
         }
         let other = &list[i as usize];
         let other_left = other.left().map_or(-1, |l| index_of(l) as isize);
-        let other_right = other.right().map_or(len, |r| index_of(r) as isize);
+        let other_right = other
+            .right()
+            .map(|r| index_of(r) as isize)
+            .filter(|&r| r > other_left)
+            .unwrap_or(len);
 
         // Its left origin is before ours: we're past the items that could
         // go before us.
