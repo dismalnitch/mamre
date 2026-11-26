@@ -136,3 +136,23 @@ mod tests {
         assert!(get_json::<ChunkExt>(&mut &out[..]).is_err());
     }
 }
+
+/// An event, named for side data: its agent's name and seq.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Named {
+    pub(crate) agent: String,
+    pub(crate) seq: u64,
+}
+
+/// An aside event (see [`Aside`](crate::Aside)) as a chunk carries it:
+/// JSON in its run, after the kind. Events it names are named in full.
+/// A variant a reader doesn't know is refused, as an unknown event kind
+/// is: a later event could depend on it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum AsideJson {
+    /// A range from `start` to `end` (inserts, both included), tagged.
+    RangeAdd { start: Named, end: Named, tag: String },
+    /// A range's tag set, or the range removed (`null`).
+    RangeSet { range: Named, tag: Option<String> },
+}

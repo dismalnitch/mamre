@@ -171,15 +171,68 @@ fn ranges_undo_with_their_group() {
     );
 }
 
+/// Range events go in chunks as JSON in their runs, naming characters by
+/// agent and seq: they read back as the same events, in one chunk or
+/// split across two.
 #[test]
-#[should_panic(expected = "until their encoding is decided")]
-fn a_chunk_with_a_range_is_refused_until_its_encoding_is_decided() {
+fn ranges_round_trip_in_chunks() {
+    let mut log = OpLog::new();
+    let a = log.agent("alice");
+    let v = log.add_insert(a, &[], 0, "abc".chars());
+    let v = log.add_range(a, &v, 0, 2, "POV: Ann");
+    let id = v[0];
+    let v = log.set_range(a, &v, id, Some("flashback"));
+    log.set_range(a, &v, id, None);
+    let mut all = Vec::new();
+    log.encode_chunk(0..log.len(), &mut all);
+    let text = String::from_utf8_lossy(&all);
+    assert!(text.contains(
+        r#"{"range_add":{"start":{"agent":"alice","seq":0},"end":{"agent":"alice","seq":2},"tag":"POV: Ann"}}"#
+    ), "{text}");
+    assert!(text.contains(r#"{"range_set":{"range":{"agent":"alice","seq":3},"tag":null}}"#));
+    let same = |back: &OpLog<char>| {
+        for lv in 0..log.len() {
+            assert_eq!(format!("{:?}", back.event(lv)), format!("{:?}", log.event(lv)));
+        }
+    };
+    let mut back = OpLog::<char>::new();
+    assert_eq!(back.decode_chunk(&all), Ok(log.len()));
+    same(&back);
+    // Split: the range set names a range from the chunk before.
+    let (mut one, mut two) = (Vec::new(), Vec::new());
+    log.encode_chunk(0..4, &mut one);
+    log.encode_chunk(4..log.len(), &mut two);
+    let mut back = OpLog::<char>::new();
+    assert_eq!(back.decode_chunk(&one), Ok(4));
+    assert_eq!(back.decode_chunk(&two), Ok(2));
+    same(&back);
+}
+
+/// A range event naming what it can't is refused, and nothing is added.
+#[test]
+fn a_range_naming_what_it_cant_is_refused() {
     let mut log = OpLog::new();
     let a = log.agent("a");
     let v = log.add_insert(a, &[], 0, "ab".chars());
     log.add_range(a, &v, 0, 1, "t");
-    let mut out = Vec::new();
-    log.encode_chunk(0..log.len(), &mut out);
+    let mut good = Vec::new();
+    log.encode_chunk(0..log.len(), &mut good);
+    let swap = |from: &str, to: &str| {
+        // The JSON's length is one byte here, so keep it the same length.
+        assert_eq!(from.len(), to.len());
+        let text = String::from_utf8_lossy(&good).replace(from, to);
+        text.into_bytes()
+    };
+    for (from, to, why) in [
+        (r#""seq":1}"#, r#""seq":7}"#, "an end this log doesn't have"),
+        (r#""seq":1}"#, r#""seq":2}"#, "an end that's the range itself"),
+        (r#""agent":"a","seq":0"#, r#""agent":"z","seq":0"#, "an agent nobody has"),
+        ("range_add", "range_zzz", "an aside this version doesn't know"),
+    ] {
+        let mut back = OpLog::<char>::new();
+        assert!(back.decode_chunk(&swap(from, to)).is_err(), "{why}");
+        assert_eq!(back.len(), 0, "{why}");
+    }
 }
 
 // ---- Many writers ----
@@ -323,5 +376,11 @@ proptest! {
         };
         prop_assert_eq!(pick(&ws[0]), pick(&ws[1]));
         prop_assert_eq!(pick(&ws[1]), pick(&ws[2]));
+        // And the whole history through a chunk: the same events.
+        let mut bytes = Vec::new();
+        log.encode_chunk(0..log.len(), &mut bytes);
+        let mut back = OpLog::<char>::new();
+        prop_assert_eq!(back.decode_chunk(&bytes), Ok(log.len()));
+        prop_assert_eq!(ranges::reference(&back, &all), ranges::reference(&log, &all));
     }
 }
