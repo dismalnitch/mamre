@@ -167,6 +167,7 @@ fn events(log: &OpLog<char>) -> Events {
                 Op::Undelete { target } => format!("undel {:?}", stable(target)),
                 Op::Move { pos, len, to } => format!("move {pos} {len} {to}"),
                 Op::Mark { pos, level } => format!("mark {pos} {level}"),
+                Op::Undo { target } => format!("undo {:?}", stable(target)),
             };
             (stable(lv), parents, op)
         })

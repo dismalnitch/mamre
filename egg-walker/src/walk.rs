@@ -670,7 +670,9 @@ impl<T: Clone> OpLog<T> {
                                 }
                                 out.delete_run(pos, n)
                             }
-                            Op::Undelete { .. } => unreachable!("an undelete is never critical"),
+                            Op::Undelete { .. } | Op::Undo { .. } => {
+                                unreachable!("an undo is never critical")
+                            }
                             Op::Move { .. } => {
                                 unreachable!("a log with moves takes the moves path")
                             }
@@ -817,13 +819,13 @@ impl<T: Clone> OpLog<T> {
             .collect();
         let critical = self.critical_points(&order, &old, &new, &base);
         let mut critical = critical.iter().peekable();
-        // Deletes an undo in the replay brings back: the window must start
-        // before them, where their items still show.
+        // Deletes an undo in the replay brings back, and moves one cancels:
+        // the window must start before them, where their items still show
+        // (or show where they were).
         let revived: HashSet<Lv> = order
             .iter()
             .flat_map(|(span, _)| span.clone())
-            .filter(|&lv| matches!(self.op(lv), Op::Undelete { .. }))
-            .map(|lv| self.undeleted(lv))
+            .filter_map(|lv| self.needs_replayed(lv))
             .collect();
         let old_len: usize = old.iter().map(|span| span.len()).sum();
         // Where the window starts, if it hasn't, and whether the books so
@@ -893,7 +895,7 @@ impl<T: Clone> OpLog<T> {
                 }
                 out.delete_run(pos, n);
             }
-            Op::Undelete { .. } => unreachable!("an undelete is never critical"),
+            Op::Undelete { .. } | Op::Undo { .. } => unreachable!("an undo is never critical"),
             Op::Mark { pos, level } => {
                 let item = out.ids.as_ref().expect("kept for marks").get(pos);
                 out.mark(item, Some(pos), level);
@@ -997,15 +999,15 @@ impl<T: Clone> OpLog<T> {
         }
         // Never at an undelete, nor anywhere from the delete it undoes to
         // it: a fresh start forgets the records, and the item it brings
-        // back must still have one.
+        // back must still have one. The same for an undo, from the move it
+        // undoes (#30).
         let mut forbidden: Vec<Range<usize>> = Vec::new();
         let mut at = 0;
         for (span, _) in order {
-            if self.kind(span.start) == Kind::Undelete {
+            if matches!(self.kind(span.start), Kind::Undelete | Kind::Undo) {
                 for (k, u) in span.clone().enumerate() {
-                    let d = self.undeleted(u);
-                    let from =
-                        replayed_at(d, at + k).expect("a merge replays an undelete's delete");
+                    let d = self.needs_replayed(u).expect("an undo needs something");
+                    let from = replayed_at(d, at + k).expect("a merge replays what an undo needs");
                     forbidden.push(from..at + k + 1);
                 }
             }
@@ -1063,7 +1065,9 @@ impl<'a, T: Clone> Walk<'a, T> {
             Op::Insert { pos, .. } => self.insert(lv, pos, out),
             Op::Delete { pos } => self.delete(lv, pos, out),
             Op::Undelete { target } => self.undelete(target, out),
-            Op::Move { .. } => unreachable!("a log with moves takes the moves path"),
+            Op::Move { .. } | Op::Undo { .. } => {
+                unreachable!("a log with moves takes the moves path")
+            }
             Op::Mark { pos, level } => self.mark(lv, pos, level, out),
         }
         self.prepared = vec![lv];
@@ -1089,7 +1093,7 @@ impl<'a, T: Clone> Walk<'a, T> {
                 true
             }
             // One at a time.
-            Kind::Undelete | Kind::Move | Kind::Mark => false,
+            Kind::Undelete | Kind::Move | Kind::Mark | Kind::Undo => false,
         };
         if done {
             self.replayed += n - 1;

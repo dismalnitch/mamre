@@ -28,6 +28,7 @@ pub(crate) enum Kind {
     Undelete,
     Move,
     Mark,
+    Undo,
 }
 
 /// A local version: an event's number in this log. Parents always have
@@ -65,6 +66,13 @@ pub enum Op<T> {
     /// unmarks it. The mark is the item's, wherever it goes; the latest
     /// mark of an item wins (see `reference.rs`).
     Mark { pos: usize, level: u8 },
+    /// Undoes `target`, an earlier event this one includes: a move, or an
+    /// undo of one (#30). A move is cancelled while an undo of it is in
+    /// force: its originals come back where they were, its copies go. An
+    /// undo is in force unless an undo of it is: so a redo is an undo of
+    /// the undo, and brings back the same copies. (Deletes are undone by
+    /// [`Op::Undelete`]; in a chunk, both are kind 2.)
+    Undo { target: Lv },
 }
 
 /// One event, as a log hands it out.
@@ -104,6 +112,8 @@ pub(crate) enum RunOp<T> {
     Move { pos: usize, len: usize, to: usize },
     /// One mark: marks don't run together either.
     Mark { pos: usize, level: u8 },
+    /// One undo of a move, or of an undo of one.
+    Undo { target: Lv },
 }
 
 impl<T> Run<T> {
@@ -111,7 +121,7 @@ impl<T> Run<T> {
         match &self.op {
             RunOp::Insert { items, .. } => items.len(),
             RunOp::Delete { len, .. } | RunOp::Undelete { len, .. } => *len,
-            RunOp::Move { .. } | RunOp::Mark { .. } => 1,
+            RunOp::Move { .. } | RunOp::Mark { .. } | RunOp::Undo { .. } => 1,
         }
     }
 
@@ -188,7 +198,8 @@ impl<T: Clone> OpLog<T> {
             RunOp::Delete { .. }
             | RunOp::Undelete { .. }
             | RunOp::Move { .. }
-            | RunOp::Mark { .. } => None,
+            | RunOp::Mark { .. }
+            | RunOp::Undo { .. } => None,
         }
     }
 
@@ -205,6 +216,7 @@ impl<T: Clone> OpLog<T> {
             RunOp::Undelete { target, .. } => Op::Undelete { target: target + k },
             &RunOp::Move { pos, len, to } => Op::Move { pos, len, to },
             &RunOp::Mark { pos, level } => Op::Mark { pos, level },
+            &RunOp::Undo { target } => Op::Undo { target },
         }
     }
 
@@ -256,6 +268,34 @@ impl<T: Clone> OpLog<T> {
             );
             let seq = self.next_seq[agent.0 as usize];
             let lv = self.push(agent, seq, version, Op::Undelete { target });
+            version = vec![lv];
+        }
+        version
+    }
+
+    /// Undoes `targets`, in a document at `parents`, as `agent`: one event
+    /// each, in order. A delete is undone by an undelete; a move, or an
+    /// undo of one (a redo), by an undo (#30). Each must be an event
+    /// `parents` includes. Returns the version after.
+    pub fn add_undo(
+        &mut self,
+        agent: AgentId,
+        parents: &[Lv],
+        targets: impl IntoIterator<Item = Lv>,
+    ) -> Vec<Lv> {
+        let mut version = normalize(parents.to_vec());
+        for target in targets {
+            debug_assert!(
+                self.contains(parents, target),
+                "an undo undoes an event it includes"
+            );
+            let op = match self.kind(target) {
+                Kind::Delete => Op::Undelete { target },
+                Kind::Move | Kind::Undo => Op::Undo { target },
+                kind => panic!("event {target} is a {kind:?}: nothing to undo"),
+            };
+            let seq = self.next_seq[agent.0 as usize];
+            let lv = self.push(agent, seq, version, op);
             version = vec![lv];
         }
         version
@@ -324,6 +364,11 @@ impl<T: Clone> OpLog<T> {
                         .local(other, target)
                         .expect("an undelete's target arrives before it"),
                 },
+                Op::Undo { target } => Op::Undo {
+                    target: self
+                        .local(other, target)
+                        .expect("an undo's target arrives before it"),
+                },
                 op => op,
             };
             self.push(agent, event.seq, parents, op);
@@ -364,6 +409,16 @@ impl<T: Clone> OpLog<T> {
             assert!(
                 target < lv && matches!(self.run_of(target).op, RunOp::Delete { .. }),
                 "an undelete undoes an earlier delete"
+            );
+        }
+        if let Op::Undo { target } = op {
+            assert!(
+                target < lv
+                    && matches!(
+                        self.run_of(target).op,
+                        RunOp::Move { .. } | RunOp::Undo { .. }
+                    ),
+                "an undo undoes an earlier move, or an undo of one"
             );
         }
         let next = &mut self.next_seq[agent.0 as usize];
@@ -420,6 +475,7 @@ impl<T: Clone> OpLog<T> {
                     Op::Undelete { target } => RunOp::Undelete { target, len: 1 },
                     Op::Move { pos, len, to } => RunOp::Move { pos, len, to },
                     Op::Mark { pos, level } => RunOp::Mark { pos, level },
+                    Op::Undo { target } => RunOp::Undo { target },
                 },
             });
             self.spans[agent.0 as usize].insert(seq, (lv, 1));
@@ -445,7 +501,9 @@ impl<T> OpLog<T> {
             RunOp::Insert { items, .. } => items.len(),
             RunOp::Delete { len, .. } => *len,
             RunOp::Move { .. } | RunOp::Mark { .. } => 1,
-            RunOp::Undelete { .. } => unreachable!("undeletes go one at a time"),
+            RunOp::Undelete { .. } | RunOp::Undo { .. } => {
+                unreachable!("undos go one at a time")
+            }
         };
         debug_assert!(len > 0 && parents.iter().all(|&p| p < lv));
         debug_assert!(self.find(agent, seq).is_none(), "new events");
@@ -605,6 +663,33 @@ impl<T> OpLog<T> {
             RunOp::Undelete { .. } => Kind::Undelete,
             RunOp::Move { .. } => Kind::Move,
             RunOp::Mark { .. } => Kind::Mark,
+            RunOp::Undo { .. } => Kind::Undo,
+        }
+    }
+
+    /// What undo `lv` undoes: a move, or an undo of one.
+    pub(crate) fn undone(&self, lv: Lv) -> Lv {
+        match self.run_of(lv).op {
+            RunOp::Undo { target } => target,
+            _ => panic!("event {lv} isn't an undo"),
+        }
+    }
+
+    /// The move at the end of undo `lv`'s chain of targets.
+    pub(crate) fn undone_move(&self, mut lv: Lv) -> Lv {
+        while self.kind(lv) == Kind::Undo {
+            lv = self.undone(lv);
+        }
+        lv
+    }
+
+    /// What an undo-like event needs replayed with it, so the merge knows
+    /// what it brings back: an undelete's delete, an undo's move.
+    pub(crate) fn needs_replayed(&self, lv: Lv) -> Option<Lv> {
+        match self.kind(lv) {
+            Kind::Undelete => Some(self.undeleted(lv)),
+            Kind::Undo => Some(self.undone_move(lv)),
+            _ => None,
         }
     }
 
@@ -675,10 +760,10 @@ impl<T> OpLog<T> {
                 // An undelete needs the delete it undoes replayed too, so
                 // the item it brings back is known: the base can't hold it.
                 let undoes_replayed = || {
-                    replayed
-                        .iter()
-                        .filter(|&&lv| self.kind(lv) == Kind::Undelete)
-                        .all(|&lv| replayed.binary_search(&self.undeleted(lv)).is_ok())
+                    replayed.iter().all(|&lv| {
+                        self.needs_replayed(lv)
+                            .is_none_or(|d| replayed.binary_search(&d).is_ok())
+                    })
                 };
                 if self.all_include(&replayed, &base) && undoes_replayed() {
                     let mut old = Vec::new();

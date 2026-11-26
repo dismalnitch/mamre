@@ -16,7 +16,9 @@
 //!             op
 //! op        = 0 insert:   pos, count, items (as a run: text is one UTF-8 string)
 //!             1 delete:   pos, count          (each removes the item at pos)
-//!             2 undelete: count, then each target delete, a ref
+//!             2 undo:     count, then each target, a ref: a delete
+//!                         (undone for good), a move, or an undo of a
+//!                         move (a redo) (#30)
 //!             3 move:     pos, count, to   (one event: moves don't run)
 //!             4 mark:     pos, level       (one event)
 //!             (other kinds are reserved for other kinds of event)
@@ -40,7 +42,9 @@
 //!
 //! Decoding checks everything before adding anything: every reference
 //! names an event this log has or the chunk brings, earlier than the event
-//! referring to it; an undelete's target is a delete. Events the log
+//! referring to it; an undo's target is a delete, a move, or an undo of a
+//! move. (Older readers refuse an undo of anything but a delete, so they
+//! refuse chunks that undo moves cleanly.) Events the log
 //! already has are skipped, so a chunk can be applied twice. Checking that
 //! an event's position fits its document is left to the walk (adversarial
 //! peers are M4's later work).
@@ -57,7 +61,7 @@ use crate::oplog::{AgentId, Kind, Lv, Op, OpLog, RunOp, normalize};
 
 const INSERT: u64 = 0;
 const DELETE: u64 = 1;
-const UNDELETE: u64 = 2;
+const UNDO: u64 = 2;
 const MOVE: u64 = 3;
 const MARK: u64 = 4;
 
@@ -87,7 +91,7 @@ enum Ref {
 enum RawOp<T> {
     Insert { pos: usize, items: Vec<T> },
     Delete { pos: usize, len: usize },
-    Undelete { targets: Vec<Ref> },
+    Undo { targets: Vec<Ref> },
     Move { pos: usize, len: usize, to: usize },
     Mark { pos: usize, level: u8 },
 }
@@ -104,7 +108,7 @@ impl<T> RawRun<T> {
         match &self.op {
             RawOp::Insert { items, .. } => items.len(),
             RawOp::Delete { len, .. } => *len,
-            RawOp::Undelete { targets } => targets.len(),
+            RawOp::Undo { targets } => targets.len(),
             RawOp::Move { .. } | RawOp::Mark { .. } => 1,
         }
     }
@@ -260,10 +264,14 @@ impl<T: Clone + Codec> OpLog<T> {
             for p in self.piece_parents(*r, range.start) {
                 outside(p);
             }
-            if let RunOp::Undelete { target, .. } = run.op {
-                for t in target + (range.start - run.start)..target + (range.end - run.start) {
-                    outside(t);
+            match run.op {
+                RunOp::Undelete { target, .. } => {
+                    for t in target + (range.start - run.start)..target + (range.end - run.start) {
+                        outside(t);
+                    }
                 }
+                RunOp::Undo { target } => outside(target),
+                _ => {}
             }
         }
         agents
@@ -321,15 +329,10 @@ impl<T: Clone + Codec> OpLog<T> {
                 PlannedOp::Run(op) => {
                     self.push_run(ids[agent], seq, normalize(parents), op);
                 }
-                PlannedOp::Undeletes(targets) => {
+                PlannedOp::Undos(ops) => {
                     let mut parents = parents;
-                    for (k, target) in targets.into_iter().enumerate() {
-                        let lv = self.add_event(
-                            ids[agent],
-                            seq + k as u64,
-                            &parents,
-                            Op::Undelete { target },
-                        );
+                    for (k, op) in ops.into_iter().enumerate() {
+                        let lv = self.add_event(ids[agent], seq + k as u64, &parents, op);
                         parents = vec![lv];
                     }
                 }
@@ -385,11 +388,16 @@ impl<T: Clone + Codec> Writer<'_, T> {
                 put_usize(out, ks.len());
             }
             RunOp::Undelete { target, .. } => {
-                put_varint(out, UNDELETE << 1);
+                put_varint(out, UNDO << 1);
                 put_usize(out, ks.len());
                 for k in ks {
                     self.put_ref(out, target + k, first);
                 }
+            }
+            RunOp::Undo { target } => {
+                put_varint(out, UNDO << 1);
+                put_usize(out, 1);
+                self.put_ref(out, *target, first);
             }
             RunOp::Move { pos, len, to } => {
                 put_varint(out, MOVE << 1);
@@ -423,11 +431,12 @@ impl<T: Clone + Codec> Writer<'_, T> {
     }
 }
 
-/// What a new run of a chunk adds: a run as the log keeps it, or
-/// undeletes, one target each (they needn't be side by side here).
+/// What a new run of a chunk adds: a run as the log keeps it, or undos,
+/// one target each (they needn't be side by side here, nor of one kind):
+/// undeletes and undos of moves.
 enum PlannedOp<T> {
     Run(RunOp<T>),
-    Undeletes(Vec<Lv>),
+    Undos(Vec<Op<T>>),
 }
 
 /// A run of a chunk with the events this log has already left out: the
@@ -566,20 +575,23 @@ impl<'a, T: Clone> Planner<'a, T> {
                 self.new_kinds.push(Kind::Mark);
                 PlannedOp::Run(RunOp::Mark { pos, level })
             }
-            RawOp::Undelete { targets } => {
-                let mut resolved = Vec::with_capacity(n);
+            RawOp::Undo { targets } => {
+                let mut ops = Vec::with_capacity(n);
                 for &t in &targets[known..] {
-                    let t = self.resolve(t, first)?;
-                    if self.kind(t) != Some(Kind::Delete) {
-                        return Err(DecodeError::Invalid(
-                            "an undelete of something not a delete",
-                        ));
-                    }
-                    resolved.push(t);
+                    let target = self.resolve(t, first)?;
+                    let (op, kind) = match self.kind(target) {
+                        Some(Kind::Delete) => (Op::Undelete { target }, Kind::Undelete),
+                        Some(Kind::Move | Kind::Undo) => (Op::Undo { target }, Kind::Undo),
+                        _ => {
+                            return Err(DecodeError::Invalid(
+                                "an undo of something not a delete, a move or an undo of a move",
+                            ));
+                        }
+                    };
+                    self.new_kinds.push(kind);
+                    ops.push(op);
                 }
-                self.new_kinds
-                    .extend(std::iter::repeat_n(Kind::Undelete, n));
-                PlannedOp::Undeletes(resolved)
+                PlannedOp::Undos(ops)
             }
         })
     }
@@ -758,7 +770,7 @@ fn get_op<T: Codec>(input: &mut &[u8]) -> Result<RawOp<T>, DecodeError> {
             pos: get_usize(input)?,
             len: get_usize(input)?,
         },
-        UNDELETE => RawOp::Undelete {
+        UNDO => RawOp::Undo {
             targets: get_refs(input)?,
         },
         MOVE => RawOp::Move {

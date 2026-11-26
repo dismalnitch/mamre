@@ -189,9 +189,20 @@ fn subset(a: &[Keys], b: &[Keys]) -> bool {
 #[derive(Clone)]
 enum Info {
     Insert(Spot),
-    Delete { root: Lv },
-    Undelete { target: Ix },
-    Mark { root: Lv, level: u8 },
+    Delete {
+        root: Lv,
+    },
+    Undelete {
+        target: Ix,
+    },
+    Mark {
+        root: Lv,
+        level: u8,
+    },
+    /// Undoing a move, or an undo of one (see `copies.rs`).
+    Undo {
+        target: Ix,
+    },
     Move(Move),
     Inert,
 }
@@ -207,6 +218,8 @@ struct Active {
     some_off: bool,
     /// The moves dropped for loops, sorted.
     looped: Vec<Ix>,
+    /// The moves undone, sorted (#30).
+    cancelled: Vec<Ix>,
     /// Which redirects it was given (see [`Redirects`]).
     stamp: u64,
 }
@@ -226,6 +239,7 @@ impl Active {
             rank,
             some_off,
             looped: Vec::new(),
+            cancelled: Vec::new(),
             stamp: 0,
         }
     }
@@ -454,7 +468,7 @@ impl Linked {
 
 /// Where each event goes, among the active moves it was worked out for.
 /// Where events go (see `redirect`), for the standing moves `list` (and
-/// those dropped for loops), stamped `stamp`: checking a stamp costs nothing,
+/// those dropped for loops or undone), stamped `stamp`: checking a stamp costs nothing,
 /// where comparing the lists cost the moves, on every one of the window's
 /// redirects (#29).
 #[derive(Default)]
@@ -462,6 +476,7 @@ struct Redirects {
     stamp: u64,
     list: Vec<Ix>,
     looped: Vec<Ix>,
+    cancelled: Vec<Ix>,
     found: HashMap<Ix, (Spot, Vec<Ix>)>,
 }
 
@@ -774,10 +789,15 @@ impl<'a, T: Clone> Replay<'a, T> {
     /// fresh stamp: once for each set of standing moves.
     fn stamp(&self, act: &mut Active) {
         let mut memo = self.redirects.borrow_mut();
-        if memo.stamp == 0 || memo.list != act.list || memo.looped != act.looped {
+        if memo.stamp == 0
+            || memo.list != act.list
+            || memo.looped != act.looped
+            || memo.cancelled != act.cancelled
+        {
             memo.stamp += 1;
             memo.list.clone_from(&act.list);
             memo.looped.clone_from(&act.looped);
+            memo.cancelled.clone_from(&act.cancelled);
             memo.found.clear();
         }
         act.stamp = memo.stamp;
@@ -857,12 +877,33 @@ impl<'a, T: Clone> Replay<'a, T> {
                         k
                     })
                 };
-                let mut left = unloop(raw.left);
+                // Typed among an undone move's copies (#30), both its
+                // neighbours copies of it: it goes back with the originals,
+                // by what the copies stood for. At an edge of them it stays
+                // where its author put it, beside the copies, which stay
+                // laid out (undrawn).
+                let undone_by = |k: Option<Key>| {
+                    k.filter(|&k| k >= self.copy_base)
+                        .map(|k| self.copier(k))
+                        .filter(|m| act.cancelled.binary_search(m).is_ok())
+                };
+                let among = matches!(
+                    (undone_by(raw.before), undone_by(raw.after)),
+                    (Some(a), Some(b)) if a == b
+                );
+                let uncancel = |k: Option<Key>| -> Option<Key> {
+                    let mut k = k?;
+                    while among && undone_by(Some(k)).is_some() {
+                        k = self.source(k);
+                    }
+                    Some(k)
+                };
+                let mut left = uncancel(unloop(raw.left));
                 while let Some(k) = left {
                     let Some(by) = carried(k) else { break };
                     left = self.spot(by).left;
                 }
-                let mut right = unloop(raw.right);
+                let mut right = uncancel(unloop(raw.right));
                 while let Some(k) = right {
                     let Some(by) = carried(k) else { break };
                     right = self.spot(by).right;
@@ -883,8 +924,9 @@ impl<'a, T: Clone> Replay<'a, T> {
     }
 
     fn active(&self, at: &[bool], dropped: &HashSet<Ix>, losses: &mut Vec<Loss>) -> Vec<Ix> {
+        let cancelled = self.cancelled(at);
         let mut moves: Vec<Ix> = (0..self.n())
-            .filter(|&i| at[i] && !dropped.contains(&i))
+            .filter(|&i| at[i] && !dropped.contains(&i) && !cancelled.contains(&i))
             .filter(|&i| match &self.info[i] {
                 Info::Move(_) => true,
                 Info::Inert => {
@@ -941,6 +983,22 @@ impl<'a, T: Clone> Replay<'a, T> {
         active
     }
 
+    /// The moves cancelled at `at`: see `copies.rs`.
+    fn cancelled(&self, at: &[bool]) -> HashSet<Ix> {
+        let mut undone: HashSet<Ix> = HashSet::new();
+        for u in (0..self.n()).rev().filter(|&u| at[u]) {
+            if let Info::Undo { target } = self.info[u]
+                && !undone.contains(&u)
+            {
+                undone.insert(target);
+            }
+        }
+        undone
+            .into_iter()
+            .filter(|&m| matches!(self.info[m], Info::Move(_) | Info::Inert))
+            .collect()
+    }
+
     fn undone(&self, at: &[bool]) -> HashSet<Ix> {
         (0..self.n())
             .filter(|&u| at[u])
@@ -974,6 +1032,8 @@ impl<'a, T: Clone> Replay<'a, T> {
             let mut act = Active::new(self.active(at, &skip, &mut losses), self.n(), moves);
             act.looped = skip.iter().copied().collect();
             act.looped.sort_unstable();
+            act.cancelled = self.cancelled(at).into_iter().collect();
+            act.cancelled.sort_unstable();
             self.stamp(&mut act);
             match self.build(at, &act) {
                 Ok(layout) => break (act, layout, losses),
@@ -1438,6 +1498,12 @@ impl<'a, T: Clone> Replay<'a, T> {
                 }
             }
             Info::Mark { .. } | Info::Inert => {}
+            Info::Undo { .. } => {
+                // It reaches everything the move did: drawn from scratch.
+                let mut at: Vec<bool> = (0..self.n()).map(|j| j < x && self.saw(x, j)).collect();
+                at[x] = true;
+                return self.rebuild(&at);
+            }
             Info::Move(mv) => {
                 v.active.push(x);
                 for r in &mv.sources {
@@ -1723,6 +1789,13 @@ fn replay_checked<'a, T: Clone>(
                 Some(&t) => {
                     assert!(r.saw(i, t), "undelete {lv} undoes a delete it includes");
                     Info::Undelete { target: t }
+                }
+                None => return Err(Unsupported),
+            },
+            Op::Undo { target } => match r.ix.get(target) {
+                Some(&t) => {
+                    assert!(r.saw(i, t), "undo {lv} undoes an event it includes");
+                    Info::Undo { target: t }
                 }
                 None => return Err(Unsupported),
             },

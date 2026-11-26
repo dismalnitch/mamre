@@ -548,6 +548,7 @@ impl<'a, T: Clone> Walk<'a, T> {
             Op::Undelete { target } => self.undelete(*target, out),
             &Op::Move { pos, len, to } => self.move_(lv, pos, len, to, out),
             &Op::Mark { pos, level } => self.mark(lv, pos, level, out),
+            Op::Undo { .. } => unimplemented!("undoing a move is copies' (#30)"),
         }
         self.prepared.insert(lv);
         self.effect.insert(lv);
@@ -590,6 +591,7 @@ impl<'a, T: Clone> Walk<'a, T> {
             Kind::Undelete => return self.shift_undelete(x, false),
             Kind::Move => return self.shift_portal(x, false),
             Kind::Mark => return,
+            Kind::Undo => unimplemented!("undoing a move is copies' (#30)"),
             _ => {}
         }
         let insert = self.log.is_insert(x);
@@ -612,6 +614,7 @@ impl<'a, T: Clone> Walk<'a, T> {
             Kind::Undelete => return self.shift_undelete(x, true),
             Kind::Move => return self.shift_portal(x, true),
             Kind::Mark => return,
+            Kind::Undo => unimplemented!("undoing a move is copies' (#30)"),
             _ => {}
         }
         let insert = self.log.is_insert(x);
