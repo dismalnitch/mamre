@@ -50,7 +50,7 @@ fn apply(s: &mut String, edit: &Edit) {
             };
             s.insert_str(at, &moved);
         }
-        Edit::Section { .. } | Edit::Lost { .. } => {}
+        Edit::Section { .. } | Edit::Isolates | Edit::Lost { .. } => {}
     }
 }
 
@@ -485,4 +485,42 @@ fn section_edits_keep_an_outline() {
     let want: BTreeMap<_, _> = b.text.sections().iter().map(|s| (s.id, s.level)).collect();
     assert_eq!(outline, want);
     assert_eq!(want.len(), 2);
+}
+
+/// A move, and an insert made inside what it moves at the same time,
+/// panic the merge: "origins in a loop", in egg-walker's `copies.rs`.
+/// Found by the isolates' two-writer test; nothing here is an isolate.
+#[test]
+#[ignore = "panics in egg-walker's moves: origins in a loop"]
+fn a_move_and_an_insert_at_once() {
+    fn talk(a: &mut Text, b: &mut Text) {
+        let mut to_b = vec![a.hello()];
+        let mut to_a = vec![b.hello()];
+        while !to_a.is_empty() || !to_b.is_empty() {
+            let mut next_a = Vec::new();
+            for m in to_b.drain(..) {
+                next_a.extend(b.receive(&m).unwrap().reply);
+            }
+            for m in to_a.drain(..) {
+                to_b.extend(a.receive(&m).unwrap().reply);
+            }
+            to_a = next_a;
+        }
+    }
+    let mut a = Text::new("me");
+    a.insert(0, ", בגaaaaaaבגaaaa23aa, bca, aaaבג, aaa")
+        .unwrap();
+    let mut b = Text::new("you");
+    talk(&mut a, &mut b);
+    b.delete(20..28).unwrap();
+    b.insert(0, " ").unwrap();
+    b.insert(15, "]").unwrap();
+    b.insert(0, "[").unwrap();
+    b.insert(0, "12").unwrap();
+    talk(&mut a, &mut b);
+    assert_eq!(a.to_string(), "12[ , בגaaaaaaב]גaaaaa, aaaבג, aaa");
+    a.move_text(0..19, 21).unwrap();
+    b.insert(18, " ").unwrap();
+    talk(&mut a, &mut b);
+    assert_eq!(a.to_string(), b.to_string());
 }
