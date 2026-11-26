@@ -94,7 +94,7 @@ impl<M: Measure, const N: usize> Rope<M, N> {
 
     /// How many of `unit` start before byte `offset`.
     pub fn units_before(&self, offset: usize, unit: Unit) -> usize {
-        let k = unit_state(&self.summary_before(offset), unit).starts;
+        let k = self.starts_before(offset, unit);
         // A unit that starts at its line's start is only noticed later on
         // the line (a paragraph at its first non-blank, a heading at the
         // space after its `#`s), so it may start before `offset` without
@@ -103,6 +103,39 @@ impl<M: Measure, const N: usize> Rope<M, N> {
             Some(start) if start < offset => k + 1,
             _ => k,
         }
+    }
+
+    /// How many of `unit`'s machine has seen start before byte `offset`:
+    /// the chunks before it from the tree, then `unit`'s machine alone over
+    /// the part of its chunk before it (not the whole summary, which runs
+    /// every unit's machine from every state).
+    fn starts_before(&self, offset: usize, unit: Unit) -> usize {
+        assert!(
+            offset <= self.len(),
+            "byte {offset} is out of bounds for a rope of {} bytes",
+            self.len()
+        );
+        let mut cursor = self.tree.cursor::<(ByteOffset, TextSummary<M>)>();
+        cursor.seek(&ByteOffset(offset), Bias::Right);
+        let (ByteOffset(start), before) = *cursor.start();
+        let s = unit_state(&before, unit);
+        let Some(chunk) = cursor.item() else {
+            return s.starts;
+        };
+        let k = offset - start;
+        let text = chunk.as_str();
+        assert!(
+            text.is_char_boundary(k),
+            "byte {offset} is not a char boundary"
+        );
+        let step = unit.step();
+        let (mut state, mut starts) = (s.state, s.starts);
+        for c in text[..k].chars() {
+            let (next, starts_here, _) = step(state, c);
+            starts += starts_here as usize;
+            state = next;
+        }
+        starts
     }
 
     /// Where unit `n` starts, if there are that many.
@@ -132,7 +165,10 @@ impl<M: Measure, const N: usize> Rope<M, N> {
             End::Event(anchor) => match self.find(unit, Kind::End, n) {
                 Some(at) => self.place(at, anchor),
                 // Still open when the text ends.
-                None => self.len(),
+                None => match anchor {
+                    Anchor::BeforeJoiner => self.place(self.len(), anchor),
+                    _ => self.len(),
+                },
             },
         })
     }
@@ -189,6 +225,25 @@ impl<M: Measure, const N: usize> Rope<M, N> {
             Anchor::LineStart => {
                 let row = self.offset_to_point(at).row;
                 self.point_to_offset(Point::new(row, 0))
+            }
+            Anchor::BeforeJoiner => {
+                // Only a `MamreWord` ends this way. Whether its machine
+                // was holding a joiner at `at`, and where that began, takes
+                // running it up to there from where its state is known.
+                let unit = Unit::MamreWord;
+                let (from, mut state) = unit.sync(self.chars_before(at));
+                let step = unit.step();
+                let mut held = None;
+                for (i, c) in self.chars_from(from).take_while(|&(i, _)| i < at) {
+                    let (next, _, _) = step(state, c);
+                    if !unit.holds(next) {
+                        held = None;
+                    } else if !unit.holds(state) {
+                        held = Some(i);
+                    }
+                    state = next;
+                }
+                held.unwrap_or(at)
             }
         }
     }
