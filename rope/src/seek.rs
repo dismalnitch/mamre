@@ -132,7 +132,10 @@ impl<M: Measure, const N: usize> Rope<M, N> {
             End::Event(anchor) => match self.find(unit, Kind::End, n) {
                 Some(at) => self.place(at, anchor),
                 // Still open when the text ends.
-                None => self.len(),
+                None => match anchor {
+                    Anchor::BeforeJoiner => self.place(self.len(), anchor),
+                    _ => self.len(),
+                },
             },
         })
     }
@@ -190,6 +193,10 @@ impl<M: Measure, const N: usize> Rope<M, N> {
                 let row = self.offset_to_point(at).row;
                 self.point_to_offset(Point::new(row, 0))
             }
+            Anchor::BeforeJoiner => match self.chars_before(at).next() {
+                Some((i, c)) if crate::units::joins(c) => i,
+                _ => at,
+            },
         }
     }
 }

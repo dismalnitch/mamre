@@ -28,9 +28,12 @@ pub enum Unit {
     /// the word "two", and a pointed Hebrew word is one word, points and
     /// accents included. What a double click selects.
     ///
-    /// An apostrophe or a hyphen is punctuation like any other: "don't" is
-    /// two words, as is "dub-sar". Telling an apostrophe from a closing
-    /// quote takes the `char` after it, and a machine sees one at a time.
+    /// An apostrophe or a hyphen with a word character on both sides is
+    /// part of the word: "don't", "she'ol", "dub-sar", and Hebrew words
+    /// joined by a maqaf. One at a word's edge isn't, since nothing tells
+    /// it from a quote mark or a dash: "'tis" is "tis", and "dogs'" is
+    /// "dogs". A glottal stop written as a letter (ʾ, ʿ, ʼ) is a letter
+    /// wherever it stands.
     MamreWord,
     /// Vim's sentence (`(` `)`): from the first non-blank character, to a
     /// `.`, `!` or `?` (followed by any `)`, `]`, `"` or `'`) that's
@@ -73,6 +76,16 @@ pub(crate) enum Anchor {
     /// At the start of that line: a paragraph is only known on its first
     /// non-blank character, and a heading on the space after its `#`s.
     LineStart,
+    /// Right there, or before the `char` before it if that's a joiner: a
+    /// word that ran up to an apostrophe is only known to have ended
+    /// before it once the next `char` isn't a letter.
+    BeforeJoiner,
+}
+
+/// Whether `c` joins the word characters on either side of it into one
+/// [`Unit::MamreWord`].
+pub(crate) fn joins(c: char) -> bool {
+    mamre_word::joins(c)
 }
 
 /// How a unit's end is found.
@@ -119,9 +132,8 @@ impl Unit {
 
     pub(crate) fn end(self) -> End {
         match self {
-            Unit::Word | Unit::VimWord | Unit::MamreWord | Unit::Sentence => {
-                End::Event(Anchor::Here)
-            }
+            Unit::Word | Unit::VimWord | Unit::Sentence => End::Event(Anchor::Here),
+            Unit::MamreWord => End::Event(Anchor::BeforeJoiner),
             Unit::Paragraph | Unit::VimParagraph => End::Event(Anchor::LineStart),
             Unit::Section => End::NextStart,
         }
@@ -210,6 +222,10 @@ impl Unit {
         let place = |at: usize, anchor: Anchor| match anchor {
             Anchor::Here => at,
             Anchor::LineStart => line_start(at),
+            Anchor::BeforeJoiner => match text[..at].chars().next_back() {
+                Some(c) if joins(c) => at - c.len_utf8(),
+                _ => at,
+            },
         };
         let starts: Vec<usize> = starts
             .into_iter()
@@ -219,8 +235,13 @@ impl Unit {
             End::NextStart => starts.iter().skip(1).copied().chain([text.len()]).collect(),
             End::Event(anchor) => {
                 let mut ends: Vec<usize> = ends.into_iter().map(|at| place(at, anchor)).collect();
-                // One still open at the end of the text ends there.
-                ends.resize(starts.len(), text.len());
+                // One still open at the end of the text ends there (or
+                // before a joiner left hanging).
+                let close = match anchor {
+                    Anchor::BeforeJoiner => place(text.len(), anchor),
+                    _ => text.len(),
+                };
+                ends.resize(starts.len(), close);
                 ends
             }
         };
@@ -334,25 +355,49 @@ mod vim_word {
     }
 }
 
-/// A reader's word: runs of letters, digits and marks.
+/// A reader's word: runs of letters, digits and marks, and the apostrophes
+/// and hyphens between them.
 mod mamre_word {
     use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 
     pub const START: u8 = GAP;
     const GAP: u8 = 0;
     const IN: u8 = 1;
+    /// Just past a joiner that came after a word character: still in the
+    /// word if a word character comes next, and if not, the word ended
+    /// before the joiner.
+    const JOIN: u8 = 2;
 
     /// A letter or digit of any script, or a mark: a vowel point, an
-    /// accent, anything that sits on the letter before it.
+    /// accent, anything that sits on the letter before it. And the geresh
+    /// and gershayim, which Hebrew writes inside a word (ג׳, צה״ל) and
+    /// never as quote marks.
     fn in_word(c: char) -> bool {
-        c.is_alphanumeric() || c.general_category_group() == GeneralCategoryGroup::Mark
+        c.is_alphanumeric()
+            || c.general_category_group() == GeneralCategoryGroup::Mark
+            || matches!(c, '\u{5f3}' | '\u{5f4}')
+    }
+
+    /// What holds two halves of a word together: an apostrophe (typed
+    /// straight or curly, either way round, as a glottal stop or an ayin
+    /// often is), a hyphen (plain, non-breaking, soft, or the maqaf), or a
+    /// zero width joiner or non-joiner.
+    pub fn joins(c: char) -> bool {
+        matches!(
+            c,
+            '\'' | '\u{2018}' | '\u{2019}'
+                | '-' | '\u{2010}' | '\u{2011}' | '\u{ad}' | '\u{5be}'
+                | '\u{200c}' | '\u{200d}'
+        )
     }
 
     pub fn step(state: u8, c: char) -> (u8, bool, bool) {
         if in_word(c) {
             (IN, state == GAP, false)
+        } else if state == IN && joins(c) {
+            (JOIN, false, false)
         } else {
-            (GAP, false, state == IN)
+            (GAP, false, state != GAP)
         }
     }
 }
@@ -574,19 +619,47 @@ mod tests {
             pieces(Unit::MamreWord, "e\u{301}t\u{e9}, na\u{ef}ve"),
             ["e\u{301}t\u{e9}", "na\u{ef}ve"]
         );
-        // Pointed Hebrew with its accents, and a maqaf between
-        // two words.
+        // Pointed Hebrew with its accents; a maqaf joins two words.
         assert_eq!(
             pieces(Unit::MamreWord, "בְּרֵאשִׁ֖ית בָּרָ֣א, אֶת־הַשָּׁמַ֖יִם"),
-            ["בְּרֵאשִׁ֖ית", "בָּרָ֣א", "אֶת", "הַשָּׁמַ֖יִם"]
+            ["בְּרֵאשִׁ֖ית", "בָּרָ֣א", "אֶת־הַשָּׁמַ֖יִם"]
         );
         assert_eq!(pieces(Unit::MamreWord, "日本語 ok"), ["日本語", "ok"]);
-        // An apostrophe and a hyphen are punctuation.
-        assert_eq!(
-            pieces(Unit::MamreWord, "don't dub-sar"),
-            ["don", "t", "dub", "sar"]
-        );
         assert_eq!(pieces(Unit::MamreWord, " ,.; "), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn mamre_words_join() {
+        let words = |text| pieces(Unit::MamreWord, text);
+        // An apostrophe or a hyphen between word characters is the word's.
+        assert_eq!(
+            words("don't she'ol Qur\u{2019}an Ka\u{2018}ba dub-sar mu-un-du3"),
+            ["don't", "she'ol", "Qur\u{2019}an", "Ka\u{2018}ba", "dub-sar", "mu-un-du3"]
+        );
+        assert_eq!(words("rock'n'roll"), ["rock'n'roll"]);
+        // At a word's edge it isn't: a quote mark, a dash.
+        assert_eq!(words("'quoted' \u{2018}so\u{2019}"), ["quoted", "so"]);
+        assert_eq!(words("'tis the dogs' bowl"), ["tis", "the", "dogs", "bowl"]);
+        assert_eq!(words("-a- b - c"), ["a", "b", "c"]);
+        // Two in a row join nothing, and neither does a dash.
+        assert_eq!(words("a--b c\u{2014}d e'-f"), ["a", "b", "c", "d", "e", "f"]);
+        // Left hanging at the end of the text.
+        assert_eq!(Unit::MamreWord.ranges("rock'"), [0..4]);
+        assert_eq!(Unit::MamreWord.ranges("rock'n"), [0..6]);
+        assert_eq!(Unit::MamreWord.ranges("'"), []);
+        // A glottal stop written as a letter is one anywhere.
+        assert_eq!(
+            words("\u{2be}elohim shema\u{2bf} she\u{2bc}ol"),
+            ["\u{2be}elohim", "shema\u{2bf}", "she\u{2bc}ol"]
+        );
+        // Geresh and gershayim are the word's, wherever they stand; a
+        // maqaf at the end is not.
+        assert_eq!(
+            words("ג\u{5f3}ורג\u{5f3} צה\u{5f4}ל ד\u{5f3}, על\u{5be}"),
+            ["ג\u{5f3}ורג\u{5f3}", "צה\u{5f4}ל", "ד\u{5f3}", "על"]
+        );
+        // A soft hyphen doesn't split a word.
+        assert_eq!(words("hy\u{ad}phen"), ["hy\u{ad}phen"]);
     }
 
     #[test]

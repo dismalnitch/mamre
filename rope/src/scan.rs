@@ -17,7 +17,7 @@ use std::ops::ControlFlow;
 use mamre::cursor::Bias;
 
 use crate::summary::ByteOffset;
-use crate::units::{Anchor, End, Unit};
+use crate::units::{Anchor, End, Unit, joins};
 use crate::{Measure, Rope};
 
 /// Which side of a unit: where it starts, or just past where it ends.
@@ -190,32 +190,45 @@ impl<M: Measure, const N: usize> Rope<M, N> {
         // Units placed at their line's start sync at a line start, so this
         // starts out right for them.
         let mut line_start = from;
-        let place = |at: usize, anchor: Anchor, line_start: usize| match anchor {
+        // Where a joiner just before the `char` being read starts. A scan
+        // starts at a sync point, and none is just past a joiner.
+        let mut joiner = None;
+        let place = |at: usize, anchor: Anchor, line_start: usize, joiner: Option<usize>| match anchor {
             Anchor::Here => at,
             Anchor::LineStart => line_start,
+            Anchor::BeforeJoiner => joiner.unwrap_or(at),
         };
         for (i, c) in self.chars_from(from) {
             let (next, starts, ends) = step(state, c);
             if ends
                 && let End::Event(anchor) = unit.end()
-                && f(place(i, anchor, line_start), Edge::End, i).is_break()
+                && f(place(i, anchor, line_start, joiner), Edge::End, i).is_break()
             {
                 return;
             }
-            if starts && f(place(i, unit.start_anchor(), line_start), Edge::Start, i).is_break() {
+            if starts
+                && f(place(i, unit.start_anchor(), line_start, joiner), Edge::Start, i).is_break()
+            {
                 return;
             }
             if c == '\n' {
                 line_start = i + 1;
             }
+            joiner = joins(c).then_some(i);
             state = next;
         }
         let len = self.len();
         if unit.pending(state) && f(line_start, Edge::Start, len).is_break() {
             return;
         }
-        if matches!(unit.end(), End::Event(_)) && unit.inside(state) {
-            let _ = f(len, Edge::End, len);
+        if let End::Event(anchor) = unit.end()
+            && unit.inside(state)
+        {
+            let at = match anchor {
+                Anchor::BeforeJoiner => joiner.unwrap_or(len),
+                _ => len,
+            };
+            let _ = f(at, Edge::End, len);
         }
     }
 
@@ -236,7 +249,7 @@ impl<M: Measure, const N: usize> Rope<M, N> {
     }
 
     /// The `char`s before byte `pos`, nearest first, with their offsets.
-    fn chars_before(&self, pos: usize) -> impl Iterator<Item = (usize, char)> + '_ {
+    pub(crate) fn chars_before(&self, pos: usize) -> impl Iterator<Item = (usize, char)> + '_ {
         let mut cursor = self.tree.cursor::<ByteOffset>();
         // The chunk holding the byte just before `pos`.
         cursor.seek(&ByteOffset(pos), Bias::Left);
