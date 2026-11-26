@@ -396,7 +396,16 @@ proptest! {
         prop_assert_eq!(&texts[1], &texts[2]);
         let sections: Vec<Vec<(usize, u8)>> = rs
             .iter()
-            .map(|r| r.text.sections().iter().map(|s| (s.at, s.level)).collect())
+            // Headless sections (#19) are each replica's own: one that never
+            // showed a heading before it went keeps no place for it.
+            .map(|r| {
+                r.text
+                    .sections()
+                    .iter()
+                    .filter(|s| s.start == mamre_egg_walker::Start::Heading)
+                    .map(|s| (s.at, s.level))
+                    .collect()
+            })
             .collect();
         prop_assert_eq!(&sections[0], &sections[1]);
         prop_assert_eq!(&sections[1], &sections[2]);
