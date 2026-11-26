@@ -105,7 +105,8 @@ pub enum Aside {
 }
 
 /// Where a comment stands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CommentState {
     Open,
     Resolved,

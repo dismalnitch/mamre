@@ -118,6 +118,35 @@ fn a_body_is_a_small_text_of_its_own() {
     assert_eq!(a.doc.iter().collect::<String>(), "the big dog");
 }
 
+/// Comment events go in chunks as JSON in their runs: adding, state, and
+/// a body's edits, a character each. They read back as the same events.
+#[test]
+fn comments_round_trip_in_chunks() {
+    let (mut log, mut a, c) = big();
+    let v = log.add_body_insert(a.me, a.books.version(), c, 0, "hi");
+    a.merge(&log, &v);
+    let v = log.add_body_delete(a.me, a.books.version(), c, 1..2);
+    a.merge(&log, &v);
+    let v = log.set_comment(a.me, a.books.version(), c, CommentState::Resolved);
+    a.merge(&log, &v);
+    let mut bytes = Vec::new();
+    log.encode_chunk(0..log.len(), &mut bytes);
+    let text = String::from_utf8_lossy(&bytes);
+    for want in [r#"{"comment_add":{"start":"#, r#""item":"h"}}"#, r#""state":"resolved"}}"#, r#"{"body_delete":"#] {
+        assert!(text.contains(want), "{want} in {text}");
+    }
+    let mut back = OpLog::<char>::new();
+    assert_eq!(back.decode_chunk(&bytes), Ok(log.len()));
+    for lv in 0..log.len() {
+        assert_eq!(event(&back, lv), event(&log, lv));
+    }
+    assert_eq!(back.comment_body(c, log.version()), "h");
+    // A body edit naming something that isn't a comment is refused.
+    let bad = String::from_utf8_lossy(&bytes).replacen(r#"{"body_insert":{"comment":{"agent":"w","seq":11}"#, r#"{"body_insert":{"comment":{"agent":"w","seq":10}"#, 1);
+    assert_ne!(bad.as_bytes(), &bytes[..], "the test changed something");
+    assert!(OpLog::<char>::new().decode_chunk(bad.as_bytes()).is_err());
+}
+
 #[test]
 fn resolving_and_undoing_by_step() {
     let mut log = OpLog::new();
@@ -310,6 +339,18 @@ proptest! {
             prop_assert_eq!(&body, &ws[1].books.comment_body(&log, c));
             prop_assert_eq!(&body, &ws[2].books.comment_body(&log, c));
         }
+        // And the whole history through a chunk: the same events, so the
+        // same comments and bodies.
+        let mut bytes = Vec::new();
+        log.encode_chunk(0..log.len(), &mut bytes);
+        let mut back = OpLog::<char>::new();
+        prop_assert_eq!(back.decode_chunk(&bytes), Ok(log.len()));
+        for lv in 0..log.len() {
+            prop_assert_eq!(event(&back, lv), event(&log, lv));
+        }
+        for &c in &made {
+            prop_assert_eq!(back.comment_body(c, &all), log.comment_body(c, &all));
+        }
     }
 }
 
@@ -321,4 +362,11 @@ fn ends_live(log: &OpLog<char>, c: Lv, ids: &BTreeSet<Lv>) -> bool {
         }
         _ => false,
     }
+}
+
+/// Event `lv`, with its agent by name: a log read from a chunk numbers
+/// agents in the order the chunk names them.
+fn event(log: &OpLog<char>, lv: Lv) -> String {
+    let e = log.event(lv);
+    format!("{} {} {:?} {:?}", log.agent_name(e.agent), e.seq, e.parents, e.op)
 }

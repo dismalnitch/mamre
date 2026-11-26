@@ -167,4 +167,12 @@ pub(crate) enum AsideJson {
     RangeAdd { start: Named, end: Named, tag: String },
     /// A range's tag set, or the range removed (`null`).
     RangeSet { range: Named, tag: Option<String> },
+    /// A comment on `start` to `end` (inserts, both included).
+    CommentAdd { start: Named, end: Named },
+    /// A comment's state: "open", "resolved" or "removed".
+    CommentSet { comment: Named, state: crate::CommentState },
+    /// A character typed into a comment's body at `pos`.
+    BodyInsert { comment: Named, pos: usize, item: char },
+    /// The character at `pos` taken out of a comment's body.
+    BodyDelete { comment: Named, pos: usize },
 }
