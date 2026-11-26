@@ -1,0 +1,131 @@
+//! Side data: what isn't the text's core log, written as JSON.
+//!
+//! The core log (text inserts and deletes, moves, marks, undos, with their
+//! parents and agents) is our own bytes, in `encode.rs`: it's nearly all of
+//! a file, and it's settled. What sits beside the text (ranges, comments,
+//! undo steps, ghosts' places, the history index) is rare, so its size
+//! hardly matters, and it's what's still changing, so being able to add a
+//! field matters more. It's written with serde:
+//!
+//! ```text
+//! extension = format (byte, 1: JSON), length, the bytes
+//! ```
+//!
+//! The format byte leaves room for a compact binary format later without
+//! breaking files: the same derives work with either. Fields a reader
+//! doesn't know are ignored, so later versions can add them; a field whose
+//! meaning a reader can't do without belongs in the core log, or behind a
+//! new event kind, which older readers refuse.
+//!
+//! Characters are named as `{"agent": "…", "seq": n}` in side data, not by
+//! the core log's back references: side data stands alone.
+
+use mamre::codec::{DecodeError, get_str, put_str};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+/// The one format so far.
+const JSON: u8 = 1;
+
+/// Writes `value` as an extension: the format byte, then its JSON.
+pub(crate) fn put_json<V: Serialize>(out: &mut Vec<u8>, value: &V) {
+    out.push(JSON);
+    let json = serde_json::to_string(value).expect("side data is always valid JSON");
+    put_str(out, &json);
+}
+
+/// Reads an extension [`put_json`] wrote.
+pub(crate) fn get_json<V: DeserializeOwned>(input: &mut &[u8]) -> Result<V, DecodeError> {
+    let (&format, rest) = input.split_first().ok_or(DecodeError::UnexpectedEnd)?;
+    *input = rest;
+    if format != JSON {
+        return Err(DecodeError::Invalid("an extension in a format this version doesn't know"));
+    }
+    serde_json::from_str(get_str(input)?)
+        .map_err(|_| DecodeError::Invalid("an extension that isn't the JSON it should be"))
+}
+
+/// Reads the extension that ends a body, if there is one: an empty rest
+/// is nothing beside, so the default. `after` is the complaint for bytes
+/// past it.
+pub(crate) fn get_trailing<V: DeserializeOwned + Default>(
+    input: &mut &[u8],
+    after: &'static str,
+) -> Result<V, DecodeError> {
+    if input.is_empty() {
+        return Ok(V::default());
+    }
+    let side = get_json(input)?;
+    if !input.is_empty() {
+        return Err(DecodeError::Invalid(after));
+    }
+    Ok(side)
+}
+
+/// What a chunk carries beside its runs. Nothing yet: undo steps (#14)
+/// come next. Written only when there's something in it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct ChunkExt {}
+
+impl ChunkExt {
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == ChunkExt::default()
+    }
+}
+
+/// What a snapshot carries beside the books. Nothing yet: ghosts' places
+/// (#19) and the history index (#34) come next. Written only when there's
+/// something in it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct SnapshotExt {}
+
+impl SnapshotExt {
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == SnapshotExt::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Later {
+        steps: Vec<u64>,
+    }
+
+    #[test]
+    fn json_round_trips() {
+        let mut out = Vec::new();
+        put_json(&mut out, &Later { steps: vec![3, 9] });
+        assert_eq!(out[0], JSON);
+        let mut input = &out[..];
+        assert_eq!(get_json::<Later>(&mut input), Ok(Later { steps: vec![3, 9] }));
+        assert!(input.is_empty());
+    }
+
+    /// A later version's fields are ignored, so it can add them.
+    #[test]
+    fn fields_a_reader_doesnt_know_are_ignored() {
+        let mut out = Vec::new();
+        put_json(&mut out, &Later { steps: vec![1] });
+        assert_eq!(get_json::<ChunkExt>(&mut &out[..]), Ok(ChunkExt {}));
+    }
+
+    #[test]
+    fn another_format_is_refused() {
+        let mut out = Vec::new();
+        put_json(&mut out, &ChunkExt {});
+        out[0] = 2;
+        assert!(get_json::<ChunkExt>(&mut &out[..]).is_err());
+    }
+
+    #[test]
+    fn bad_json_is_refused() {
+        let mut out = vec![JSON];
+        put_str(&mut out, "{\"steps\": [");
+        assert!(get_json::<ChunkExt>(&mut &out[..]).is_err());
+    }
+}
