@@ -9,8 +9,12 @@
 //!            (other kinds are skipped, so they can be added)
 //! snapshot = document (count, items as a run), then its accountant's
 //!            books: version (count, then events), identities, anchors,
-//!            outline, moved blocks
+//!            outline, moved blocks; then [extension]: what it carries
+//!            beside the books, as JSON (see `ext.rs`), only when there's
+//!            something in it
 //! ```
+//!
+//! [`dump`] shows a whole file as JSON, for reading by people.
 //!
 //! Saving appends: a chunk of the events since the last save, then a
 //! snapshot. Nothing is rewritten, so a save costs what changed, and a
@@ -25,6 +29,8 @@
 use mamre::codec::{Codec, DecodeError, get_frame, get_usize, put_frame, put_usize};
 
 use crate::accountant::Accountant;
+use crate::encode::dump_chunk;
+use crate::ext::{self, SnapshotExt};
 use crate::oplog::OpLog;
 
 const MAGIC: &[u8; 6] = b"MAMRE\0";
@@ -93,6 +99,10 @@ pub fn save<T: Clone + Codec>(
     let n = T::encode_iter(doc, &mut body);
     debug_assert_eq!(n, accountant.len(), "the books are the document's");
     accountant.encode(&mut body);
+    let side = SnapshotExt::default();
+    if !side.is_empty() {
+        ext::put_json(&mut body, &side);
+    }
     record(file, SNAPSHOT, &body);
     log.len()
 }
@@ -103,13 +113,7 @@ fn record(out: &mut Vec<u8>, kind: u8, body: &[u8]) {
 
 /// Loads a file: its history, and its last snapshot.
 pub fn load<T: Clone + Codec>(bytes: &[u8]) -> Result<Loaded<T>, LoadError> {
-    if bytes.len() < MAGIC.len() + 1 || &bytes[..MAGIC.len()] != MAGIC {
-        return Err(LoadError::NotAFile);
-    }
-    let version = bytes[MAGIC.len()];
-    if version != VERSION {
-        return Err(LoadError::Version(version));
-    }
+    header(bytes)?;
     let mut loaded = Loaded {
         log: OpLog::new(),
         snapshot: None,
@@ -131,6 +135,17 @@ pub fn load<T: Clone + Codec>(bytes: &[u8]) -> Result<Loaded<T>, LoadError> {
         }
     }
     Ok(loaded)
+}
+
+/// Checks a file's magic and version, and returns the version.
+fn header(bytes: &[u8]) -> Result<u8, LoadError> {
+    if bytes.len() < MAGIC.len() + 1 || &bytes[..MAGIC.len()] != MAGIC {
+        return Err(LoadError::NotAFile);
+    }
+    match bytes[MAGIC.len()] {
+        VERSION => Ok(VERSION),
+        version => Err(LoadError::Version(version)),
+    }
 }
 
 /// Reads one record from the front of `bytes`, applying a chunk to `log`.
@@ -156,14 +171,72 @@ fn read_record<T: Clone + Codec>(
             if accountant.len() != doc.len() {
                 return Err(DecodeError::Invalid("books for another document"));
             }
-            if !input.is_empty() {
-                return Err(DecodeError::Invalid("bytes after the snapshot"));
-            }
+            let _side: SnapshotExt = ext::get_trailing(&mut input, "bytes after the snapshot")?;
             Ok((total, Some(Snapshot { doc, accountant })))
         }
         // A kind a later version added: skipped whole.
         _ => Ok((total, None)),
     }
+}
+
+/// A whole file as JSON, for reading by people: each record in order,
+/// chunks with their runs spelled out, snapshots with their document and
+/// what they carry beside the books (the books themselves are binary, and
+/// shown by size). A record that's cut off or damaged ends the list, as it
+/// ends loading, with a note saying so.
+pub fn dump<T: Clone + Codec + serde::Serialize>(bytes: &[u8]) -> Result<serde_json::Value, LoadError> {
+    use serde_json::json;
+    let version = header(bytes)?;
+    let mut log = OpLog::<T>::new();
+    let mut records = Vec::new();
+    let mut at = MAGIC.len() + 1;
+    while at < bytes.len() {
+        let shown = (|| {
+            let mut input = &bytes[at..];
+            let (kind, body) = get_frame(&mut input)?;
+            let total = bytes.len() - at - input.len();
+            let shown = match kind {
+                CHUNK => {
+                    let mut chunk = dump_chunk::<T>(body)?;
+                    log.decode_chunk(body)?;
+                    chunk["record"] = json!("chunk");
+                    chunk
+                }
+                SNAPSHOT => {
+                    let mut input = body;
+                    let n = get_usize(&mut input)?;
+                    let doc = T::decode_run(n, &mut input)?;
+                    let before = input.len();
+                    Accountant::decode(&mut input, log.len())?;
+                    let books = before - input.len();
+                    let side: serde_json::Value =
+                        ext::get_trailing(&mut input, "bytes after the snapshot")?;
+                    let mut snap = json!({
+                        "record": "snapshot",
+                        "document": crate::encode::items_json(&doc),
+                        "books": format!("{books} bytes"),
+                    });
+                    if !side.is_null() {
+                        snap["extension"] = side;
+                    }
+                    snap
+                }
+                other => json!({"record": other, "skipped": format!("{} bytes", body.len())}),
+            };
+            Ok::<_, DecodeError>((total, shown))
+        })();
+        match shown {
+            Ok((total, shown)) => {
+                records.push(shown);
+                at += total;
+            }
+            Err(e) => {
+                records.push(json!({"damaged": e.to_string(), "at": at}));
+                break;
+            }
+        }
+    }
+    Ok(json!({"version": version, "records": records}))
 }
 
 #[cfg(test)]
@@ -201,5 +274,79 @@ mod tests {
 
             assert_eq!(streamed, collected, "saving {} chars", doc.len());
         }
+    }
+
+    /// A saved file reads as JSON: its chunk's runs spelled out, its
+    /// snapshot's document as text.
+    #[test]
+    fn a_file_dumps_as_json() {
+        let mut log = OpLog::new();
+        let a = log.agent("alice");
+        let mut books = Accountant::new();
+        let v = log.add_insert(a, &[], 0, "hello".chars());
+        let v = log.add_delete(a, &v, 1..2);
+        books.merge(&log, &v);
+        let mut file = create();
+        save(&mut file, &log, 0, "hllo".chars(), &books);
+        let shown = dump::<char>(&file).unwrap();
+        assert_eq!(shown["version"], 1);
+        let records = shown["records"].as_array().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["record"], "chunk");
+        assert_eq!(records[0]["agents"], serde_json::json!(["alice"]));
+        let runs = records[0]["runs"].as_array().unwrap();
+        assert_eq!(runs[0]["op"]["insert"]["items"], "hello");
+        assert_eq!(
+            runs[1]["parents"],
+            serde_json::json!([{"agent": "alice", "seq": 4}])
+        );
+        assert_eq!(runs[1]["op"]["delete"], serde_json::json!({"pos": 1, "count": 1}));
+        assert_eq!(records[1]["record"], "snapshot");
+        assert_eq!(records[1]["document"], "hllo");
+    }
+
+    /// A damaged record ends the dump, as it ends loading, and says so.
+    #[test]
+    fn a_damaged_file_dumps_up_to_the_damage() {
+        let mut log = OpLog::new();
+        let a = log.agent("a");
+        let mut books = Accountant::new();
+        let v = log.add_insert(a, &[], 0, "hi".chars());
+        books.merge(&log, &v);
+        let mut file = create();
+        save(&mut file, &log, 0, "hi".chars(), &books);
+        let last = file.len() - 1;
+        file[last] ^= 1;
+        let shown = dump::<char>(&file).unwrap();
+        let records = shown["records"].as_array().unwrap();
+        assert_eq!(records[0]["record"], "chunk");
+        assert!(records[1]["damaged"].is_string());
+    }
+
+    /// A snapshot carrying side data a later version wrote still loads.
+    #[test]
+    fn a_snapshots_unknown_side_data_is_ignored() {
+        let mut log = OpLog::new();
+        let a = log.agent("a");
+        let mut books = Accountant::new();
+        let v = log.add_insert(a, &[], 0, "hi".chars());
+        books.merge(&log, &v);
+        let mut file = create();
+        let mut body = Vec::new();
+        log.encode_chunk(0..log.len(), &mut body);
+        record(&mut file, CHUNK, &body);
+        let mut body = Vec::new();
+        put_usize(&mut body, 2);
+        char::encode_run(&['h', 'i'], &mut body);
+        books.encode(&mut body);
+        ext::put_json(&mut body, &serde_json::json!({"later": [1, 2]}));
+        record(&mut file, SNAPSHOT, &body);
+        let loaded = load::<char>(&file).unwrap();
+        assert!(!loaded.damaged);
+        assert_eq!(loaded.snapshot.unwrap().doc, ['h', 'i']);
+        assert_eq!(
+            dump::<char>(&file).unwrap()["records"][1]["extension"],
+            serde_json::json!({"later": [1, 2]})
+        );
     }
 }
