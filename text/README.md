@@ -24,13 +24,14 @@ for msg in got.reply { /* send to ana */ }
 | Local edits | `insert`, `delete`, `replace`, `move_text`, all in bytes; each returns the `Edit`s it made |
 | Sections | `mark_section(at, level)` → `SectionId`; `sections()`, `section_range(id)`, `move_section(id, to)`. A section is a mark on a character, not syntax in the text |
 | Anchors | `anchor(at)` → `Anchor`; `position(&anchor)`; `release(anchor)`. Carets and selections that stay put through every merge |
+| Isolates | `mark_isolate(range, direction)` → `IsolateId` (on an isolate's own range: sets its direction); `isolates()` → `Isolate { id, range, direction, parent }`; `insert_in(at, text, id)`; `remove_isolate(id)`; `lost_isolates()`. Stretches set in a direction of their own (Hebrew in English, an English word in the Hebrew). Markers in the history, not in the text: saved, sent and merged, and text goes inside or outside one by which side of a marker it's put. Text moved out of one keeps its direction. An editor decides what's an isolate |
 | Sync | `hello()` → bytes to send; `receive(bytes)` → `Received { reply, edits }` |
 | Files | `save(&mut file)` appends; `Text::open(writer, &bytes)` |
 
 `Edit` is what the editor's layout needs, in order, each in the text as
 it was just before: `Insert { at, text }`, `Delete { range }`,
 `Move { range, to }` (`to` is before the move, outside the range),
-`Section { section, at, level }`, and `Lost { ranges }`.
+`Section { section, at, level }`, `Isolates` (they changed; the text didn't), and `Lost { ranges }`.
 
 ## Wiring it into an editor
 

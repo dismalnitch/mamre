@@ -81,12 +81,24 @@ impl ChunkExt {
     }
 }
 
-/// What a snapshot carries beside the books. Nothing yet: ghosts' places
-/// (#19) and the history index (#34) come next. Written only when there's
-/// something in it.
+/// What a snapshot carries beside the books. Written only when there's
+/// something in it. Events are named by number, as the rest of the
+/// snapshot names them: a file is written by one log (see `file.rs`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-pub(crate) struct SnapshotExt {}
+pub(crate) struct SnapshotExt {
+    /// The outline's ghosts (#19): each deleted heading that keeps its
+    /// place, and the place, in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) ghosts: Vec<Ghost>,
+}
+
+/// A ghost: a deleted item that keeps its place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Ghost {
+    pub(crate) item: usize,
+    pub(crate) place: usize,
+}
 
 impl SnapshotExt {
     pub(crate) fn is_empty(&self) -> bool {

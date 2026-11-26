@@ -563,7 +563,7 @@ proptest! {
                     .filter_map(|(pos, id)| want_levels.get(id).map(|&l| (pos, *id, l)))
                     .collect();
                 let got_sections: Vec<(usize, Lv, u8)> =
-                    books.sections().iter().map(|s| (s.pos, s.item, s.level)).collect();
+                    books.sections().iter().filter(|s| s.start == mamre_egg_walker::Start::Heading).map(|s| (s.pos, s.item, s.level)).collect();
                 prop_assert_eq!(got_sections, want_sections, "sections, in\n{}", describe(&log));
                 prop_assert_eq!(&doc, &want, "changes_with {:?} to {:?}, in\n{}", from, to, describe(&log));
                 prop_assert_eq!(&kept_ids, &want_ids, "changes_with {:?} to {:?}, in\n{}", from, to, describe(&log));
