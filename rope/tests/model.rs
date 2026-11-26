@@ -183,9 +183,10 @@ fn verify_outline<const N: usize>(rope: &Rope<Doc, N>, text: &str) -> Result<(),
 /// The units a `Markdown` rope counts, and so can find by number.
 const COUNTED: [Unit; 3] = [Unit::Word, Unit::Paragraph, Unit::Section];
 
-const ALL_UNITS: [Unit; 6] = [
+const ALL_UNITS: [Unit; 7] = [
     Unit::Word,
     Unit::VimWord,
+    Unit::MamreWord,
     Unit::Sentence,
     Unit::Paragraph,
     Unit::VimParagraph,
@@ -334,11 +335,13 @@ fn run<const N: usize>(start: &str, ops: &[Op]) -> Result<(), String> {
 }
 
 fn text(max: usize) -> impl Strategy<Value = String> {
-    // Word characters, punctuation that ends sentences and closes them, and
+    // Word characters, punctuation that ends sentences and closes them,
+    // what joins a word's halves (and a mark, which is the word's), digits
+    // and Hebrew letters, which join by rules of their own, and
     // plenty of whitespace and newlines, so every unit has boundaries.
     let pool = vec![
         'a', 'b', 'c', '_', ' ', ' ', '\n', '\n', '\t', '\r', '#', '#', '.', '!', '"', ')', 'é',
-        '日', '🦀',
+        '日', '🦀', '\'', '\'', '-', '\u{5be}', '\u{301}', '1', '2', ',', 'א', 'ב', '\u{5f4}',
     ];
     prop::collection::vec(prop::sample::select(pool), 0..=max)
         .prop_map(|cs| cs.into_iter().collect())

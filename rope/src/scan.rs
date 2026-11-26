@@ -190,23 +190,35 @@ impl<M: Measure, const N: usize> Rope<M, N> {
         // Units placed at their line's start sync at a line start, so this
         // starts out right for them.
         let mut line_start = from;
-        let place = |at: usize, anchor: Anchor, line_start: usize| match anchor {
+        // Where the joiner the machine is holding began. A scan starts at
+        // a sync point, and the machine holds nothing there.
+        let mut held = None;
+        let place = |at: usize, anchor: Anchor, line_start: usize, held: Option<usize>| match anchor {
             Anchor::Here => at,
             Anchor::LineStart => line_start,
+            Anchor::BeforeJoiner => held.unwrap_or(at),
         };
         for (i, c) in self.chars_from(from) {
             let (next, starts, ends) = step(state, c);
+            let back = if unit.holds(state) { held } else { None };
             if ends
                 && let End::Event(anchor) = unit.end()
-                && f(place(i, anchor, line_start), Edge::End, i).is_break()
+                && f(place(i, anchor, line_start, back), Edge::End, i).is_break()
             {
                 return;
             }
-            if starts && f(place(i, unit.start_anchor(), line_start), Edge::Start, i).is_break() {
+            if starts
+                && f(place(i, unit.start_anchor(), line_start, None), Edge::Start, i).is_break()
+            {
                 return;
             }
             if c == '\n' {
                 line_start = i + 1;
+            }
+            if !unit.holds(next) {
+                held = None;
+            } else if !unit.holds(state) {
+                held = Some(i);
             }
             state = next;
         }
@@ -215,7 +227,7 @@ impl<M: Measure, const N: usize> Rope<M, N> {
             return;
         }
         if matches!(unit.end(), End::Event(_)) && unit.inside(state) {
-            let _ = f(len, Edge::End, len);
+            let _ = f(held.unwrap_or(len), Edge::End, len);
         }
     }
 
@@ -236,7 +248,7 @@ impl<M: Measure, const N: usize> Rope<M, N> {
     }
 
     /// The `char`s before byte `pos`, nearest first, with their offsets.
-    fn chars_before(&self, pos: usize) -> impl Iterator<Item = (usize, char)> + '_ {
+    pub(crate) fn chars_before(&self, pos: usize) -> impl Iterator<Item = (usize, char)> + '_ {
         let mut cursor = self.tree.cursor::<ByteOffset>();
         // The chunk holding the byte just before `pos`.
         cursor.seek(&ByteOffset(pos), Bias::Left);
