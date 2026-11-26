@@ -23,6 +23,15 @@ pub enum Unit {
     /// other non-blank characters. Vim also counts an empty line as a word;
     /// that's for a motion layer to add, since it's a rule about motions.
     VimWord,
+    /// A word as a reader means it: a run of letters, digits and the marks
+    /// on them. Whitespace and punctuation are between words, so "two," is
+    /// the word "two", and a pointed Hebrew word is one word, points and
+    /// accents included. What a double click selects.
+    ///
+    /// An apostrophe or a hyphen is punctuation like any other: "don't" is
+    /// two words, as is "dub-sar". Telling an apostrophe from a closing
+    /// quote takes the `char` after it, and a machine sees one at a time.
+    MamreWord,
     /// Vim's sentence (`(` `)`): from the first non-blank character, to a
     /// `.`, `!` or `?` (followed by any `)`, `]`, `"` or `'`) that's
     /// followed by whitespace, or to an empty line. One ended by an empty
@@ -80,6 +89,7 @@ impl Unit {
         match self {
             Unit::Word => word::step,
             Unit::VimWord => vim_word::step,
+            Unit::MamreWord => mamre_word::step,
             Unit::Sentence => sentence::step,
             Unit::Paragraph => paragraph::step,
             Unit::VimParagraph => vim_paragraph::step,
@@ -92,6 +102,7 @@ impl Unit {
         match self {
             Unit::Word => word::START,
             Unit::VimWord => vim_word::START,
+            Unit::MamreWord => mamre_word::START,
             Unit::Sentence => sentence::START,
             Unit::Paragraph => paragraph::START,
             Unit::VimParagraph => vim_paragraph::START,
@@ -102,13 +113,15 @@ impl Unit {
     pub(crate) fn start_anchor(self) -> Anchor {
         match self {
             Unit::Paragraph | Unit::VimParagraph | Unit::Section => Anchor::LineStart,
-            Unit::Word | Unit::VimWord | Unit::Sentence => Anchor::Here,
+            Unit::Word | Unit::VimWord | Unit::MamreWord | Unit::Sentence => Anchor::Here,
         }
     }
 
     pub(crate) fn end(self) -> End {
         match self {
-            Unit::Word | Unit::VimWord | Unit::Sentence => End::Event(Anchor::Here),
+            Unit::Word | Unit::VimWord | Unit::MamreWord | Unit::Sentence => {
+                End::Event(Anchor::Here)
+            }
             Unit::Paragraph | Unit::VimParagraph => End::Event(Anchor::LineStart),
             Unit::Section => End::NextStart,
         }
@@ -124,7 +137,9 @@ impl Unit {
     /// if the text ends here. (Sections end at the next start instead.)
     pub(crate) fn inside(self, state: u8) -> bool {
         match self {
-            Unit::Word | Unit::VimWord | Unit::Sentence => state != self.start_state(),
+            Unit::Word | Unit::VimWord | Unit::MamreWord | Unit::Sentence => {
+                state != self.start_state()
+            }
             Unit::Paragraph | Unit::VimParagraph => state != self.start_state(),
             Unit::Section => true,
         }
@@ -144,7 +159,7 @@ impl Unit {
     pub(crate) fn sync(self, mut before: impl Iterator<Item = (usize, char)>) -> (usize, u8) {
         let start = (0, self.start_state());
         match self {
-            Unit::Word | Unit::VimWord => before
+            Unit::Word | Unit::VimWord | Unit::MamreWord => before
                 .find(|&(_, c)| c.is_whitespace())
                 .map_or(start, |(i, c)| (i + c.len_utf8(), self.start_state())),
             Unit::Sentence => sentence::sync(before).unwrap_or(start),
@@ -315,6 +330,29 @@ mod vim_word {
             // Leaving a word ends it; entering one starts it. Going from
             // keyword to punctuation does both at once.
             (to, to != GAP, state != GAP)
+        }
+    }
+}
+
+/// A reader's word: runs of letters, digits and marks.
+mod mamre_word {
+    use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
+
+    pub const START: u8 = GAP;
+    const GAP: u8 = 0;
+    const IN: u8 = 1;
+
+    /// A letter or digit of any script, or a mark: a vowel point, an
+    /// accent, anything that sits on the letter before it.
+    fn in_word(c: char) -> bool {
+        c.is_alphanumeric() || c.general_category_group() == GeneralCategoryGroup::Mark
+    }
+
+    pub fn step(state: u8, c: char) -> (u8, bool, bool) {
+        if in_word(c) {
+            (IN, state == GAP, false)
+        } else {
+            (GAP, false, state == IN)
         }
     }
 }
@@ -523,6 +561,32 @@ mod tests {
             ["foo", ".", "bar", "(", "x", ")", "baz_2"]
         );
         assert_eq!(pieces(Unit::VimWord, "é日本 -> ok"), ["é日本", "->", "ok"]);
+    }
+
+    #[test]
+    fn mamre_words() {
+        assert_eq!(
+            pieces(Unit::MamreWord, "  foo.bar(x)  baz_2, \"two,\" three!\n"),
+            ["foo", "bar", "x", "baz", "2", "two", "three"]
+        );
+        // A mark stays with its letter, whichever way it's written.
+        assert_eq!(
+            pieces(Unit::MamreWord, "e\u{301}t\u{e9}, na\u{ef}ve"),
+            ["e\u{301}t\u{e9}", "na\u{ef}ve"]
+        );
+        // Pointed Hebrew with its accents, and a maqaf between
+        // two words.
+        assert_eq!(
+            pieces(Unit::MamreWord, "בְּרֵאשִׁ֖ית בָּרָ֣א, אֶת־הַשָּׁמַ֖יִם"),
+            ["בְּרֵאשִׁ֖ית", "בָּרָ֣א", "אֶת", "הַשָּׁמַ֖יִם"]
+        );
+        assert_eq!(pieces(Unit::MamreWord, "日本語 ok"), ["日本語", "ok"]);
+        // An apostrophe and a hyphen are punctuation.
+        assert_eq!(
+            pieces(Unit::MamreWord, "don't dub-sar"),
+            ["don", "t", "dub", "sar"]
+        );
+        assert_eq!(pieces(Unit::MamreWord, " ,.; "), Vec::<&str>::new());
     }
 
     #[test]

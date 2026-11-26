@@ -183,9 +183,10 @@ fn verify_outline<const N: usize>(rope: &Rope<Doc, N>, text: &str) -> Result<(),
 /// The units a `Markdown` rope counts, and so can find by number.
 const COUNTED: [Unit; 3] = [Unit::Word, Unit::Paragraph, Unit::Section];
 
-const ALL_UNITS: [Unit; 6] = [
+const ALL_UNITS: [Unit; 7] = [
     Unit::Word,
     Unit::VimWord,
+    Unit::MamreWord,
     Unit::Sentence,
     Unit::Paragraph,
     Unit::VimParagraph,
