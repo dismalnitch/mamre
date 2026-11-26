@@ -336,11 +336,12 @@ fn run<const N: usize>(start: &str, ops: &[Op]) -> Result<(), String> {
 
 fn text(max: usize) -> impl Strategy<Value = String> {
     // Word characters, punctuation that ends sentences and closes them,
-    // what joins a word's halves (and a mark, which is the word's), and
+    // what joins a word's halves (and a mark, which is the word's), digits
+    // and Hebrew letters, which join by rules of their own, and
     // plenty of whitespace and newlines, so every unit has boundaries.
     let pool = vec![
         'a', 'b', 'c', '_', ' ', ' ', '\n', '\n', '\t', '\r', '#', '#', '.', '!', '"', ')', 'é',
-        '日', '🦀', '\'', '\'', '-', '\u{5be}', '\u{301}',
+        '日', '🦀', '\'', '\'', '-', '\u{5be}', '\u{301}', '1', '2', ',', 'א', 'ב', '\u{5f4}',
     ];
     prop::collection::vec(prop::sample::select(pool), 0..=max)
         .prop_map(|cs| cs.into_iter().collect())

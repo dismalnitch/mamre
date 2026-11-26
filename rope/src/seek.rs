@@ -193,10 +193,25 @@ impl<M: Measure, const N: usize> Rope<M, N> {
                 let row = self.offset_to_point(at).row;
                 self.point_to_offset(Point::new(row, 0))
             }
-            Anchor::BeforeJoiner => match self.chars_before(at).next() {
-                Some((i, c)) if crate::units::joins(c) => i,
-                _ => at,
-            },
+            Anchor::BeforeJoiner => {
+                // Only a `MamreWord` ends this way. Whether its machine
+                // was holding a joiner at `at`, and where that began, takes
+                // running it up to there from where its state is known.
+                let unit = Unit::MamreWord;
+                let (from, mut state) = unit.sync(self.chars_before(at));
+                let step = unit.step();
+                let mut held = None;
+                for (i, c) in self.chars_from(from).take_while(|&(i, _)| i < at) {
+                    let (next, _, _) = step(state, c);
+                    if !unit.holds(next) {
+                        held = None;
+                    } else if !unit.holds(state) {
+                        held = Some(i);
+                    }
+                    state = next;
+                }
+                held.unwrap_or(at)
+            }
         }
     }
 }

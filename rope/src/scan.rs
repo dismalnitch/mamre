@@ -17,7 +17,7 @@ use std::ops::ControlFlow;
 use mamre::cursor::Bias;
 
 use crate::summary::ByteOffset;
-use crate::units::{Anchor, End, Unit, joins};
+use crate::units::{Anchor, End, Unit};
 use crate::{Measure, Rope};
 
 /// Which side of a unit: where it starts, or just past where it ends.
@@ -190,45 +190,44 @@ impl<M: Measure, const N: usize> Rope<M, N> {
         // Units placed at their line's start sync at a line start, so this
         // starts out right for them.
         let mut line_start = from;
-        // Where a joiner just before the `char` being read starts. A scan
-        // starts at a sync point, and none is just past a joiner.
-        let mut joiner = None;
-        let place = |at: usize, anchor: Anchor, line_start: usize, joiner: Option<usize>| match anchor {
+        // Where the joiner the machine is holding began. A scan starts at
+        // a sync point, and the machine holds nothing there.
+        let mut held = None;
+        let place = |at: usize, anchor: Anchor, line_start: usize, held: Option<usize>| match anchor {
             Anchor::Here => at,
             Anchor::LineStart => line_start,
-            Anchor::BeforeJoiner => joiner.unwrap_or(at),
+            Anchor::BeforeJoiner => held.unwrap_or(at),
         };
         for (i, c) in self.chars_from(from) {
             let (next, starts, ends) = step(state, c);
+            let back = if unit.holds(state) { held } else { None };
             if ends
                 && let End::Event(anchor) = unit.end()
-                && f(place(i, anchor, line_start, joiner), Edge::End, i).is_break()
+                && f(place(i, anchor, line_start, back), Edge::End, i).is_break()
             {
                 return;
             }
             if starts
-                && f(place(i, unit.start_anchor(), line_start, joiner), Edge::Start, i).is_break()
+                && f(place(i, unit.start_anchor(), line_start, None), Edge::Start, i).is_break()
             {
                 return;
             }
             if c == '\n' {
                 line_start = i + 1;
             }
-            joiner = joins(c).then_some(i);
+            if !unit.holds(next) {
+                held = None;
+            } else if !unit.holds(state) {
+                held = Some(i);
+            }
             state = next;
         }
         let len = self.len();
         if unit.pending(state) && f(line_start, Edge::Start, len).is_break() {
             return;
         }
-        if let End::Event(anchor) = unit.end()
-            && unit.inside(state)
-        {
-            let at = match anchor {
-                Anchor::BeforeJoiner => joiner.unwrap_or(len),
-                _ => len,
-            };
-            let _ = f(at, Edge::End, len);
+        if matches!(unit.end(), End::Event(_)) && unit.inside(state) {
+            let _ = f(held.unwrap_or(len), Edge::End, len);
         }
     }
 
