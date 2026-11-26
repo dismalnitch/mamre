@@ -46,6 +46,8 @@ pub use mamre_rope::{Plain, Rope, Unit, Units};
 
 mod units;
 
+mod reconcile;
+
 /// One writer's replica of a document: the text, its history, and the
 /// books that keep merges cheap.
 ///
@@ -389,6 +391,107 @@ impl<M: Measure> Text<M> {
         Ok(self.catch_up(&v))
     }
 
+    /// Makes the text `incoming`, edited outside mamre (#35): its content
+    /// is matched against the text (see `reconcile.rs`), what matches keeps
+    /// its characters, so their anchors, sections and history, and the
+    /// rest is ordinary edits, made here and recorded. A paragraph moved
+    /// elsewhere is moved, not deleted and retyped. The edits say what it
+    /// did.
+    pub fn reconcile(&mut self, incoming: &str) -> Vec<Edit> {
+        use reconcile::Piece;
+        let old = self.to_string();
+        let pieces = reconcile::plan(&old, incoming);
+        let mut edits = Vec::new();
+        // What goes: what no piece keeps, from the end.
+        let mut kept: Vec<Range<usize>> = pieces
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Old(r) => Some(r.clone()),
+                Piece::New(_) => None,
+            })
+            .collect();
+        kept.sort_unstable_by_key(|r| r.start);
+        let mut gone = Vec::new();
+        let mut at = 0;
+        for r in &kept {
+            if r.start > at {
+                gone.push(at..r.start);
+            }
+            at = r.end;
+        }
+        if at < old.len() {
+            gone.push(at..old.len());
+        }
+        for r in gone.iter().rev() {
+            edits.extend(self.delete(r.clone()).expect("in the text"));
+        }
+        // The kept pieces as they are now, in the text's order, and as
+        // they should be. Those in the longest run in both orders stay;
+        // each other goes after the one that should come before it.
+        let shift = |p: usize| {
+            p - gone
+                .iter()
+                .filter(|g| g.end <= p)
+                .map(|g| g.len())
+                .sum::<usize>()
+        };
+        let now: Vec<(usize, usize)> = kept.iter().map(|r| (shift(r.start), r.len())).collect();
+        let want: Vec<usize> = pieces
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Old(r) => Some(
+                    kept.binary_search_by_key(&r.start, |k| k.start)
+                        .expect("kept"),
+                ),
+                Piece::New(_) => None,
+            })
+            .collect();
+        let order: Vec<(usize, usize)> = want.iter().enumerate().map(|(t, &k)| (k, t)).collect();
+        let stay: std::collections::HashSet<usize> =
+            lis_by_first(&order).into_iter().map(|t| want[t]).collect();
+        // Where each kept piece is in `now` (by its index in `kept`).
+        let mut seq: Vec<usize> = (0..kept.len()).collect();
+        for t in 0..want.len() {
+            let k = want[t];
+            if stay.contains(&k) {
+                continue;
+            }
+            let from = seq.iter().position(|&x| x == k).expect("kept");
+            let start: usize = seq[..from].iter().map(|&x| now[x].1).sum();
+            let range = start..start + now[k].1;
+            // After the piece that should come before it, or first.
+            let to = match t.checked_sub(1).map(|p| want[p]) {
+                Some(prev) => {
+                    let i = seq.iter().position(|&x| x == prev).expect("kept");
+                    seq[..=i].iter().map(|&x| now[x].1).sum::<usize>()
+                }
+                None => 0,
+            };
+            if to != range.start && to != range.end {
+                edits.extend(self.move_text(range.clone(), to).expect("in the text"));
+            }
+            seq.remove(from);
+            let at = match t.checked_sub(1).map(|p| want[p]) {
+                Some(prev) => seq.iter().position(|&x| x == prev).expect("kept") + 1,
+                None => 0,
+            };
+            seq.insert(at, k);
+        }
+        // What comes: the new text, where it goes.
+        let mut at = 0;
+        for p in &pieces {
+            match p {
+                Piece::Old(r) => at += r.len(),
+                Piece::New(r) => {
+                    edits.extend(self.insert(at, &incoming[r.clone()]).expect("in the text"));
+                    at += r.len();
+                }
+            }
+        }
+        debug_assert_eq!(self.to_string(), incoming);
+        edits
+    }
+
     /// Makes the character at byte `at` start a section at `level` (0: no
     /// section). Returns its id, the same through every edit and merge.
     pub fn mark_section(
@@ -576,4 +679,28 @@ impl<M: Measure> fmt::Display for Text<M> {
         }
         Ok(())
     }
+}
+
+/// The longest run of `pairs` in order by their first: the seconds of its
+/// pairs, which must be in order already.
+fn lis_by_first(pairs: &[(usize, usize)]) -> Vec<usize> {
+    let mut tops: Vec<usize> = Vec::new();
+    let mut prev: Vec<Option<usize>> = vec![None; pairs.len()];
+    for (k, &(i, _)) in pairs.iter().enumerate() {
+        let p = tops.partition_point(|&t| pairs[t].0 < i);
+        prev[k] = p.checked_sub(1).map(|q| tops[q]);
+        if p == tops.len() {
+            tops.push(k);
+        } else {
+            tops[p] = k;
+        }
+    }
+    let mut out = Vec::new();
+    let mut at = tops.last().copied();
+    while let Some(k) = at {
+        out.push(pairs[k].1);
+        at = prev[k];
+    }
+    out.reverse();
+    out
 }
