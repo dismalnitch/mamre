@@ -54,6 +54,7 @@
 
 mod accountant;
 mod anchors;
+mod comments;
 // Kept in the books' format until it's cleaned out (#20): always empty.
 #[allow(dead_code)]
 mod blocks;
@@ -83,8 +84,9 @@ mod walk;
 
 pub use accountant::Accountant;
 pub use anchors::Anchors;
+pub use comments::Comment;
 pub use ids::Identities;
-pub use oplog::{AgentId, Aside, Event, Lv, Op, OpLog};
+pub use oplog::{AgentId, Aside, CommentState, Event, Lv, Op, OpLog};
 pub use outline::{Ambiguity, Next, Policies, Policy, Resolution, Section, Start};
 pub use ranges::AuthorRange;
 pub use walk::{Change, Sequence};

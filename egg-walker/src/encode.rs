@@ -26,7 +26,12 @@
 //!                         one event per run, the events it names by
 //!                         agent name and seq. Ranges (#32): {"range_add":
 //!                         {"start", "end", "tag"}} or {"range_set":
-//!                         {"range", "tag"}}
+//!                         {"range", "tag"}}. Comments (#33):
+//!                         {"comment_add": {"start", "end"}},
+//!                         {"comment_set": {"comment", "state"}}, and a
+//!                         body's edits, a character each:
+//!                         {"body_insert": {"comment", "pos", "item"}},
+//!                         {"body_delete": {"comment", "pos"}}
 //!             (other kinds are reserved for other kinds of event)
 //! extension = what the chunk carries beside its runs, as JSON (see
 //!             `ext.rs`); only when there's something in it. So far:
@@ -484,6 +489,23 @@ impl<T: Clone + Codec> Writer<'_, T> {
                 range: self.named(*range),
                 tag: tag.clone(),
             },
+            Aside::CommentAdd { start, end } => AsideJson::CommentAdd {
+                start: self.named(*start),
+                end: self.named(*end),
+            },
+            Aside::CommentSet { comment, state } => AsideJson::CommentSet {
+                comment: self.named(*comment),
+                state: *state,
+            },
+            Aside::BodyInsert { comment, pos, item } => AsideJson::BodyInsert {
+                comment: self.named(*comment),
+                pos: *pos,
+                item: *item,
+            },
+            Aside::BodyDelete { comment, pos } => AsideJson::BodyDelete {
+                comment: self.named(*comment),
+                pos: *pos,
+            },
         }
     }
 
@@ -548,6 +570,8 @@ struct Planner<'a, T> {
     planned: Vec<Vec<(u64, Lv, usize)>>,
     /// The new events that add a range, for a range set to name.
     new_ranges: std::collections::HashSet<Lv>,
+    /// The new events that add a comment, for its later events to name.
+    new_comments: std::collections::HashSet<Lv>,
 }
 
 impl<'a, T: Clone> Planner<'a, T> {
@@ -568,6 +592,7 @@ impl<'a, T: Clone> Planner<'a, T> {
             names,
             planned: vec![Vec::new(); names.len()],
             new_ranges: Default::default(),
+            new_comments: Default::default(),
         }
     }
 
@@ -662,8 +687,14 @@ impl<'a, T: Clone> Planner<'a, T> {
             RawOp::Aside(json) => {
                 let lv = self.next - 1;
                 let aside = self.aside(json, lv)?;
-                if matches!(aside, Aside::RangeAdd { .. }) {
-                    self.new_ranges.insert(lv);
+                match aside {
+                    Aside::RangeAdd { .. } => {
+                        self.new_ranges.insert(lv);
+                    }
+                    Aside::CommentAdd { .. } => {
+                        self.new_comments.insert(lv);
+                    }
+                    _ => {}
                 }
                 self.new_kinds.push(Kind::Aside);
                 PlannedOp::Run(RunOp::Aside(aside))
@@ -751,6 +782,14 @@ impl<'a, T: Clone> Planner<'a, T> {
                 self.new_ranges.contains(&at)
             }
         };
+        let comment = |at: Lv| {
+            if at < self.log.len() {
+                matches!(self.log.run_of(at).op, RunOp::Aside(Aside::CommentAdd { .. }))
+            } else {
+                self.new_comments.contains(&at)
+            }
+        };
+        let not_comment = "an event about a comment that isn't an earlier comment";
         Ok(match json {
             AsideJson::RangeAdd { start, end, tag } => Aside::RangeAdd {
                 start: earlier(&start, &insert, "a range's end that isn't an earlier insert")?,
@@ -760,6 +799,23 @@ impl<'a, T: Clone> Planner<'a, T> {
             AsideJson::RangeSet { range: r, tag } => Aside::RangeSet {
                 range: earlier(&r, &range, "a range set of something not an earlier range")?,
                 tag,
+            },
+            AsideJson::CommentAdd { start, end } => Aside::CommentAdd {
+                start: earlier(&start, &insert, "a comment's end that isn't an earlier insert")?,
+                end: earlier(&end, &insert, "a comment's end that isn't an earlier insert")?,
+            },
+            AsideJson::CommentSet { comment: c, state } => Aside::CommentSet {
+                comment: earlier(&c, &comment, not_comment)?,
+                state,
+            },
+            AsideJson::BodyInsert { comment: c, pos, item } => Aside::BodyInsert {
+                comment: earlier(&c, &comment, not_comment)?,
+                pos,
+                item,
+            },
+            AsideJson::BodyDelete { comment: c, pos } => Aside::BodyDelete {
+                comment: earlier(&c, &comment, not_comment)?,
+                pos,
             },
         })
     }
