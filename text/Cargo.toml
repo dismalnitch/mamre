@@ -13,3 +13,11 @@ mamre-egg-walker = { path = "../egg-walker" }
 
 [dev-dependencies]
 proptest = "1.12"
+
+[[bench]]
+name = "units"
+harness = false
+
+[[bench]]
+name = "reconcile"
+harness = false

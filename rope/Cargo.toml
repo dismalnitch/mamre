@@ -12,6 +12,8 @@ mamre = { path = ".." }
 arrayvec = "0.7.8"
 # Grapheme cluster boundaries, found chunk by chunk.
 unicode-segmentation = "1.12"
+# Which chars are marks, for words that keep their vowel points.
+unicode-properties = { version = "0.1.5", default-features = false, features = ["general-category"] }
 
 [dev-dependencies]
 proptest = "1.12"

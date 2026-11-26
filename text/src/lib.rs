@@ -41,12 +41,23 @@ use std::ops::Range;
 
 use mamre_egg_walker::sync::Message;
 use mamre_egg_walker::{Accountant, AgentId, Change, Lv, OpLog, Sequence, file};
-pub use mamre_rope::Rope;
+use mamre_rope::Measure;
+pub use mamre_rope::{Plain, Rope, Unit, Units};
+
+mod units;
+
+mod reconcile;
 
 /// One writer's replica of a document: the text, its history, and the
 /// books that keep merges cheap.
-pub struct Text {
-    rope: Rope,
+///
+/// What the text counts beyond bytes, chars and lines is its measure `M`,
+/// chosen with its type: a plain `Text` counts nothing more, a
+/// `Text<Units>` counts words, sentences and paragraphs (#31), so it can
+/// count and seek by them (see [`count`](Text::count)) in O(log n). A
+/// document that doesn't use them doesn't pay for bigger summaries.
+pub struct Text<M: Measure = Plain> {
+    rope: Rope<M>,
     log: OpLog<char>,
     books: Accountant,
     me: AgentId,
@@ -181,12 +192,12 @@ impl fmt::Display for OpenError {
 impl std::error::Error for OpenError {}
 
 /// The rope, edited by the CRDT's changes, noting each in bytes.
-struct Applying<'a> {
-    rope: &'a mut Rope,
+struct Applying<'a, M: Measure> {
+    rope: &'a mut Rope<M>,
     edits: &'a mut Vec<Edit>,
 }
 
-impl Sequence<char> for Applying<'_> {
+impl<M: Measure> Sequence<char> for Applying<'_, M> {
     fn insert(&mut self, pos: usize, items: &[char]) {
         let at = self.rope.char_to_offset(pos);
         let text: String = items.iter().collect();
@@ -224,6 +235,21 @@ impl Text {
     /// replicas (two devices, two windows) never share a name. A user on a
     /// device, say, `"zach@aperol"`.
     pub fn new(writer: &str) -> Self {
+        Text::with_measure(writer)
+    }
+
+    /// Opens a file `save` wrote, to be edited by `writer` (see
+    /// [`new`](Self::new)). A save cut off partway is read up to where
+    /// it's whole.
+    pub fn open(writer: &str, bytes: &[u8]) -> Result<Text, OpenError> {
+        Text::open_with_measure(writer, bytes)
+    }
+}
+
+impl<M: Measure> Text<M> {
+    /// An empty text counting what `M` counts, edited by `writer`: as
+    /// [`Text::new`], say `Text::<Units>::with_measure("me")`.
+    pub fn with_measure(writer: &str) -> Self {
         let mut log = OpLog::new();
         let me = log.agent(writer);
         Text {
@@ -237,7 +263,7 @@ impl Text {
     }
 
     /// The text.
-    pub fn rope(&self) -> &Rope {
+    pub fn rope(&self) -> &Rope<M> {
         &self.rope
     }
 
@@ -251,7 +277,7 @@ impl Text {
     }
 
     /// The text in `range`: a rope of its own, sharing this one's chunks.
-    pub fn slice(&self, range: Range<usize>) -> Result<Rope, TextError> {
+    pub fn slice(&self, range: Range<usize>) -> Result<Rope<M>, TextError> {
         self.check_range(&range)?;
         Ok(self.rope.slice(range))
     }
@@ -363,6 +389,107 @@ impl Text {
         let to = self.rope.offset_to_char(to);
         let v = self.log.add_move(self.me, self.books.version(), chars, to);
         Ok(self.catch_up(&v))
+    }
+
+    /// Makes the text `incoming`, edited outside mamre (#35): its content
+    /// is matched against the text (see `reconcile.rs`), what matches keeps
+    /// its characters, so their anchors, sections and history, and the
+    /// rest is ordinary edits, made here and recorded. A paragraph moved
+    /// elsewhere is moved, not deleted and retyped. The edits say what it
+    /// did.
+    pub fn reconcile(&mut self, incoming: &str) -> Vec<Edit> {
+        use reconcile::Piece;
+        let old = self.to_string();
+        let pieces = reconcile::plan(&old, incoming);
+        let mut edits = Vec::new();
+        // What goes: what no piece keeps, from the end.
+        let mut kept: Vec<Range<usize>> = pieces
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Old(r) => Some(r.clone()),
+                Piece::New(_) => None,
+            })
+            .collect();
+        kept.sort_unstable_by_key(|r| r.start);
+        let mut gone = Vec::new();
+        let mut at = 0;
+        for r in &kept {
+            if r.start > at {
+                gone.push(at..r.start);
+            }
+            at = r.end;
+        }
+        if at < old.len() {
+            gone.push(at..old.len());
+        }
+        for r in gone.iter().rev() {
+            edits.extend(self.delete(r.clone()).expect("in the text"));
+        }
+        // The kept pieces as they are now, in the text's order, and as
+        // they should be. Those in the longest run in both orders stay;
+        // each other goes after the one that should come before it.
+        let shift = |p: usize| {
+            p - gone
+                .iter()
+                .filter(|g| g.end <= p)
+                .map(|g| g.len())
+                .sum::<usize>()
+        };
+        let now: Vec<(usize, usize)> = kept.iter().map(|r| (shift(r.start), r.len())).collect();
+        let want: Vec<usize> = pieces
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Old(r) => Some(
+                    kept.binary_search_by_key(&r.start, |k| k.start)
+                        .expect("kept"),
+                ),
+                Piece::New(_) => None,
+            })
+            .collect();
+        let order: Vec<(usize, usize)> = want.iter().enumerate().map(|(t, &k)| (k, t)).collect();
+        let stay: std::collections::HashSet<usize> =
+            lis_by_first(&order).into_iter().map(|t| want[t]).collect();
+        // Where each kept piece is in `now` (by its index in `kept`).
+        let mut seq: Vec<usize> = (0..kept.len()).collect();
+        for t in 0..want.len() {
+            let k = want[t];
+            if stay.contains(&k) {
+                continue;
+            }
+            let from = seq.iter().position(|&x| x == k).expect("kept");
+            let start: usize = seq[..from].iter().map(|&x| now[x].1).sum();
+            let range = start..start + now[k].1;
+            // After the piece that should come before it, or first.
+            let to = match t.checked_sub(1).map(|p| want[p]) {
+                Some(prev) => {
+                    let i = seq.iter().position(|&x| x == prev).expect("kept");
+                    seq[..=i].iter().map(|&x| now[x].1).sum::<usize>()
+                }
+                None => 0,
+            };
+            if to != range.start && to != range.end {
+                edits.extend(self.move_text(range.clone(), to).expect("in the text"));
+            }
+            seq.remove(from);
+            let at = match t.checked_sub(1).map(|p| want[p]) {
+                Some(prev) => seq.iter().position(|&x| x == prev).expect("kept") + 1,
+                None => 0,
+            };
+            seq.insert(at, k);
+        }
+        // What comes: the new text, where it goes.
+        let mut at = 0;
+        for p in &pieces {
+            match p {
+                Piece::Old(r) => at += r.len(),
+                Piece::New(r) => {
+                    edits.extend(self.insert(at, &incoming[r.clone()]).expect("in the text"));
+                    at += r.len();
+                }
+            }
+        }
+        debug_assert_eq!(self.to_string(), incoming);
+        edits
     }
 
     /// Makes the character at byte `at` start a section at `level` (0: no
@@ -515,10 +642,10 @@ impl Text {
         self.saved = file::save(file, &self.log, self.saved, self.rope.chars(), &self.books);
     }
 
-    /// Opens a file `save` wrote, to be edited by `writer` (see
-    /// [`new`](Self::new)). A save cut off partway is read up to where
-    /// it's whole.
-    pub fn open(writer: &str, bytes: &[u8]) -> Result<Text, OpenError> {
+    /// Opens a file `save` wrote, counting what `M` counts: as
+    /// [`Text::open`]. The measure isn't in the file: open it however the
+    /// document wants it counted.
+    pub fn open_with_measure(writer: &str, bytes: &[u8]) -> Result<Self, OpenError> {
         let loaded = file::load::<char>(bytes).map_err(|e| match e {
             file::LoadError::NotAFile => OpenError::NotAFile,
             file::LoadError::Version(v) => OpenError::Version(v),
@@ -545,11 +672,35 @@ impl Text {
     }
 }
 
-impl fmt::Display for Text {
+impl<M: Measure> fmt::Display for Text<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for chunk in self.rope.chunks() {
             f.write_str(chunk)?;
         }
         Ok(())
     }
+}
+
+/// The longest run of `pairs` in order by their first: the seconds of its
+/// pairs, which must be in order already.
+fn lis_by_first(pairs: &[(usize, usize)]) -> Vec<usize> {
+    let mut tops: Vec<usize> = Vec::new();
+    let mut prev: Vec<Option<usize>> = vec![None; pairs.len()];
+    for (k, &(i, _)) in pairs.iter().enumerate() {
+        let p = tops.partition_point(|&t| pairs[t].0 < i);
+        prev[k] = p.checked_sub(1).map(|q| tops[q]);
+        if p == tops.len() {
+            tops.push(k);
+        } else {
+            tops[p] = k;
+        }
+    }
+    let mut out = Vec::new();
+    let mut at = tops.last().copied();
+    while let Some(k) = at {
+        out.push(pairs[k].1);
+        at = prev[k];
+    }
+    out.reverse();
+    out
 }
