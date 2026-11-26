@@ -10,6 +10,16 @@ publish = false
 [dependencies]
 mamre-rope = { path = "../rope" }
 mamre-egg-walker = { path = "../egg-walker" }
+mamre = { path = ".." }
 
 [dev-dependencies]
 proptest = "1.12"
+unicode-bidi = "0.3.18"
+
+[[bench]]
+name = "units"
+harness = false
+
+[[bench]]
+name = "reconcile"
+harness = false

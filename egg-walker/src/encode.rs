@@ -52,18 +52,27 @@ use mamre::codec::{
 
 use crate::oplog::{AgentId, Kind, Lv, Op, OpLog, RunOp, normalize};
 
-/// What a new run of a chunk adds: a run as the log keeps it, or
-/// undeletes, one target each (they needn't be side by side here).
-enum PlannedOp<T> {
-    Run(RunOp<T>),
-    Undeletes(Vec<Lv>),
-}
-
 const INSERT: u64 = 0;
 const DELETE: u64 = 1;
 const UNDELETE: u64 = 2;
 const MOVE: u64 = 3;
 const MARK: u64 = 4;
+
+// Encoding and decoding mirror each other, step by step:
+//
+// | step                    | writes              | reads               |
+// |-------------------------|---------------------|---------------------|
+// | the whole chunk         | `encode_events`     | `parse_chunk`       |
+// | compression byte        | (a 0)               | `get_compression`   |
+// | the agent table         | `put_agents`        | `get_agents`        |
+// | one run                 | `Writer::put_run`   | `get_run`           |
+// | a run's seq             | `Seqs::put`         | `Seqs::get`         |
+// | one reference           | `Writer::put_ref`   | `get_ref`           |
+// | one run's op, by kind   | `Writer::put_op`    | `get_op`            |
+// | the target              | (none: text only)   | `get_target`        |
+//
+// `decode_chunk` then checks the parsed runs against this log
+// (`Planner`) before it adds anything (`apply`).
 
 /// A reference to an event, as read: in this chunk, or from before it.
 #[derive(Clone, Copy)]
@@ -98,6 +107,91 @@ impl<T> RawRun<T> {
     }
 }
 
+/// The events a chunk carries: spans of the log (sorted, apart, none
+/// empty), and where each starts in the chunk's own order.
+struct Spans {
+    spans: Vec<Range<Lv>>,
+    offsets: Vec<usize>,
+}
+
+impl Spans {
+    fn new(spans: &[Range<Lv>], log_len: usize) -> Self {
+        let spans: Vec<Range<Lv>> = spans.iter().filter(|s| !s.is_empty()).cloned().collect();
+        assert!(
+            spans.windows(2).all(|w| w[0].end <= w[1].start)
+                && spans.last().is_none_or(|s| s.end <= log_len),
+            "spans {spans:?} aren't sorted, apart and in the log"
+        );
+        let offsets = spans
+            .iter()
+            .scan(0, |n, s| {
+                let at = *n;
+                *n += s.len();
+                Some(at)
+            })
+            .collect();
+        Spans { spans, offsets }
+    }
+
+    /// Where `lv` is in the chunk, if the chunk carries it.
+    fn index(&self, lv: Lv) -> Option<usize> {
+        let k = self.spans.partition_point(|s| s.end <= lv);
+        self.spans
+            .get(k)
+            .filter(|s| s.start <= lv)
+            .map(|s| self.offsets[k] + lv - s.start)
+    }
+}
+
+/// A stretch of one of the log's runs that a chunk carries: the run's
+/// index, and the events.
+type Piece = (usize, Range<Lv>);
+
+/// The agents a chunk names, in the order it names them.
+#[derive(Default)]
+struct AgentTable {
+    agents: Vec<AgentId>,
+    index: HashMap<AgentId, usize>,
+}
+
+impl AgentTable {
+    /// `agent`'s index in the table, adding it if it's new.
+    fn name(&mut self, agent: AgentId) -> usize {
+        *self.index.entry(agent).or_insert_with(|| {
+            self.agents.push(agent);
+            self.agents.len() - 1
+        })
+    }
+}
+
+/// Each agent's seq where its last run so far in the chunk ended (0 before
+/// its first): a run's seq is written as its difference from that.
+#[derive(Default)]
+struct Seqs(HashMap<usize, u64>);
+
+impl Seqs {
+    fn expected(&self, agent: usize) -> u64 {
+        self.0.get(&agent).copied().unwrap_or(0)
+    }
+
+    fn put(&self, out: &mut Vec<u8>, agent: usize, seq: u64) {
+        (seq as i64 - self.expected(agent) as i64).encode(out);
+    }
+
+    fn get(&self, input: &mut &[u8], agent: usize) -> Result<u64, DecodeError> {
+        let delta = i64::decode(input)?;
+        (self.expected(agent) as i64)
+            .checked_add(delta)
+            .and_then(|s| u64::try_from(s).ok())
+            .ok_or(DecodeError::Overflow)
+    }
+
+    /// Notes that `agent`'s run ended just before `end`.
+    fn ran(&mut self, agent: usize, end: u64) {
+        self.0.insert(agent, end);
+    }
+}
+
 impl<T: Clone + Codec> OpLog<T> {
     /// Appends the events in `events` (in this log's order) as a chunk.
     /// Events before `events.start` are referred to by agent and sequence
@@ -112,31 +206,27 @@ impl<T: Clone + Codec> OpLog<T> {
     /// number. For one span, the same bytes as
     /// [`encode_chunk`](Self::encode_chunk).
     pub fn encode_events(&self, spans: &[Range<Lv>], out: &mut Vec<u8>) {
-        let spans: Vec<Range<Lv>> = spans.iter().filter(|s| !s.is_empty()).cloned().collect();
-        assert!(
-            spans.windows(2).all(|w| w[0].end <= w[1].start)
-                && spans.last().is_none_or(|s| s.end <= self.len()),
-            "spans {spans:?} aren't sorted, apart and in the log"
-        );
-        // Where each span starts in the chunk's own order.
-        let offsets: Vec<usize> = spans
-            .iter()
-            .scan(0, |n, s| {
-                let at = *n;
-                *n += s.len();
-                Some(at)
-            })
-            .collect();
-        let chunk_index = |lv: Lv| -> Option<usize> {
-            let k = spans.partition_point(|s| s.end <= lv);
-            spans
-                .get(k)
-                .filter(|s| s.start <= lv)
-                .map(|s| offsets[k] + lv - s.start)
+        let spans = Spans::new(spans, self.len());
+        let pieces = self.pieces(&spans);
+        let agents = self.chunk_agents(&pieces, &spans);
+        out.push(0); // No compression.
+        self.put_agents(out, &agents.agents);
+        put_usize(out, pieces.len());
+        let writer = Writer {
+            log: self,
+            spans: &spans,
+            agents: &agents,
         };
-        // The stretches of runs in the spans.
+        let mut seqs = Seqs::default();
+        for piece in &pieces {
+            writer.put_run(out, piece, &mut seqs);
+        }
+    }
+
+    /// The stretches of runs in `spans`, in order.
+    fn pieces(&self, spans: &Spans) -> Vec<Piece> {
         let mut pieces = Vec::new();
-        for span in &spans {
+        for span in &spans.spans {
             let mut r = self.run_index(span.start);
             while let Some(run) = self.runs.get(r)
                 && run.start < span.end
@@ -145,88 +235,38 @@ impl<T: Clone + Codec> OpLog<T> {
                 r += 1;
             }
         }
-        // The agents it names: its own, and those of events it refers to
-        // from outside.
-        let mut agents: Vec<AgentId> = Vec::new();
-        let mut index: HashMap<AgentId, usize> = HashMap::new();
-        let mut name = |agent: AgentId, agents: &mut Vec<AgentId>| {
-            *index.entry(agent).or_insert_with(|| {
-                agents.push(agent);
-                agents.len() - 1
-            })
-        };
-        for (r, range) in &pieces {
+        pieces
+    }
+
+    /// The agents a chunk names: those of its own events, and those of
+    /// events it refers to from outside, in order of first mention.
+    fn chunk_agents(&self, pieces: &[Piece], spans: &Spans) -> AgentTable {
+        let mut agents = AgentTable::default();
+        for (r, range) in pieces {
             let run = &self.runs[*r];
-            name(run.agent, &mut agents);
-            for p in self.piece_parents(*r, range.start) {
-                if chunk_index(p).is_none() {
-                    name(self.run_of(p).agent, &mut agents);
+            agents.name(run.agent);
+            let mut outside = |lv: Lv| {
+                if spans.index(lv).is_none() {
+                    agents.name(self.run_of(lv).agent);
                 }
+            };
+            for p in self.piece_parents(*r, range.start) {
+                outside(p);
             }
             if let RunOp::Undelete { target, .. } = run.op {
                 for t in target + (range.start - run.start)..target + (range.end - run.start) {
-                    if chunk_index(t).is_none() {
-                        name(self.run_of(t).agent, &mut agents);
-                    }
+                    outside(t);
                 }
             }
         }
-        let index: HashMap<AgentId, usize> =
-            agents.iter().enumerate().map(|(i, &a)| (a, i)).collect();
+        agents
+    }
 
-        out.push(0); // No compression.
+    /// Writes the agent table: a count, then each name.
+    fn put_agents(&self, out: &mut Vec<u8>, agents: &[AgentId]) {
         put_usize(out, agents.len());
-        for &agent in &agents {
+        for &agent in agents {
             put_str(out, self.agent_name(agent));
-        }
-        put_usize(out, pieces.len());
-        let mut next_seq: HashMap<AgentId, u64> = HashMap::new();
-        for (r, range) in &pieces {
-            let run = &self.runs[*r];
-            let k = range.start - run.start;
-            let first = chunk_index(range.start).expect("a piece is in the chunk");
-            put_usize(out, index[&run.agent]);
-            let seq = run.seq + k as u64;
-            let expected = next_seq.get(&run.agent).copied().unwrap_or(0);
-            (seq as i64 - expected as i64).encode(out);
-            next_seq.insert(run.agent, seq + range.len() as u64);
-            let parents = self.piece_parents(*r, range.start);
-            put_usize(out, parents.len());
-            for p in parents {
-                self.put_ref(out, p, first, chunk_index(p), &index);
-            }
-            match &run.op {
-                RunOp::Insert { pos, items } => {
-                    put_varint(out, INSERT << 1);
-                    put_usize(out, pos + k);
-                    put_usize(out, range.len());
-                    T::encode_run(&items[k..k + range.len()], out);
-                }
-                RunOp::Delete { pos, .. } => {
-                    put_varint(out, DELETE << 1);
-                    put_usize(out, *pos);
-                    put_usize(out, range.len());
-                }
-                RunOp::Undelete { target, .. } => {
-                    put_varint(out, UNDELETE << 1);
-                    put_usize(out, range.len());
-                    for i in 0..range.len() {
-                        let t = target + k + i;
-                        self.put_ref(out, t, first, chunk_index(t), &index);
-                    }
-                }
-                RunOp::Move { pos, len, to } => {
-                    put_varint(out, MOVE << 1);
-                    put_usize(out, *pos);
-                    put_usize(out, *len);
-                    put_usize(out, *to);
-                }
-                RunOp::Mark { pos, level } => {
-                    put_varint(out, MARK << 1);
-                    put_usize(out, *pos);
-                    put_usize(out, *level as usize);
-                }
-            }
         }
     }
 
@@ -240,30 +280,6 @@ impl<T: Clone + Codec> OpLog<T> {
         }
     }
 
-    /// Writes a reference to `lv` from a run whose first event is `first`
-    /// in the chunk: by distance if `lv` is in the chunk too (at `inside`),
-    /// by agent and seq if not.
-    fn put_ref(
-        &self,
-        out: &mut Vec<u8>,
-        lv: Lv,
-        first: usize,
-        inside: Option<usize>,
-        index: &HashMap<AgentId, usize>,
-    ) {
-        match inside {
-            Some(at) => {
-                debug_assert!(at < first, "a reference is to an earlier event");
-                put_usize(out, (first - at) << 1);
-            }
-            None => {
-                let run = self.run_of(lv);
-                put_usize(out, (index[&run.agent] << 1) | 1);
-                put_varint(out, run.seq + (lv - run.start) as u64);
-            }
-        }
-    }
-
     /// Adds the events of a chunk (one [`encode_chunk`](Self::encode_chunk)
     /// wrote) that this log doesn't have yet. Returns how many were new.
     ///
@@ -271,135 +287,32 @@ impl<T: Clone + Codec> OpLog<T> {
     /// to events this log doesn't have, nothing is added.
     pub fn decode_chunk(&mut self, mut bytes: &[u8]) -> Result<usize, DecodeError> {
         let input = &mut bytes;
-        let runs = Self::parse_chunk(input)?;
+        let (names, runs) = parse_chunk::<T>(input)?;
         if !input.is_empty() {
             return Err(DecodeError::Invalid("bytes after the chunk"));
         }
-        let (names, runs) = runs;
-
-        // Plan, run by run: which events this log has already (a prefix of
-        // each agent's), the numbers the new ones get, and their parents.
-        let agents: Vec<Option<AgentId>> = names.iter().map(|n| self.agent_by_name(n)).collect();
-        // Each agent's next new seq: what this log has, then what the
-        // chunk adds. A new event must be exactly that: every event
-        // includes the one before, so a replica has a prefix of each
-        // agent's events, and a summary can say so.
-        let mut next_seq: Vec<u64> = agents
-            .iter()
-            .map(|a| a.map_or(0, |a| self.next_seq[a.index()]))
-            .collect();
-        let have: Vec<u64> = next_seq.clone();
-        let mut lvs: Vec<Lv> = Vec::new();
-        let mut new_kinds: Vec<Kind> = Vec::new();
-        let mut next = self.len();
-        let resolve = |r: Ref, at: usize, lvs: &[Lv]| -> Result<Lv, DecodeError> {
-            match r {
-                Ref::Back(d) => {
-                    let i = at
-                        .checked_sub(d)
-                        .filter(|_| d > 0)
-                        .ok_or(DecodeError::Invalid("a reference past the chunk's start"))?;
-                    Ok(lvs[i])
-                }
-                Ref::Before { agent, seq } => {
-                    let a = agents
-                        .get(agent)
-                        .ok_or(DecodeError::Invalid("an agent the chunk doesn't name"))?;
-                    a.and_then(|a| self.find(a, seq))
-                        .ok_or(DecodeError::Invalid("an event this log doesn't have"))
-                }
-            }
-        };
-        // New runs: agent (into names), seq, parents, and the op, as a run
-        // or (undeletes) one target per event.
-        let mut planned: Vec<(usize, u64, Vec<Lv>, PlannedOp<T>)> = Vec::new();
+        let mut planner = Planner::new(self, &names);
+        let mut planned = Vec::new();
         for run in runs {
-            if run.agent >= names.len() {
-                return Err(DecodeError::Invalid("an agent the chunk doesn't name"));
-            }
-            let len = run.len();
-            run.seq
-                .checked_add(len as u64)
-                .ok_or(DecodeError::Overflow)?;
-            let first = lvs.len();
-            // The prefix this log has already.
-            let known = have[run.agent].saturating_sub(run.seq).min(len as u64) as usize;
-            let agent = agents[run.agent];
-            for k in 0..known {
-                let a = agent.expect("a known event's agent is known");
-                lvs.push(
-                    self.find(a, run.seq + k as u64)
-                        .expect("a prefix of the agent's events"),
-                );
-            }
-            if known == len {
-                continue;
-            }
-            let seq = run.seq + known as u64;
-            if seq != next_seq[run.agent] {
-                return Err(DecodeError::Invalid("a gap in an agent's events"));
-            }
-            let n = len - known;
-            next_seq[run.agent] += n as u64;
-            let parents = if known == 0 {
-                run.parents
-                    .iter()
-                    .map(|&p| resolve(p, first, &lvs))
-                    .collect::<Result<Vec<_>, _>>()?
-            } else {
-                vec![lvs[first + known - 1]]
-            };
-            let start = next;
-            lvs.extend(start..start + n);
-            next += n;
-            let op = match run.op {
-                RawOp::Insert { pos, mut items } => {
-                    let pos = pos.checked_add(known).ok_or(DecodeError::Overflow)?;
-                    new_kinds.extend(std::iter::repeat_n(Kind::Insert, n));
-                    PlannedOp::Run(RunOp::Insert {
-                        pos,
-                        items: items.split_off(known),
-                    })
-                }
-                RawOp::Delete { pos, .. } => {
-                    new_kinds.extend(std::iter::repeat_n(Kind::Delete, n));
-                    PlannedOp::Run(RunOp::Delete { pos, len: n })
-                }
-                RawOp::Move { pos, len, to } => {
-                    new_kinds.push(Kind::Move);
-                    PlannedOp::Run(RunOp::Move { pos, len, to })
-                }
-                RawOp::Mark { pos, level } => {
-                    new_kinds.push(Kind::Mark);
-                    PlannedOp::Run(RunOp::Mark { pos, level })
-                }
-                RawOp::Undelete { targets } => {
-                    let mut resolved = Vec::with_capacity(n);
-                    for &t in &targets[known..] {
-                        let t = resolve(t, first, &lvs)?;
-                        let is_delete = if t < self.len() {
-                            self.kind(t) == Kind::Delete
-                        } else {
-                            new_kinds.get(t - self.len()) == Some(&Kind::Delete)
-                        };
-                        if !is_delete {
-                            return Err(DecodeError::Invalid(
-                                "an undelete of something not a delete",
-                            ));
-                        }
-                        resolved.push(t);
-                    }
-                    new_kinds.extend(std::iter::repeat_n(Kind::Undelete, n));
-                    PlannedOp::Undeletes(resolved)
-                }
-            };
-            planned.push((run.agent, seq, parents, op));
+            planned.extend(planner.plan_run(run)?);
         }
-
-        // Apply: everything checked.
-        let ids: Vec<AgentId> = names.iter().map(|n| self.agent(n)).collect();
+        let next = planner.next;
         let added = next - self.len();
-        for (agent, seq, parents, op) in planned {
+        self.apply(&names, planned);
+        debug_assert_eq!(self.len(), next, "planned numbering");
+        Ok(added)
+    }
+
+    /// Adds a chunk's planned runs, everything checked.
+    fn apply(&mut self, names: &[String], planned: Vec<PlannedRun<T>>) {
+        let ids: Vec<AgentId> = names.iter().map(|n| self.agent(n)).collect();
+        for PlannedRun {
+            agent,
+            seq,
+            parents,
+            op,
+        } in planned
+        {
             match op {
                 PlannedOp::Run(op) => {
                     self.push_run(ids[agent], seq, normalize(parents), op);
@@ -418,107 +331,414 @@ impl<T: Clone + Codec> OpLog<T> {
                 }
             }
         }
-        debug_assert_eq!(self.len(), next, "planned numbering");
-        Ok(added)
+    }
+}
+
+/// Writes a chunk's runs: the log, the events the chunk carries, and the
+/// agents it names.
+struct Writer<'a, T> {
+    log: &'a OpLog<T>,
+    spans: &'a Spans,
+    agents: &'a AgentTable,
+}
+
+impl<T: Clone + Codec> Writer<'_, T> {
+    /// Writes one piece: agent, seq, parents, then the op. Mirrors
+    /// [`get_run`].
+    fn put_run(&self, out: &mut Vec<u8>, (r, range): &Piece, seqs: &mut Seqs) {
+        let run = &self.log.runs[*r];
+        let k = range.start - run.start;
+        let first = self
+            .spans
+            .index(range.start)
+            .expect("a piece is in the chunk");
+        let agent = self.agents.index[&run.agent];
+        put_usize(out, agent);
+        let seq = run.seq + k as u64;
+        seqs.put(out, agent, seq);
+        seqs.ran(agent, seq + range.len() as u64);
+        let parents = self.log.piece_parents(*r, range.start);
+        put_usize(out, parents.len());
+        for p in parents {
+            self.put_ref(out, p, first);
+        }
+        self.put_op(out, &run.op, k..k + range.len(), first);
     }
 
-    /// Reads a chunk's agents and runs.
-    #[allow(clippy::type_complexity)]
-    fn parse_chunk(input: &mut &[u8]) -> Result<(Vec<String>, Vec<RawRun<T>>), DecodeError> {
-        match u8::decode(input)? {
-            0 => {}
-            _ => return Err(DecodeError::Invalid("an unknown compression")),
+    /// Writes events `ks` (counted from the run's first) of a run's op: its
+    /// tag, then its fields. Mirrors [`get_op`].
+    fn put_op(&self, out: &mut Vec<u8>, op: &RunOp<T>, ks: Range<usize>, first: usize) {
+        match op {
+            RunOp::Insert { pos, items } => {
+                put_varint(out, INSERT << 1);
+                put_usize(out, pos + ks.start);
+                put_usize(out, ks.len());
+                T::encode_run(&items[ks], out);
+            }
+            RunOp::Delete { pos, .. } => {
+                put_varint(out, DELETE << 1);
+                put_usize(out, *pos);
+                put_usize(out, ks.len());
+            }
+            RunOp::Undelete { target, .. } => {
+                put_varint(out, UNDELETE << 1);
+                put_usize(out, ks.len());
+                for k in ks {
+                    self.put_ref(out, target + k, first);
+                }
+            }
+            RunOp::Move { pos, len, to } => {
+                put_varint(out, MOVE << 1);
+                put_usize(out, *pos);
+                put_usize(out, *len);
+                put_usize(out, *to);
+            }
+            RunOp::Mark { pos, level } => {
+                put_varint(out, MARK << 1);
+                put_usize(out, *pos);
+                put_usize(out, *level as usize);
+            }
         }
-        let n = get_usize(input)?;
-        let mut names = Vec::with_capacity(n.min(input.len()));
-        for _ in 0..n {
-            names.push(get_str(input)?.to_string());
+    }
+
+    /// Writes a reference to `lv` from a run whose first event is `first`
+    /// in the chunk: by distance if `lv` is in the chunk too, by agent and
+    /// seq if not. Mirrors [`get_ref`].
+    fn put_ref(&self, out: &mut Vec<u8>, lv: Lv, first: usize) {
+        match self.spans.index(lv) {
+            Some(at) => {
+                debug_assert!(at < first, "a reference is to an earlier event");
+                put_usize(out, (first - at) << 1);
+            }
+            None => {
+                let run = self.log.run_of(lv);
+                put_usize(out, (self.agents.index[&run.agent] << 1) | 1);
+                put_varint(out, run.seq + (lv - run.start) as u64);
+            }
         }
-        let n = get_usize(input)?;
-        let mut runs = Vec::with_capacity(n.min(input.len()));
-        let mut next_seq: HashMap<usize, u64> = HashMap::new();
-        let get_ref = |input: &mut &[u8]| -> Result<Ref, DecodeError> {
-            let v = get_usize(input)?;
-            if v & 1 == 0 {
-                Ok(Ref::Back(v >> 1))
-            } else {
-                Ok(Ref::Before {
-                    agent: v >> 1,
-                    seq: get_varint(input)?,
+    }
+}
+
+/// What a new run of a chunk adds: a run as the log keeps it, or
+/// undeletes, one target each (they needn't be side by side here).
+enum PlannedOp<T> {
+    Run(RunOp<T>),
+    Undeletes(Vec<Lv>),
+}
+
+/// A run of a chunk with the events this log has already left out: the
+/// agent (into the chunk's names), its first new seq, its parents, its op.
+struct PlannedRun<T> {
+    agent: usize,
+    seq: u64,
+    parents: Vec<Lv>,
+    op: PlannedOp<T>,
+}
+
+/// Checks a chunk's runs against a log, run by run: which events the log
+/// has already (a prefix of each agent's), the numbers the new ones get,
+/// and their parents.
+struct Planner<'a, T> {
+    log: &'a OpLog<T>,
+    /// The log's agent for each name, if it has one.
+    agents: Vec<Option<AgentId>>,
+    /// Each agent's next seq in the log before this chunk.
+    have: Vec<u64>,
+    /// Each agent's next new seq: what the log has, then what the chunk
+    /// adds. A new event must be exactly that: every event includes the
+    /// one before, so a replica has a prefix of each agent's events, and a
+    /// summary can say so.
+    next_seq: Vec<u64>,
+    /// Each of the chunk's events so far, as numbered in the log.
+    lvs: Vec<Lv>,
+    /// The kinds of the new events so far.
+    new_kinds: Vec<Kind>,
+    /// The number the next new event gets.
+    next: Lv,
+}
+
+impl<'a, T: Clone> Planner<'a, T> {
+    fn new(log: &'a OpLog<T>, names: &[String]) -> Self {
+        let agents: Vec<Option<AgentId>> = names.iter().map(|n| log.agent_by_name(n)).collect();
+        let have: Vec<u64> = agents
+            .iter()
+            .map(|a| a.map_or(0, |a| log.next_seq[a.index()]))
+            .collect();
+        Planner {
+            log,
+            agents,
+            next_seq: have.clone(),
+            have,
+            lvs: Vec::new(),
+            new_kinds: Vec::new(),
+            next: log.len(),
+        }
+    }
+
+    /// Plans one run: `None` if the log has all of it already.
+    fn plan_run(&mut self, run: RawRun<T>) -> Result<Option<PlannedRun<T>>, DecodeError> {
+        if run.agent >= self.agents.len() {
+            return Err(DecodeError::Invalid("an agent the chunk doesn't name"));
+        }
+        let len = run.len();
+        run.seq
+            .checked_add(len as u64)
+            .ok_or(DecodeError::Overflow)?;
+        let first = self.lvs.len();
+        let known = self.known(&run);
+        if known == len {
+            return Ok(None);
+        }
+        let seq = run.seq + known as u64;
+        if seq != self.next_seq[run.agent] {
+            return Err(DecodeError::Invalid("a gap in an agent's events"));
+        }
+        let n = len - known;
+        self.next_seq[run.agent] += n as u64;
+        let parents = if known == 0 {
+            run.parents
+                .iter()
+                .map(|&p| self.resolve(p, first))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            vec![self.lvs[first + known - 1]]
+        };
+        let start = self.next;
+        self.lvs.extend(start..start + n);
+        self.next += n;
+        let op = self.plan_op(run.op, known, n, first)?;
+        Ok(Some(PlannedRun {
+            agent: run.agent,
+            seq,
+            parents,
+            op,
+        }))
+    }
+
+    /// How many of `run`'s events, from its first, the log has already.
+    /// Numbers them.
+    fn known(&mut self, run: &RawRun<T>) -> usize {
+        let known = self.have[run.agent]
+            .saturating_sub(run.seq)
+            .min(run.len() as u64) as usize;
+        for k in 0..known {
+            let a = self.agents[run.agent].expect("a known event's agent is known");
+            self.lvs.push(
+                self.log
+                    .find(a, run.seq + k as u64)
+                    .expect("a prefix of the agent's events"),
+            );
+        }
+        known
+    }
+
+    /// The op for the `n` new events of a run, after the `known` the log
+    /// has. The run's first event is `first` in the chunk.
+    fn plan_op(
+        &mut self,
+        op: RawOp<T>,
+        known: usize,
+        n: usize,
+        first: usize,
+    ) -> Result<PlannedOp<T>, DecodeError> {
+        Ok(match op {
+            RawOp::Insert { pos, mut items } => {
+                let pos = pos.checked_add(known).ok_or(DecodeError::Overflow)?;
+                self.new_kinds.extend(std::iter::repeat_n(Kind::Insert, n));
+                PlannedOp::Run(RunOp::Insert {
+                    pos,
+                    items: items.split_off(known),
                 })
             }
-        };
-        for _ in 0..n {
-            let agent = get_usize(input)?;
-            let delta = i64::decode(input)?;
-            let expected = next_seq.get(&agent).copied().unwrap_or(0);
-            let seq = u64::try_from(expected as i64 + delta).map_err(|_| DecodeError::Overflow)?;
-            let n_parents = get_usize(input)?;
-            let mut parents = Vec::with_capacity(n_parents.min(input.len()));
-            for _ in 0..n_parents {
-                parents.push(get_ref(input)?);
+            RawOp::Delete { pos, .. } => {
+                self.new_kinds.extend(std::iter::repeat_n(Kind::Delete, n));
+                PlannedOp::Run(RunOp::Delete { pos, len: n })
             }
-            let tag = get_varint(input)?;
-            if tag & 1 == 1 {
-                return Err(match get_varint(input)? {
-                    0 => DecodeError::Invalid("a target of 0, which is written as none"),
-                    _ => DecodeError::Invalid("a structure this version doesn't know"),
-                });
+            RawOp::Move { pos, len, to } => {
+                self.new_kinds.push(Kind::Move);
+                PlannedOp::Run(RunOp::Move { pos, len, to })
             }
-            let op = match tag >> 1 {
-                INSERT => {
-                    let pos = get_usize(input)?;
-                    let len = get_usize(input)?;
-                    RawOp::Insert {
-                        pos,
-                        items: T::decode_run(len, input)?,
+            RawOp::Mark { pos, level } => {
+                self.new_kinds.push(Kind::Mark);
+                PlannedOp::Run(RunOp::Mark { pos, level })
+            }
+            RawOp::Undelete { targets } => {
+                let mut resolved = Vec::with_capacity(n);
+                for &t in &targets[known..] {
+                    let t = self.resolve(t, first)?;
+                    if self.kind(t) != Some(Kind::Delete) {
+                        return Err(DecodeError::Invalid(
+                            "an undelete of something not a delete",
+                        ));
                     }
+                    resolved.push(t);
                 }
-                DELETE => RawOp::Delete {
-                    pos: get_usize(input)?,
-                    len: get_usize(input)?,
-                },
-                UNDELETE => {
-                    let len = get_usize(input)?;
-                    let mut targets = Vec::with_capacity(len.min(input.len()));
-                    for _ in 0..len {
-                        targets.push(get_ref(input)?);
-                    }
-                    RawOp::Undelete { targets }
-                }
-                MOVE => RawOp::Move {
-                    pos: get_usize(input)?,
-                    len: get_usize(input)?,
-                    to: get_usize(input)?,
-                },
-                MARK => RawOp::Mark {
-                    pos: get_usize(input)?,
-                    level: u8::try_from(get_usize(input)?)
-                        .map_err(|_| DecodeError::Invalid("a section level past 255"))?,
-                },
-                _ => {
-                    return Err(DecodeError::Invalid(
-                        "an event kind this version doesn't know",
-                    ));
-                }
-            };
-            let run = RawRun {
-                agent,
-                seq,
-                parents,
-                op,
-            };
-            if run.len() == 0 {
-                return Err(DecodeError::Invalid("an empty run"));
+                self.new_kinds
+                    .extend(std::iter::repeat_n(Kind::Undelete, n));
+                PlannedOp::Undeletes(resolved)
             }
-            next_seq.insert(
-                agent,
-                seq.checked_add(run.len() as u64)
-                    .ok_or(DecodeError::Overflow)?,
-            );
-            runs.push(run);
+        })
+    }
+
+    /// The event `r` names, from a run whose first event is `at` in the
+    /// chunk.
+    fn resolve(&self, r: Ref, at: usize) -> Result<Lv, DecodeError> {
+        match r {
+            Ref::Back(d) => {
+                let i = at
+                    .checked_sub(d)
+                    .filter(|_| d > 0)
+                    .ok_or(DecodeError::Invalid("a reference past the chunk's start"))?;
+                Ok(self.lvs[i])
+            }
+            Ref::Before { agent, seq } => {
+                let a = self
+                    .agents
+                    .get(agent)
+                    .ok_or(DecodeError::Invalid("an agent the chunk doesn't name"))?;
+                a.and_then(|a| self.log.find(a, seq))
+                    .ok_or(DecodeError::Invalid("an event this log doesn't have"))
+            }
         }
-        Ok((names, runs))
+    }
+
+    /// The kind of event `lv`, in the log or planned.
+    fn kind(&self, lv: Lv) -> Option<Kind> {
+        if lv < self.log.len() {
+            Some(self.log.kind(lv))
+        } else {
+            self.new_kinds.get(lv - self.log.len()).copied()
+        }
+    }
+}
+
+/// A chunk as read: its agents' names and its runs.
+type Parsed<T> = (Vec<String>, Vec<RawRun<T>>);
+
+/// Reads a chunk's agents and runs. Mirrors
+/// [`encode_events`](OpLog::encode_events).
+fn parse_chunk<T: Codec>(input: &mut &[u8]) -> Result<Parsed<T>, DecodeError> {
+    get_compression(input)?;
+    let names = get_agents(input)?;
+    let n = get_usize(input)?;
+    let mut runs = Vec::with_capacity(n.min(input.len()));
+    let mut seqs = Seqs::default();
+    for _ in 0..n {
+        runs.push(get_run(input, &mut seqs)?);
+    }
+    Ok((names, runs))
+}
+
+/// Reads the compression byte: only 0, none, so far.
+fn get_compression(input: &mut &[u8]) -> Result<(), DecodeError> {
+    match u8::decode(input)? {
+        0 => Ok(()),
+        _ => Err(DecodeError::Invalid("an unknown compression")),
+    }
+}
+
+/// Reads the agent table. Mirrors [`OpLog::put_agents`].
+fn get_agents(input: &mut &[u8]) -> Result<Vec<String>, DecodeError> {
+    let n = get_usize(input)?;
+    let mut names = Vec::with_capacity(n.min(input.len()));
+    for _ in 0..n {
+        names.push(get_str(input)?.to_string());
+    }
+    Ok(names)
+}
+
+/// Reads one run. Mirrors [`Writer::put_run`].
+fn get_run<T: Codec>(input: &mut &[u8], seqs: &mut Seqs) -> Result<RawRun<T>, DecodeError> {
+    let agent = get_usize(input)?;
+    let seq = seqs.get(input, agent)?;
+    let parents = get_refs(input)?;
+    let op = get_op(input)?;
+    let run = RawRun {
+        agent,
+        seq,
+        parents,
+        op,
+    };
+    if run.len() == 0 {
+        return Err(DecodeError::Invalid("an empty run"));
+    }
+    let end = seq
+        .checked_add(run.len() as u64)
+        .ok_or(DecodeError::Overflow)?;
+    seqs.ran(agent, end);
+    Ok(run)
+}
+
+/// Reads one run's op: its tag, its target if any, then its fields.
+/// Mirrors [`Writer::put_op`].
+fn get_op<T: Codec>(input: &mut &[u8]) -> Result<RawOp<T>, DecodeError> {
+    let tag = get_varint(input)?;
+    if tag & 1 == 1 {
+        get_target(input)?;
+    }
+    Ok(match tag >> 1 {
+        INSERT => {
+            let pos = get_usize(input)?;
+            let len = get_usize(input)?;
+            RawOp::Insert {
+                pos,
+                items: T::decode_run(len, input)?,
+            }
+        }
+        DELETE => RawOp::Delete {
+            pos: get_usize(input)?,
+            len: get_usize(input)?,
+        },
+        UNDELETE => RawOp::Undelete {
+            targets: get_refs(input)?,
+        },
+        MOVE => RawOp::Move {
+            pos: get_usize(input)?,
+            len: get_usize(input)?,
+            to: get_usize(input)?,
+        },
+        MARK => RawOp::Mark {
+            pos: get_usize(input)?,
+            level: u8::try_from(get_usize(input)?)
+                .map_err(|_| DecodeError::Invalid("a section level past 255"))?,
+        },
+        _ => {
+            return Err(DecodeError::Invalid(
+                "an event kind this version doesn't know",
+            ));
+        }
+    })
+}
+
+/// Reads a run's target. This version knows only the text, which is
+/// written as no target, so every target is refused.
+fn get_target(input: &mut &[u8]) -> Result<(), DecodeError> {
+    Err(match get_varint(input)? {
+        0 => DecodeError::Invalid("a target of 0, which is written as none"),
+        _ => DecodeError::Invalid("a structure this version doesn't know"),
+    })
+}
+
+/// Reads a count, then that many references.
+fn get_refs(input: &mut &[u8]) -> Result<Vec<Ref>, DecodeError> {
+    let n = get_usize(input)?;
+    let mut refs = Vec::with_capacity(n.min(input.len()));
+    for _ in 0..n {
+        refs.push(get_ref(input)?);
+    }
+    Ok(refs)
+}
+
+/// Reads one reference. Mirrors [`Writer::put_ref`].
+fn get_ref(input: &mut &[u8]) -> Result<Ref, DecodeError> {
+    let v = get_usize(input)?;
+    if v & 1 == 0 {
+        Ok(Ref::Back(v >> 1))
+    } else {
+        Ok(Ref::Before {
+            agent: v >> 1,
+            seq: get_varint(input)?,
+        })
     }
 }
 
@@ -598,4 +818,56 @@ mod move_tests {
         }
         assert_eq!(back.checkout(back.version()), log.checkout(log.version()));
     }
+}
+
+#[cfg(test)]
+mod golden {
+    use crate::oplog::{Lv, OpLog};
+
+    /// Two agents, concurrent, every kind of event, and runs split by
+    /// spans: the chunks for all of it, and for spans with gaps in.
+    fn log() -> OpLog<char> {
+        let mut log = OpLog::<char>::new();
+        let a = log.agent("alice");
+        let b = log.agent("bob");
+        let v = log.add_insert(a, &[], 0, "hello world".chars());
+        let va = log.add_delete(a, &v, 2..5);
+        let vb = log.add_insert(b, &v, 11, "!?".chars());
+        let vb = log.add_mark(b, &vb, 0, 2);
+        let both = log.union(&va, &vb);
+        let v = log.add_move(a, &both, 0..3, 7);
+        let dels: Vec<Lv> = (11..14).collect();
+        let v = log.add_undelete(b, &v, dels);
+        let v = log.add_insert(b, &v, 1, "é".chars());
+        log.add_delete(a, &v, 0..1);
+        log
+    }
+
+    fn chunk(log: &OpLog<char>, spans: &[std::ops::Range<Lv>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        log.encode_events(spans, &mut out);
+        out
+    }
+
+    /// The bytes, as the encoder wrote them before #24 split it into
+    /// steps: the format didn't change.
+    #[test]
+    fn the_bytes_are_pinned() {
+        let log = log();
+        let n = log.len();
+        let mut all = Vec::new();
+        log.encode_chunk(0..n, &mut all);
+        let gaps = chunk(&log, &[3..9, 12..15, n - 2..n]);
+        assert_eq!(all, ALL);
+        assert_eq!(gaps, GAPS);
+        // And they read back as the same events.
+        let mut back = OpLog::<char>::new();
+        assert_eq!(back.decode_chunk(&all), Ok(n));
+        assert_eq!(back.checkout(back.version()), log.checkout(log.version()));
+    }
+
+    #[rustfmt::skip]
+    const ALL: &[u8] = &[0, 2, 5, 97, 108, 105, 99, 101, 3, 98, 111, 98, 8, 0, 0, 0, 0, 0, 11, 11, 104, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100, 0, 0, 1, 2, 2, 2, 3, 1, 0, 1, 8, 0, 11, 2, 2, 33, 63, 1, 0, 1, 2, 8, 0, 2, 0, 0, 2, 8, 2, 6, 0, 3, 7, 1, 0, 1, 2, 4, 3, 14, 12, 10, 1, 0, 1, 2, 0, 1, 1, 2, 195, 169, 0, 0, 1, 2, 2, 0, 1];
+    #[rustfmt::skip]
+    const GAPS: &[u8] = &[0, 2, 5, 97, 108, 105, 99, 101, 3, 98, 111, 98, 5, 0, 6, 1, 1, 2, 0, 3, 6, 6, 108, 111, 32, 119, 111, 114, 0, 6, 1, 1, 11, 2, 2, 2, 1, 0, 1, 1, 10, 0, 11, 1, 1, 33, 1, 10, 1, 3, 5, 0, 1, 1, 2, 195, 169, 0, 2, 1, 2, 2, 0, 1];
 }

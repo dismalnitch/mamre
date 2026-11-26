@@ -1283,3 +1283,44 @@ fn typing_on_after_a_merge(name: &str) {
         assert_eq!(doc, reference::checkout(&log, &to));
     }
 }
+
+/// Found by `the_walk_merges_like_the_reference` (seed kept): typing
+/// beside the copies of a move that lost, after merging it, got origins
+/// out of order (#27's loop rule maps a copy to what it copied, here an
+/// item far to the left), and the window and the reference placed it
+/// differently. A right origin before the left now says nothing, in both.
+#[test]
+fn typing_beside_a_lost_moves_copies_lands_alike_everywhere() {
+    let mut log: OpLog<char> = OpLog::new();
+    let (a, b, c) = (log.agent("a"), log.agent("b"), log.agent("c"));
+    let e0 = log.add_insert(a, &[], 0, ['a']);
+    let e1 = log.add_insert(c, &e0, 0, ['a']);
+    let e2 = log.add_insert(a, &e1, 0, ['a']);
+    let e3 = log.add_insert(b, &e0, 0, ['a']);
+    let e4 = log.add_insert(c, &e1, 1, ['a']);
+    let e5 = log.add_insert(a, &e2, 0, ['a']);
+    let e6 = log.add_move(a, &e5, 0..1, 0);
+    let v = log.union(&log.union(&e2, &e3), &e4);
+    let e7 = log.add_move(c, &v, 2..5, 1);
+    let e8 = log.add_move(a, &log.union(&e3, &e6), 0..3, 4);
+    let both = log.union(&e7, &e8);
+    let e9 = log.add_insert(a, &both, 3, ['z']);
+    let want = mamre_egg_walker::copies::identities(&log, &e9);
+    assert_eq!(want, vec![3, 1, 4, 9, 0, 5, 2]);
+    // Every replica, merging however it does, gets there: the window is
+    // checked against the reference in debug builds.
+    for from in [&e7, &e8, &both, &e2] {
+        let mut books = mamre_egg_walker::Accountant::new();
+        let mut doc = Vec::new();
+        for c in books.merge(&log, from) {
+            c.apply(&mut doc);
+        }
+        for c in books.merge(&log, &e9) {
+            c.apply(&mut doc);
+        }
+        let ids: Vec<Lv> = (0..books.len())
+            .map(|i| books.identities().item(i))
+            .collect();
+        assert_eq!(ids, want, "from {from:?}");
+    }
+}
