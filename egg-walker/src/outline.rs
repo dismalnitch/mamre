@@ -305,6 +305,18 @@ impl Outline {
         Some(me.pos..end)
     }
 
+    /// Each ghost (a deleted heading's place) and its place: side data,
+    /// beside the books.
+    pub(crate) fn ghosts(&self) -> Vec<(Lv, usize)> {
+        self.anchors.ghosts()
+    }
+
+    /// Puts back the ghosts [`ghosts`](Self::ghosts) listed, after
+    /// [`decode`](Self::decode).
+    pub(crate) fn place_ghosts(&mut self, ghosts: &[(Lv, usize)]) -> Result<(), DecodeError> {
+        self.anchors.place_ghosts(ghosts)
+    }
+
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         put_usize(out, self.levels.len());
         let mut prev = 0;

@@ -99,7 +99,7 @@ pub fn save<T: Clone + Codec>(
     let n = T::encode_iter(doc, &mut body);
     debug_assert_eq!(n, accountant.len(), "the books are the document's");
     accountant.encode(&mut body);
-    let side = SnapshotExt::default();
+    let side = accountant.side();
     if !side.is_empty() {
         ext::put_json(&mut body, &side);
     }
@@ -167,11 +167,12 @@ fn read_record<T: Clone + Codec>(
             let mut input = body;
             let n = get_usize(&mut input)?;
             let doc = T::decode_run(n, &mut input)?;
-            let accountant = Accountant::decode(&mut input, log.len())?;
+            let mut accountant = Accountant::decode(&mut input, log.len())?;
             if accountant.len() != doc.len() {
                 return Err(DecodeError::Invalid("books for another document"));
             }
-            let _side: SnapshotExt = ext::get_trailing(&mut input, "bytes after the snapshot")?;
+            let side: SnapshotExt = ext::get_trailing(&mut input, "bytes after the snapshot")?;
+            accountant.apply_side(&side)?;
             Ok((total, Some(Snapshot { doc, accountant })))
         }
         // A kind a later version added: skipped whole.
@@ -348,5 +349,53 @@ mod tests {
             dump::<char>(&file).unwrap()["records"][1]["extension"],
             serde_json::json!({"later": [1, 2]})
         );
+    }
+
+    /// A headless section survives a save and a load, its ghost written
+    /// beside the books as JSON (#19).
+    #[test]
+    fn a_headless_section_saves_and_loads() {
+        let mut log = OpLog::new();
+        let a = log.agent("a");
+        let v = log.add_insert(a, &[], 0, "abcdef".chars());
+        let v = log.add_mark(a, &v, 4, 1);
+        let v = log.add_delete(a, &v, 4..5);
+        let mut books = Accountant::new();
+        books.merge(&log, &v);
+        let mut file = create();
+        save(&mut file, &log, 0, "abcdf".chars(), &books);
+        let loaded = load::<char>(&file).unwrap();
+        assert!(!loaded.damaged);
+        let back = loaded.snapshot.unwrap().accountant;
+        assert_eq!(back.sections(), books.sections());
+        assert_eq!(back.headless(), vec![4]);
+        assert_eq!(
+            dump::<char>(&file).unwrap()["records"][1]["extension"],
+            serde_json::json!({"ghosts": [{"item": 4, "place": 4}]})
+        );
+    }
+
+    /// A ghost that can't be (here, on an item that isn't parked) is
+    /// refused: the snapshot is damaged, not wrongly read.
+    #[test]
+    fn a_ghost_that_cant_be_is_refused() {
+        let mut log = OpLog::new();
+        let a = log.agent("a");
+        let mut books = Accountant::new();
+        let v = log.add_insert(a, &[], 0, "hi".chars());
+        books.merge(&log, &v);
+        let mut file = create();
+        let mut body = Vec::new();
+        log.encode_chunk(0..log.len(), &mut body);
+        record(&mut file, CHUNK, &body);
+        let mut body = Vec::new();
+        put_usize(&mut body, 2);
+        char::encode_run(&['h', 'i'], &mut body);
+        books.encode(&mut body);
+        ext::put_json(&mut body, &serde_json::json!({"ghosts": [{"item": 0, "place": 0}]}));
+        record(&mut file, SNAPSHOT, &body);
+        let loaded = load::<char>(&file).unwrap();
+        assert!(loaded.damaged);
+        assert!(loaded.snapshot.is_none());
     }
 }

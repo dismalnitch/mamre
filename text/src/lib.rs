@@ -23,6 +23,10 @@
 //! explicit mark on a character, not syntax in the text, so `#` in code or
 //! `\section` in LaTeX mean nothing here.
 //!
+//! Text can be set in a direction of its own, apart from what's round it:
+//! an [`Isolate`], marked with [`mark_isolate`](Text::mark_isolate). It's
+//! in the history as the text is, and it isn't text: see `isolates.rs`.
+//!
 //! [`save`](Text::save) appends to a file; [`open`](Text::open) reads one
 //! back, history and all.
 //!
@@ -44,9 +48,14 @@ use mamre_egg_walker::{Accountant, AgentId, Change, Lv, OpLog, Sequence, file};
 use mamre_rope::Measure;
 pub use mamre_rope::{Plain, Rope, Unit, Units};
 
+mod isolates;
+mod piece;
 mod units;
 
 mod reconcile;
+
+pub use isolates::{Direction, Isolate, IsolateId};
+use piece::Piece;
 
 /// One writer's replica of a document: the text, its history, and the
 /// books that keep merges cheap.
@@ -58,13 +67,16 @@ mod reconcile;
 /// document that doesn't use them doesn't pay for bigger summaries.
 pub struct Text<M: Measure = Plain> {
     rope: Rope<M>,
-    log: OpLog<char>,
+    log: OpLog<Piece>,
     books: Accountant,
     me: AgentId,
     /// How many of the history's events the file holds.
     saved: usize,
     /// How many anchors watch each character.
     watchers: HashMap<Lv, usize>,
+    /// The sequence's markers, which the rope leaves out: where the
+    /// isolates open and close.
+    markers: isolates::Markers,
 }
 
 /// What an edit did to the text, in byte offsets, in order: each as the
@@ -85,6 +97,10 @@ pub enum Edit {
         at: Option<usize>,
         level: u8,
     },
+    /// The isolates changed: one was made, removed, or moved by what
+    /// another writer did. The text doesn't change. Ask
+    /// [`Text::isolates`] what they are now.
+    Isolates,
     /// A move or section mark that was discarded: it lost to something
     /// done at the same time. Where its text is now. (Not sent yet: see
     /// "What's not here yet" above.)
@@ -142,6 +158,10 @@ pub enum TextError {
     NotCharBoundary { at: usize },
     /// There's no section with that id now.
     NoSuchSection(SectionId),
+    /// There's no isolate with that id now, or it doesn't reach there.
+    NoSuchIsolate(IsolateId),
+    /// The range takes part of an isolate and not the rest.
+    CrossesIsolate,
 }
 
 /// Why a message couldn't be read: damaged, or not one of ours. Nothing
@@ -169,6 +189,8 @@ impl fmt::Display for TextError {
             }
             TextError::NotCharBoundary { at } => write!(f, "byte {at} is not a char boundary"),
             TextError::NoSuchSection(id) => write!(f, "no section {}", id.0),
+            TextError::NoSuchIsolate(id) => write!(f, "no isolate {:x} there", id.0),
+            TextError::CrossesIsolate => write!(f, "the range takes part of an isolate"),
         }
     }
 }
@@ -194,42 +216,100 @@ impl fmt::Display for OpenError {
 
 impl std::error::Error for OpenError {}
 
-/// The rope, edited by the CRDT's changes, noting each in bytes.
+/// The rope and its markers, edited by the CRDT's changes, noting each
+/// in bytes. Positions count items: characters and markers.
 struct Applying<'a, M: Measure> {
     rope: &'a mut Rope<M>,
+    markers: &'a mut isolates::Markers,
     edits: &'a mut Vec<Edit>,
+    /// Whether a marker came, went or moved.
+    isolates: bool,
 }
 
-impl<M: Measure> Sequence<char> for Applying<'_, M> {
-    fn insert(&mut self, pos: usize, items: &[char]) {
-        let at = self.rope.char_to_offset(pos);
-        let text: String = items.iter().collect();
+impl<M: Measure> Applying<'_, M> {
+    /// The byte offset of item position `pos`.
+    fn byte(&self, pos: usize) -> usize {
+        self.rope.char_to_offset(self.markers.to_char(pos))
+    }
+
+    /// Puts `pieces` in at `pos`. Returns the text among them.
+    fn put(&mut self, pos: usize, pieces: &[Piece]) -> String {
+        let at = self.byte(pos);
+        let mut text = String::new();
+        for (i, piece) in pieces.iter().enumerate() {
+            match *piece {
+                Piece::Char(c) => {
+                    self.markers.inserted(pos + i, 1);
+                    text.push(c);
+                }
+                marker => {
+                    self.markers.insert(pos + i, marker);
+                    self.isolates = true;
+                }
+            }
+        }
         self.rope.insert(at, &text);
-        self.edits.push(Edit::Insert { at, text });
+        text
+    }
+
+    /// Takes the items in `range` out. Returns them.
+    fn take(&mut self, range: Range<usize>) -> Vec<Piece> {
+        let bytes = self.byte(range.start)..self.byte(range.end);
+        let mut chars = String::with_capacity(bytes.len());
+        for chunk in self.rope.slice(bytes.clone()).chunks() {
+            chars.push_str(chunk);
+        }
+        self.rope.remove(bytes);
+        let gone = self.markers.deleted(range.clone());
+        self.isolates |= !gone.is_empty();
+        let mut chars = chars.chars();
+        let mut gone = gone.into_iter().peekable();
+        (0..range.len())
+            .map(|i| match gone.next_if(|&(at, _)| at == i) {
+                Some((_, marker)) => marker,
+                None => Piece::Char(chars.next().expect("a character for every other item")),
+            })
+            .collect()
+    }
+}
+
+impl<M: Measure> Sequence<Piece> for Applying<'_, M> {
+    fn insert(&mut self, pos: usize, items: &[Piece]) {
+        let at = self.byte(pos);
+        let text = self.put(pos, items);
+        if !text.is_empty() {
+            self.edits.push(Edit::Insert { at, text });
+        }
     }
 
     fn delete(&mut self, range: Range<usize>) {
-        let range = self.rope.char_to_offset(range.start)..self.rope.char_to_offset(range.end);
-        self.rope.remove(range.clone());
-        self.edits.push(Edit::Delete { range });
+        let bytes = self.byte(range.start)..self.byte(range.end);
+        self.take(range);
+        if !bytes.is_empty() {
+            self.edits.push(Edit::Delete { range: bytes });
+        }
     }
 
     fn move_range(&mut self, range: Range<usize>, to: usize) {
-        let range = self.rope.char_to_offset(range.start)..self.rope.char_to_offset(range.end);
-        let to = self.rope.char_to_offset(to);
-        let moved = self.rope.slice(range.clone());
-        self.rope.remove(range.clone());
+        let bytes = self.byte(range.start)..self.byte(range.end);
+        let to_byte = self.byte(to);
+        let moved = self.take(range.clone());
         let at = if to > range.start {
             to - range.len()
         } else {
             to
         };
-        let mut text = String::with_capacity(moved.len());
-        for chunk in moved.chunks() {
-            text.push_str(chunk);
+        self.put(at, &moved);
+        // Markers alone moving, or text moving only past markers, leaves
+        // the text as it was.
+        if bytes.is_empty() || (bytes.start..=bytes.end).contains(&to_byte) {
+            self.isolates = true;
+        } else {
+            self.edits.push(Edit::Move {
+                range: bytes,
+                to: to_byte,
+            });
         }
-        self.rope.insert(at, &text);
-        self.edits.push(Edit::Move { range, to });
     }
 }
 
@@ -262,6 +342,7 @@ impl<M: Measure> Text<M> {
             me,
             saved: 0,
             watchers: HashMap::new(),
+            markers: isolates::Markers::default(),
         }
     }
 
@@ -319,9 +400,10 @@ impl<M: Measure> Text<M> {
     fn catch_up(&mut self, to: &[Lv]) -> Vec<Edit> {
         let changes = self.books.merge(&self.log, to);
         let mut edits = Vec::new();
+        let mut changed = false;
         for change in &changes {
             if let Change::Mark { item, pos, level } = *change {
-                let at = pos.map(|p| self.rope.char_to_offset(p));
+                let at = pos.map(|p| self.rope.char_to_offset(self.markers.to_char(p)));
                 edits.push(Edit::Section {
                     section: SectionId(item),
                     at,
@@ -331,42 +413,105 @@ impl<M: Measure> Text<M> {
             }
             let mut doc = Applying {
                 rope: &mut self.rope,
+                markers: &mut self.markers,
                 edits: &mut edits,
+                isolates: false,
             };
             change.apply(&mut doc);
+            changed |= doc.isolates;
+        }
+        if changed {
+            edits.push(Edit::Isolates);
         }
         edits
     }
 
-    /// Puts `text` in at byte `at`.
+    /// Puts `text` in at byte `at`. Where an isolate starts or ends
+    /// there, the text goes outside it: [`insert_in`](Self::insert_in)
+    /// puts it inside.
     pub fn insert(&mut self, at: usize, text: &str) -> Result<Vec<Edit>, TextError> {
         self.check_at(at)?;
-        if text.is_empty() {
-            return Ok(Vec::new());
-        }
-        let pos = self.rope.offset_to_char(at);
-        self.rope.insert(at, text);
-        let v = self
-            .log
-            .add_insert(self.me, self.books.version(), pos, text.chars());
-        self.books.record(&self.log, &v);
-        Ok(vec![Edit::Insert {
-            at,
-            text: text.to_owned(),
-        }])
+        let c = self.rope.offset_to_char(at);
+        let pos = self
+            .markers
+            .place(c, None)
+            .expect("somewhere at every offset");
+        Ok(self.insert_at(pos, at, text))
     }
 
-    /// Takes out the text in `range`.
+    /// Puts `text` in at item position `pos`, which is byte `at`.
+    fn insert_at(&mut self, pos: usize, at: usize, text: &str) -> Vec<Edit> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        self.rope.insert(at, text);
+        self.markers.inserted(pos, text.chars().count());
+        let v = self.log.add_insert(
+            self.me,
+            self.books.version(),
+            pos,
+            text.chars().map(Piece::Char),
+        );
+        self.books.record(&self.log, &v);
+        vec![Edit::Insert {
+            at,
+            text: text.to_owned(),
+        }]
+    }
+
+    /// Takes out the text in `range`. An isolate goes with it if all of
+    /// the isolate does; one that only starts or ends in the range keeps
+    /// what's left of it.
     pub fn delete(&mut self, range: Range<usize>) -> Result<Vec<Edit>, TextError> {
         self.check_range(&range)?;
         if range.is_empty() {
             return Ok(Vec::new());
         }
         let chars = self.chars(&range);
+        // Every item from the first marker at the range's start to the
+        // last at its end, but for the markers of isolates that reach
+        // outside it: runs of items, last first.
+        let span = self.markers.first_at(chars.start)..self.markers.last_at(chars.end);
+        let within = |pos: usize| span.start <= pos && pos < span.end;
+        let mut stay: Vec<usize> = self
+            .markers
+            .unpaired(&span)
+            .into_iter()
+            .chain(
+                self.markers
+                    .shown()
+                    .into_iter()
+                    .filter(|s| within(s.open) != within(s.close))
+                    .map(|s| if within(s.open) { s.open } else { s.close }),
+            )
+            .collect();
+        stay.sort_unstable();
+        stay.dedup();
+        let mut runs = Vec::new();
+        let mut from = span.start;
+        for &pos in &stay {
+            if pos > from {
+                runs.push(from..pos);
+            }
+            from = pos + 1;
+        }
+        if span.end > from {
+            runs.push(from..span.end);
+        }
+        let mut isolates = false;
+        for run in runs.into_iter().rev() {
+            let v = self
+                .log
+                .add_delete(self.me, self.books.version(), run.clone());
+            self.books.record(&self.log, &v);
+            isolates |= !self.markers.deleted(run).is_empty();
+        }
         self.rope.remove(range.clone());
-        let v = self.log.add_delete(self.me, self.books.version(), chars);
-        self.books.record(&self.log, &v);
-        Ok(vec![Edit::Delete { range }])
+        let mut edits = vec![Edit::Delete { range }];
+        if isolates {
+            edits.push(Edit::Isolates);
+        }
+        Ok(edits)
     }
 
     /// Replaces the text in `range` with `text`.
@@ -382,6 +527,10 @@ impl<M: Measure> Text<M> {
     /// them go along, and someone typing in them at the same time types
     /// where they went. A move to inside itself, or to where it is, does
     /// nothing. The edits say what it did.
+    ///
+    /// An isolate goes along if all of it moves. Text that leaves its
+    /// isolate behind keeps the direction it was set in: it's made an
+    /// isolate of that direction where it lands, unless it lands in one.
     pub fn move_text(&mut self, range: Range<usize>, to: usize) -> Result<Vec<Edit>, TextError> {
         self.check_range(&range)?;
         self.check_at(to)?;
@@ -389,9 +538,66 @@ impl<M: Measure> Text<M> {
             return Ok(Vec::new());
         }
         let chars = self.chars(&range);
+        let stretches = self.markers.stretches(&chars);
         let to = self.rope.offset_to_char(to);
-        let v = self.log.add_move(self.me, self.books.version(), chars, to);
-        Ok(self.catch_up(&v))
+        // Text all from one isolate, put at that isolate's edge, stays
+        // in it.
+        let home = match stretches.first() {
+            Some(&(_, Some((id, _))))
+                if stretches
+                    .iter()
+                    .all(|(_, from)| from.map(|f| f.0) == Some(id)) =>
+            {
+                Some(id)
+            }
+            _ => None,
+        };
+        let to = home
+            .and_then(|id| self.markers.place(to, Some(id)))
+            .or_else(|| self.markers.place(to, None))
+            .expect("somewhere at every offset");
+        let there = self.markers.direction_at(to);
+        let earlier = stretches.first().is_some_and(|(s, _)| to <= s.start);
+        // The last stretch first, each to just before the one moved
+        // before it, so they land in order. A marker between two of them
+        // stays where it is.
+        let mut edits = Vec::new();
+        let mut at = to;
+        let mut moved = 0;
+        for (items, _) in stretches.iter().rev() {
+            // Moved earlier, what's gone ahead has pushed this one along.
+            let shift = if earlier { moved } else { 0 };
+            let items = items.start + shift..items.end + shift;
+            let v = self
+                .log
+                .add_move(self.me, self.books.version(), items.clone(), at);
+            edits.extend(self.catch_up(&v));
+            moved += items.len();
+            if !earlier {
+                at -= items.len();
+            }
+        }
+        // They're together now, from `at`. Each that left an isolate
+        // behind is made one of its direction, unless it's landed in one:
+        // last first again, so the places of the ones before hold.
+        let mut end = at + moved;
+        let mut wrapped = false;
+        for (items, direction) in stretches.iter().rev() {
+            let landed = end - items.len()..end;
+            end = landed.start;
+            let Some((_, direction)) = *direction else {
+                continue;
+            };
+            let text = self.markers.to_char(landed.start) < self.markers.to_char(landed.end);
+            if there != Some(direction) && text {
+                self.wrap(landed, direction);
+                wrapped = true;
+            }
+        }
+        if wrapped && edits.last() != Some(&Edit::Isolates) {
+            edits.push(Edit::Isolates);
+        }
+        Ok(edits)
     }
 
     /// Makes the text `incoming`, edited outside mamre (#35): its content
@@ -509,7 +715,7 @@ impl<M: Measure> Text<M> {
                 len: self.len(),
             });
         }
-        let pos = self.rope.offset_to_char(at);
+        let pos = self.markers.last_at(self.rope.offset_to_char(at));
         let item = self.books.identities().item(pos);
         let v = self.log.add_mark(self.me, self.books.version(), pos, level);
         Ok((SectionId(item), self.catch_up(&v)))
@@ -522,7 +728,7 @@ impl<M: Measure> Text<M> {
             .into_iter()
             .map(|s| Section {
                 id: SectionId(s.item),
-                at: self.rope.char_to_offset(s.pos),
+                at: self.rope.char_to_offset(self.markers.to_char(s.pos)),
                 level: s.level,
                 start: s.start,
             })
@@ -536,7 +742,8 @@ impl<M: Measure> Text<M> {
     /// deleted stays, headless, at its place).
     pub fn section_range(&self, id: SectionId) -> Option<Range<usize>> {
         let r = self.books.section_range(id.0)?;
-        Some(self.rope.char_to_offset(r.start)..self.rope.char_to_offset(r.end))
+        let byte = |pos: usize| self.rope.char_to_offset(self.markers.to_char(pos));
+        Some(byte(r.start)..byte(r.end))
     }
 
     /// Moves section `id`, subsections and all, to byte `to`.
@@ -566,9 +773,12 @@ impl<M: Measure> Text<M> {
     pub fn anchor(&mut self, at: usize) -> Result<Anchor, TextError> {
         self.check_at(at)?;
         let pos = self.rope.offset_to_char(at);
-        let chars = self.books.len();
-        let before = pos.checked_sub(1).map(|p| self.watch(p));
-        let after = (pos < chars).then(|| self.watch(pos));
+        let chars = self.books.len() - self.markers.len();
+        // The characters either side, wherever they are among the items.
+        let before = pos
+            .checked_sub(1)
+            .map(|p| self.watch(self.markers.last_at(p)));
+        let after = (pos < chars).then(|| self.watch(self.markers.last_at(pos)));
         Ok(Anchor { before, after })
     }
 
@@ -579,15 +789,15 @@ impl<M: Measure> Text<M> {
     pub fn position(&self, anchor: &Anchor) -> Option<usize> {
         let at = |item: Option<Lv>| item.and_then(|i| self.books.anchors().position(i));
         let pos = if let Some(p) = at(anchor.after) {
-            p
+            self.markers.to_char(p)
         } else if let Some(p) = at(anchor.before) {
-            p + 1
+            self.markers.to_char(p) + 1
         } else {
             match (anchor.before, anchor.after) {
                 // It was at the start: it still is.
                 (None, _) => 0,
                 // At the end.
-                (Some(_), None) => self.books.len(),
+                (Some(_), None) => self.books.len() - self.markers.len(),
                 (Some(_), Some(_)) => return None,
             }
         };
@@ -645,14 +855,15 @@ impl<M: Measure> Text<M> {
             *file = file::create();
             self.saved = 0;
         }
-        self.saved = file::save(file, &self.log, self.saved, self.rope.chars(), &self.books);
+        let doc = self.markers.pieces(self.rope.chars());
+        self.saved = file::save(file, &self.log, self.saved, doc, &self.books);
     }
 
     /// Opens a file `save` wrote, counting what `M` counts: as
     /// [`Text::open`]. The measure isn't in the file: open it however the
     /// document wants it counted.
     pub fn open_with_measure(writer: &str, bytes: &[u8]) -> Result<Self, OpenError> {
-        let loaded = file::load::<char>(bytes).map_err(|e| match e {
+        let loaded = file::load::<Piece>(bytes).map_err(|e| match e {
             file::LoadError::NotAFile => OpenError::NotAFile,
             file::LoadError::Version(v) => OpenError::Version(v),
         })?;
@@ -665,9 +876,16 @@ impl<M: Measure> Text<M> {
             me,
             saved: 0,
             watchers: HashMap::new(),
+            markers: isolates::Markers::default(),
         };
         if let Some(snapshot) = loaded.snapshot {
-            let doc: String = snapshot.doc.into_iter().collect();
+            let mut doc = String::new();
+            for (pos, piece) in snapshot.doc.into_iter().enumerate() {
+                match piece {
+                    Piece::Char(c) => doc.push(c),
+                    marker => text.markers.insert(pos, marker),
+                }
+            }
             text.rope.push_str(&doc);
             text.books = snapshot.accountant;
         }
