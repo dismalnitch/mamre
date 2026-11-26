@@ -306,6 +306,30 @@ mod tests {
         assert_eq!(records[1]["document"], "hllo");
     }
 
+    /// A paste (#36) dumps as a copy, its sources by agent and seq.
+    #[test]
+    fn a_paste_dumps_as_a_copy() {
+        let mut log = OpLog::new();
+        let a = log.agent("alice");
+        let mut books = Accountant::new();
+        let v = log.add_insert(a, &[], 0, "hi ".chars());
+        let v = log.add_paste(a, &v, 3, &[0, 1]);
+        books.merge(&log, &v);
+        let mut file = create();
+        save(&mut file, &log, 0, "hi hi".chars(), &books);
+        let shown = dump::<char>(&file).unwrap();
+        let runs = shown["records"][0]["runs"].as_array().unwrap().clone();
+        assert_eq!(runs[0]["op"]["insert"]["items"], "hi ");
+        assert_eq!(
+            runs[1]["op"],
+            serde_json::json!({"copy": {"pos": 3, "count": 2, "sources": [
+                {"agent": "alice", "seq": 0, "count": 2}
+            ]}})
+        );
+        let loaded = load::<char>(&file).unwrap();
+        assert_eq!(loaded.log.source(4), Some(1));
+    }
+
     /// A damaged record ends the dump, as it ends loading, and says so.
     #[test]
     fn a_damaged_file_dumps_up_to_the_damage() {

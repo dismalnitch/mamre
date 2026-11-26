@@ -28,6 +28,12 @@ enum Edit {
     /// Undoes a move, or an undo of one (a redo): #30.
     UndoMove(prop::sample::Index),
     Mark(prop::sample::Index, u8),
+    /// Copy the items from one place to another and paste them (#36).
+    Paste(
+        prop::sample::Index,
+        prop::sample::Index,
+        prop::sample::Index,
+    ),
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +51,8 @@ fn edit() -> impl Strategy<Value = Edit> {
         1 => any::<prop::sample::Index>().prop_map(Edit::Undo),
         1 => any::<prop::sample::Index>().prop_map(Edit::UndoMove),
         1 => (any::<prop::sample::Index>(), 0u8..4).prop_map(|(p, l)| Edit::Mark(p, l)),
+        1 => (any::<prop::sample::Index>(), any::<prop::sample::Index>(), any::<prop::sample::Index>())
+            .prop_map(|(a, b, t)| Edit::Paste(a, b, t)),
     ]
 }
 
@@ -111,6 +119,11 @@ fn history(actions: &[Action], writers: usize) -> (OpLog<char>, Vec<Vec<Lv>>) {
                         log.add_undo(agent, &v, [undoable[k.index(undoable.len())]])
                     }
                     Edit::Mark(p, level) if len > 0 => log.add_mark(agent, &v, p.index(len), level),
+                    Edit::Paste(a, b, t) if len > 0 => {
+                        let (a, b) = (a.index(len), b.index(len));
+                        let sources = copies::identities(&log, &v)[a.min(b)..a.max(b) + 1].to_vec();
+                        log.add_paste(agent, &v, t.index(len + 1), &sources)
+                    }
                     _ => continue,
                 };
             }
@@ -201,6 +214,15 @@ proptest! {
                         let to = if to > b { to - (b - a) } else { to };
                         doc.splice(to..to, taken);
                     }
+                }
+                Edit::Paste(a, b, t) if len > 0 => {
+                    let (a, b) = (a.index(len), b.index(len));
+                    let range = a.min(b)..a.max(b) + 1;
+                    let sources = copies::identities(&log, &v)[range.clone()].to_vec();
+                    let at = t.index(len + 1);
+                    v = log.add_paste(me, &v, at, &sources);
+                    let items: Vec<char> = doc[range].to_vec();
+                    doc.splice(at..at, items);
                 }
                 _ => continue,
             }

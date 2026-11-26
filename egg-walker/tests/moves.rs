@@ -21,6 +21,12 @@ enum Edit {
     Undo(prop::sample::Index),
     /// Mark the item there at a level (0 unmarks).
     Mark(prop::sample::Index, u8),
+    /// Copy the items from one place to another and paste them (#36).
+    Paste(
+        prop::sample::Index,
+        prop::sample::Index,
+        prop::sample::Index,
+    ),
 }
 
 // ---- Many writers: nothing lost, nothing copied ----
@@ -43,6 +49,8 @@ fn actions() -> impl Strategy<Value = Vec<Action>> {
         8 => edit,
         1 => any::<prop::sample::Index>().prop_map(Edit::Undo),
         2 => (any::<prop::sample::Index>(), 0u8..4).prop_map(|(p, l)| Edit::Mark(p, l)),
+        1 => (any::<prop::sample::Index>(), any::<prop::sample::Index>(), any::<prop::sample::Index>())
+            .prop_map(|(a, b, t)| Edit::Paste(a, b, t)),
     ];
     let action = prop_oneof![
         4 => (0..3usize, edit).prop_map(|(w, e)| Action::Edit(w, e)),
@@ -363,6 +371,11 @@ fn history(actions: Vec<Action>) -> (OpLog<char>, Vec<Vec<Lv>>) {
                         log.add_undelete(agent, &v, [deletes[k.index(deletes.len())]])
                     }
                     Edit::Mark(p, level) if len > 0 => log.add_mark(agent, &v, p.index(len), level),
+                    Edit::Paste(a, b, t) if len > 0 => {
+                        let (a, b) = (a.index(len), b.index(len));
+                        let sources = reference::identities(&log, &v)[a.min(b)..a.max(b) + 1].to_vec();
+                        log.add_paste(agent, &v, t.index(len + 1), &sources)
+                    }
                     _ => continue,
                 };
             }
@@ -912,6 +925,17 @@ fn replicas_agree(actions: Vec<(Action, usize)>) -> Result<(), TestCaseError> {
                             c.apply(doc);
                         }
                     }
+                    Edit::Paste(a, b, t) if len > 0 => {
+                        let (a, b) = (a.index(len), b.index(len));
+                        let range = a.min(b)..a.max(b) + 1;
+                        let sources: Vec<Lv> =
+                            range.clone().map(|k| book.identities().item(k)).collect();
+                        let at = t.index(len + 1);
+                        let items: Vec<char> = doc[range].to_vec();
+                        doc.splice(at..at, items);
+                        let v = log.add_paste(agent, &v, at, &sources);
+                        book.record(&log, &v);
+                    }
                     _ => continue,
                 }
                 w
@@ -966,6 +990,8 @@ fn replica_actions() -> impl Strategy<Value = Vec<Action>> {
             .prop_map(|(a, b, t)| Edit::Move(a, b, t)),
         1 => any::<prop::sample::Index>().prop_map(Edit::Undo),
         1 => (any::<prop::sample::Index>(), 0u8..4).prop_map(|(p, l)| Edit::Mark(p, l)),
+        1 => (any::<prop::sample::Index>(), any::<prop::sample::Index>(), any::<prop::sample::Index>())
+            .prop_map(|(a, b, t)| Edit::Paste(a, b, t)),
     ];
     let action = prop_oneof![
         3 => (0..3usize, edit).prop_map(|(w, e)| Action::Edit(w, e)),
