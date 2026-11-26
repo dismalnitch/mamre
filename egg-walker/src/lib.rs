@@ -68,6 +68,7 @@ mod merge;
 mod oplog;
 mod order;
 mod outline;
+pub mod ranges;
 mod recent;
 pub mod reference;
 #[doc(hidden)]
@@ -83,6 +84,7 @@ mod walk;
 pub use accountant::Accountant;
 pub use anchors::Anchors;
 pub use ids::Identities;
-pub use oplog::{AgentId, Event, Lv, Op, OpLog};
+pub use oplog::{AgentId, Aside, Event, Lv, Op, OpLog};
 pub use outline::{Ambiguity, Next, Policies, Policy, Resolution, Section, Start};
+pub use ranges::AuthorRange;
 pub use walk::{Change, Sequence};

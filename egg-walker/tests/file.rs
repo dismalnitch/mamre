@@ -168,6 +168,7 @@ fn events(log: &OpLog<char>) -> Events {
                 Op::Move { pos, len, to } => format!("move {pos} {len} {to}"),
                 Op::Mark { pos, level } => format!("mark {pos} {level}"),
                 Op::Undo { target } => format!("undo {:?}", stable(target)),
+                Op::Aside(a) => format!("aside {a:?}"),
             };
             (stable(lv), parents, op)
         })

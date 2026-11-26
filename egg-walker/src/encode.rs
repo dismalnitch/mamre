@@ -21,6 +21,12 @@
 //!                         move (a redo) (#30)
 //!             3 move:     pos, count, to   (one event: moves don't run)
 //!             4 mark:     pos, level       (one event)
+//!             (5 is kept for #36's copy: pos, count, to)
+//!             6 aside:    an extension (see `ext.rs`): the event as JSON,
+//!                         one event per run, the events it names by
+//!                         agent name and seq. Ranges (#32): {"range_add":
+//!                         {"start", "end", "tag"}} or {"range_set":
+//!                         {"range", "tag"}}
 //!             (other kinds are reserved for other kinds of event)
 //! extension = what the chunk carries beside its runs, as JSON (see
 //!             `ext.rs`); only when there's something in it. So far:
@@ -61,14 +67,15 @@ use mamre::codec::{
     Codec, DecodeError, get_str, get_usize, get_varint, put_str, put_usize, put_varint,
 };
 
-use crate::ext::{self, ChunkExt};
-use crate::oplog::{AgentId, Kind, Lv, Op, OpLog, RunOp, normalize};
+use crate::ext::{self, AsideJson, ChunkExt, Named};
+use crate::oplog::{AgentId, Aside, Kind, Lv, Op, OpLog, RunOp, normalize};
 
 const INSERT: u64 = 0;
 const DELETE: u64 = 1;
 const UNDO: u64 = 2;
 const MOVE: u64 = 3;
 const MARK: u64 = 4;
+const ASIDE: u64 = 6;
 
 // Encoding and decoding mirror each other, step by step:
 //
@@ -99,6 +106,7 @@ enum RawOp<T> {
     Undo { targets: Vec<Ref> },
     Move { pos: usize, len: usize, to: usize },
     Mark { pos: usize, level: u8 },
+    Aside(AsideJson),
 }
 
 struct RawRun<T> {
@@ -114,7 +122,7 @@ impl<T> RawRun<T> {
             RawOp::Insert { items, .. } => items.len(),
             RawOp::Delete { len, .. } => *len,
             RawOp::Undo { targets } => targets.len(),
-            RawOp::Move { .. } | RawOp::Mark { .. } => 1,
+            RawOp::Move { .. } | RawOp::Mark { .. } | RawOp::Aside(_) => 1,
         }
     }
 }
@@ -437,6 +445,10 @@ impl<T: Clone + Codec> Writer<'_, T> {
                 put_usize(out, 1);
                 self.put_ref(out, *target, first);
             }
+            RunOp::Aside(aside) => {
+                put_varint(out, ASIDE << 1);
+                ext::put_json(out, &self.aside_json(aside));
+            }
             RunOp::Move { pos, len, to } => {
                 put_varint(out, MOVE << 1);
                 put_usize(out, *pos);
@@ -448,6 +460,30 @@ impl<T: Clone + Codec> Writer<'_, T> {
                 put_usize(out, *pos);
                 put_usize(out, *level as usize);
             }
+        }
+    }
+
+    /// `lv` named for side data: its agent's name and seq.
+    fn named(&self, lv: Lv) -> Named {
+        let run = self.log.run_of(lv);
+        Named {
+            agent: self.log.agent_name(run.agent).to_string(),
+            seq: run.seq + (lv - run.start) as u64,
+        }
+    }
+
+    /// An aside as its run carries it. Mirrors [`Planner::aside`].
+    fn aside_json(&self, aside: &Aside) -> AsideJson {
+        match aside {
+            Aside::RangeAdd { start, end, tag } => AsideJson::RangeAdd {
+                start: self.named(*start),
+                end: self.named(*end),
+                tag: tag.clone(),
+            },
+            Aside::RangeSet { range, tag } => AsideJson::RangeSet {
+                range: self.named(*range),
+                tag: tag.clone(),
+            },
         }
     }
 
@@ -506,10 +542,16 @@ struct Planner<'a, T> {
     new_kinds: Vec<Kind>,
     /// The number the next new event gets.
     next: Lv,
+    /// The chunk's agents' names, for events side data names.
+    names: &'a [String],
+    /// Each agent's new runs so far: first seq, first number, length.
+    planned: Vec<Vec<(u64, Lv, usize)>>,
+    /// The new events that add a range, for a range set to name.
+    new_ranges: std::collections::HashSet<Lv>,
 }
 
 impl<'a, T: Clone> Planner<'a, T> {
-    fn new(log: &'a OpLog<T>, names: &[String]) -> Self {
+    fn new(log: &'a OpLog<T>, names: &'a [String]) -> Self {
         let agents: Vec<Option<AgentId>> = names.iter().map(|n| log.agent_by_name(n)).collect();
         let have: Vec<u64> = agents
             .iter()
@@ -523,6 +565,9 @@ impl<'a, T: Clone> Planner<'a, T> {
             lvs: Vec::new(),
             new_kinds: Vec::new(),
             next: log.len(),
+            names,
+            planned: vec![Vec::new(); names.len()],
+            new_ranges: Default::default(),
         }
     }
 
@@ -557,6 +602,7 @@ impl<'a, T: Clone> Planner<'a, T> {
         let start = self.next;
         self.lvs.extend(start..start + n);
         self.next += n;
+        self.planned[run.agent].push((seq, start, n));
         let op = self.plan_op(run.op, known, n, first)?;
         Ok(Some(PlannedRun {
             agent: run.agent,
@@ -613,6 +659,15 @@ impl<'a, T: Clone> Planner<'a, T> {
                 self.new_kinds.push(Kind::Mark);
                 PlannedOp::Run(RunOp::Mark { pos, level })
             }
+            RawOp::Aside(json) => {
+                let lv = self.next - 1;
+                let aside = self.aside(json, lv)?;
+                if matches!(aside, Aside::RangeAdd { .. }) {
+                    self.new_ranges.insert(lv);
+                }
+                self.new_kinds.push(Kind::Aside);
+                PlannedOp::Run(RunOp::Aside(aside))
+            }
             RawOp::Undo { targets } => {
                 let mut ops = Vec::with_capacity(n);
                 for &t in &targets[known..] {
@@ -654,6 +709,59 @@ impl<'a, T: Clone> Planner<'a, T> {
                     .ok_or(DecodeError::Invalid("an event this log doesn't have"))
             }
         }
+    }
+
+    /// The event side data names: in the log, or new in this chunk.
+    fn named(&self, named: &Named) -> Result<Lv, DecodeError> {
+        let unknown = DecodeError::Invalid("an event this log doesn't have");
+        let Some(i) = self.names.iter().position(|n| *n == named.agent) else {
+            // An agent the chunk doesn't name: one the log has.
+            return self
+                .log
+                .agent_by_name(&named.agent)
+                .and_then(|a| self.log.find(a, named.seq))
+                .ok_or(unknown);
+        };
+        if named.seq < self.have[i] {
+            let a = self.agents[i].expect("a known event's agent is known");
+            return self.log.find(a, named.seq).ok_or(unknown);
+        }
+        let runs = &self.planned[i];
+        let k = runs.partition_point(|&(seq, _, _)| seq <= named.seq);
+        k.checked_sub(1)
+            .map(|k| runs[k])
+            .filter(|&(seq, _, n)| named.seq < seq + n as u64)
+            .map(|(seq, lv, _)| lv + (named.seq - seq) as usize)
+            .ok_or(unknown)
+    }
+
+    /// An aside as event `lv`, from its JSON: what it names must be
+    /// earlier, a range's ends inserts, a range set's range a range.
+    /// Mirrors [`Writer::aside_json`].
+    fn aside(&self, json: AsideJson, lv: Lv) -> Result<Aside, DecodeError> {
+        let earlier = |named: &Named, ok: &dyn Fn(Lv) -> bool, what| {
+            let at = self.named(named)?;
+            if at < lv && ok(at) { Ok(at) } else { Err(DecodeError::Invalid(what)) }
+        };
+        let insert = |at: Lv| self.kind(at) == Some(Kind::Insert);
+        let range = |at: Lv| {
+            if at < self.log.len() {
+                matches!(self.log.run_of(at).op, RunOp::Aside(Aside::RangeAdd { .. }))
+            } else {
+                self.new_ranges.contains(&at)
+            }
+        };
+        Ok(match json {
+            AsideJson::RangeAdd { start, end, tag } => Aside::RangeAdd {
+                start: earlier(&start, &insert, "a range's end that isn't an earlier insert")?,
+                end: earlier(&end, &insert, "a range's end that isn't an earlier insert")?,
+                tag,
+            },
+            AsideJson::RangeSet { range: r, tag } => Aside::RangeSet {
+                range: earlier(&r, &range, "a range set of something not an earlier range")?,
+                tag,
+            },
+        })
     }
 
     /// The kind of event `lv`, in the log or planned.
@@ -723,6 +831,7 @@ pub(crate) fn dump_chunk<T: Codec + serde::Serialize>(
             }}),
             RawOp::Move { pos, len, to } => json!({"move": {"pos": pos, "count": len, "to": to}}),
             RawOp::Mark { pos, level } => json!({"mark": {"pos": pos, "level": level}}),
+            RawOp::Aside(aside) => json!({"aside": aside}),
         };
         out.push(json!({"agent": name(run.agent)?, "seq": run.seq, "parents": parents, "op": op}));
         events.extend((0..run.len() as u64).map(|k| (run.agent, run.seq + k)));
@@ -839,6 +948,7 @@ fn get_op<T: Codec>(input: &mut &[u8]) -> Result<RawOp<T>, DecodeError> {
             level: u8::try_from(get_usize(input)?)
                 .map_err(|_| DecodeError::Invalid("a section level past 255"))?,
         },
+        ASIDE => RawOp::Aside(ext::get_json(input)?),
         _ => {
             return Err(DecodeError::Invalid(
                 "an event kind this version doesn't know",
