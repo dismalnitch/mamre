@@ -15,5 +15,9 @@ mamre-egg-walker = { path = "../egg-walker" }
 proptest = "1.12"
 
 [[bench]]
+name = "units"
+harness = false
+
+[[bench]]
 name = "reconcile"
 harness = false

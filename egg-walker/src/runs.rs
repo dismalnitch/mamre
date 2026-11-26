@@ -352,8 +352,12 @@ impl Linked {
         cmp: impl Fn(Key) -> std::cmp::Ordering,
     ) {
         let n = self.new_node(key, left, right);
-        let (l, r) = (self.left[n], self.right[n]);
+        let (l, mut r) = (self.left[n], self.right[n]);
         let left_at = self.label_or(l, 0);
+        // A right origin before the left one says nothing: see `order.rs`.
+        if r != NIL && self.label[r] <= left_at && l != NIL {
+            r = NIL;
+        }
         let right_at = self.label_or(r, u64::MAX);
         let mut i = if l == NIL { self.head } else { self.next[l] };
         let mut dest = i;
@@ -366,7 +370,10 @@ impl Linked {
                 break;
             }
             let other_left = self.label_or(self.left[i], 0);
-            let other_right = self.label_or(self.right[i], u64::MAX);
+            let other_right = match self.right[i] {
+                r if r != NIL && self.left[i] != NIL && self.label[r] <= other_left => u64::MAX,
+                r => self.label_or(r, u64::MAX),
+            };
             if other_left < left_at {
                 break;
             }
