@@ -4,7 +4,7 @@
 //! it by agent and sequence number.
 //!
 //! ```text
-//! chunk     = compression (byte, 0: none), agents, runs
+//! chunk     = compression (byte, 0: none), agents, runs, [extension]
 //! agents    = count, then each name (length, UTF-8)
 //! runs      = count, then each run
 //! run       = agent (index into agents)
@@ -25,6 +25,8 @@
 //!             comments) share the log, so they share its one order and one
 //!             undo history; this version knows none, and refuses a chunk
 //!             that edits one, since a later event could depend on it.
+//! extension = what the chunk carries beside its runs, as JSON (see
+//!             `ext.rs`); only when there's something in it
 //! ref       = varint v:
 //!             v even: an event in this chunk, v / 2 events before this
 //!                     run's first
@@ -50,6 +52,7 @@ use mamre::codec::{
     Codec, DecodeError, get_str, get_usize, get_varint, put_str, put_usize, put_varint,
 };
 
+use crate::ext::{self, ChunkExt};
 use crate::oplog::{AgentId, Kind, Lv, Op, OpLog, RunOp, normalize};
 
 const INSERT: u64 = 0;
@@ -221,6 +224,10 @@ impl<T: Clone + Codec> OpLog<T> {
         for piece in &pieces {
             writer.put_run(out, piece, &mut seqs);
         }
+        let side = ChunkExt::default();
+        if !side.is_empty() {
+            ext::put_json(out, &side);
+        }
     }
 
     /// The stretches of runs in `spans`, in order.
@@ -287,10 +294,7 @@ impl<T: Clone + Codec> OpLog<T> {
     /// to events this log doesn't have, nothing is added.
     pub fn decode_chunk(&mut self, mut bytes: &[u8]) -> Result<usize, DecodeError> {
         let input = &mut bytes;
-        let (names, runs) = parse_chunk::<T>(input)?;
-        if !input.is_empty() {
-            return Err(DecodeError::Invalid("bytes after the chunk"));
-        }
+        let (names, runs, _side) = parse_chunk::<T>(input)?;
         let mut planner = Planner::new(self, &names);
         let mut planned = Vec::new();
         for run in runs {
@@ -612,8 +616,9 @@ impl<'a, T: Clone> Planner<'a, T> {
     }
 }
 
-/// A chunk as read: its agents' names and its runs.
-type Parsed<T> = (Vec<String>, Vec<RawRun<T>>);
+/// A chunk as read: its agents' names, its runs, and what it carries
+/// beside them.
+type Parsed<T> = (Vec<String>, Vec<RawRun<T>>, ChunkExt);
 
 /// Reads a chunk's agents and runs. Mirrors
 /// [`encode_events`](OpLog::encode_events).
@@ -626,7 +631,71 @@ fn parse_chunk<T: Codec>(input: &mut &[u8]) -> Result<Parsed<T>, DecodeError> {
     for _ in 0..n {
         runs.push(get_run(input, &mut seqs)?);
     }
-    Ok((names, runs))
+    let side = ext::get_trailing(input, "bytes after the chunk")?;
+    Ok((names, runs, side))
+}
+
+/// A chunk as JSON, for reading by people: each run with its agent, seq,
+/// parents and op, references spelled out as agent and seq. Mirrors
+/// [`parse_chunk`]; nothing is checked against a log.
+pub(crate) fn dump_chunk<T: Codec + serde::Serialize>(
+    mut body: &[u8],
+) -> Result<serde_json::Value, DecodeError> {
+    use serde_json::{Value, json};
+    let (names, runs, side) = parse_chunk::<T>(&mut body)?;
+    let name = |agent: usize| {
+        names
+            .get(agent)
+            .cloned()
+            .ok_or(DecodeError::Invalid("an agent the chunk doesn't name"))
+    };
+    // Each event of the chunk so far, as (agent, seq), for back references.
+    let mut events: Vec<(usize, u64)> = Vec::new();
+    let mut out = Vec::new();
+    for run in &runs {
+        let first = events.len();
+        let spell = |r: &Ref| -> Result<Value, DecodeError> {
+            let (agent, seq) = match *r {
+                Ref::Back(d) => *first
+                    .checked_sub(d)
+                    .and_then(|k| events.get(k))
+                    .ok_or(DecodeError::Invalid("a reference before the chunk's start"))?,
+                Ref::Before { agent, seq } => (agent, seq),
+            };
+            Ok(json!({"agent": name(agent)?, "seq": seq}))
+        };
+        let parents = run.parents.iter().map(spell).collect::<Result<Vec<_>, _>>()?;
+        let op = match &run.op {
+            RawOp::Insert { pos, items } => json!({"insert": {"pos": pos, "items": items_json(items)}}),
+            RawOp::Delete { pos, len } => json!({"delete": {"pos": pos, "count": len}}),
+            RawOp::Undelete { targets } => json!({"undelete": {
+                "targets": targets.iter().map(spell).collect::<Result<Vec<_>, _>>()?
+            }}),
+            RawOp::Move { pos, len, to } => json!({"move": {"pos": pos, "count": len, "to": to}}),
+            RawOp::Mark { pos, level } => json!({"mark": {"pos": pos, "level": level}}),
+        };
+        out.push(json!({"agent": name(run.agent)?, "seq": run.seq, "parents": parents, "op": op}));
+        events.extend((0..run.len() as u64).map(|k| (run.agent, run.seq + k)));
+    }
+    let mut chunk = json!({"agents": names, "runs": out});
+    if !side.is_empty() {
+        chunk["extension"] = serde_json::to_value(&side).expect("side data is JSON");
+    }
+    Ok(chunk)
+}
+
+/// Items as JSON: text as one string, anything else as a list.
+pub(crate) fn items_json<T: serde::Serialize>(items: &[T]) -> serde_json::Value {
+    let value = serde_json::to_value(items).expect("items serialize");
+    let text: Option<String> = value.as_array().and_then(|all| {
+        all.iter()
+            .map(|v| v.as_str().filter(|s| s.chars().count() == 1))
+            .collect()
+    });
+    match text {
+        Some(text) if !items.is_empty() => serde_json::Value::String(text),
+        _ => value,
+    }
 }
 
 /// Reads the compression byte: only 0, none, so far.
@@ -781,6 +850,27 @@ mod tests {
             ))
         );
         assert_eq!(log.len(), 0);
+    }
+
+    /// A chunk carrying side data a later version wrote still reads.
+    #[test]
+    fn a_chunks_unknown_side_data_is_ignored() {
+        let mut bytes = one_insert();
+        ext::put_json(&mut bytes, &serde_json::json!({"later": true}));
+        let mut log = OpLog::<char>::new();
+        assert_eq!(log.decode_chunk(&bytes), Ok(1));
+    }
+
+    #[test]
+    fn bytes_after_a_chunks_extension_are_refused() {
+        let mut bytes = one_insert();
+        ext::put_json(&mut bytes, &serde_json::json!({}));
+        bytes.push(0);
+        let mut log = OpLog::<char>::new();
+        assert_eq!(
+            log.decode_chunk(&bytes),
+            Err(DecodeError::Invalid("bytes after the chunk"))
+        );
     }
 
     #[test]
