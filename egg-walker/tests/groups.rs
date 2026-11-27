@@ -485,3 +485,31 @@ proptest! {
         }
     }
 }
+
+/// A log opened from a file keeps its steps but not the stacks: after
+/// `start_undo`, none of the steps so far is undone, since which were undos
+/// isn't known (undoing an undo's step would bring back what it undid).
+#[test]
+fn start_undo_leaves_the_steps_before_it() {
+    let mut log = OpLog::new();
+    let mut w = Writer::new(&mut log, "w");
+    log.begin_group(w.me);
+    w.type_at(&mut log, 0, "gone");
+    log.end_group(w.me);
+    assert!(w.undo(&mut log));
+    assert_eq!(w.text(), "");
+    // As if opened again: new books, the same log.
+    let mut again = Writer::new(&mut log, "w");
+    let v = log.version().to_vec();
+    again.merge(&log, &v);
+    again.books.start_undo(&log, again.me);
+    assert!(!again.undo(&mut log), "the undo's step isn't undone");
+    assert_eq!(again.text(), "");
+    // Steps from here on are.
+    log.begin_group(again.me);
+    again.type_at(&mut log, 0, "new");
+    log.end_group(again.me);
+    assert!(again.undo(&mut log));
+    assert_eq!(again.text(), "");
+    assert!(!again.undo(&mut log));
+}
