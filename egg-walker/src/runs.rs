@@ -36,7 +36,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
-use crate::copies::Loss;
+use crate::copies::{Loss, origins_loop};
 use crate::oplog::{Lv, Op, OpLog};
 use crate::walk::tie_break;
 
@@ -1351,7 +1351,18 @@ impl<'a, T: Clone> Replay<'a, T> {
                     .filter(|&o| !list.has(o))
                     .collect();
                 if !waiting.is_empty() {
-                    assert!(stack.len() <= limit, "origins in a loop");
+                    if stack.len() > limit {
+                        // A loop: see `copies.rs`.
+                        let waiting = |k: Key| -> Vec<Key> {
+                            let (l, r) = origins(k);
+                            [l, r].into_iter().flatten().filter(|&o| !list.has(o)).collect()
+                        };
+                        let copier = |k: Key| (k >= self.copy_base).then(|| self.copier(k));
+                        match origins_loop(k, waiting, copier, |m| act.on[m]) {
+                            Some(cycle) => return Err(cycle),
+                            None => panic!("origins in a loop"),
+                        }
+                    }
                     stack.extend(waiting);
                     continue;
                 }

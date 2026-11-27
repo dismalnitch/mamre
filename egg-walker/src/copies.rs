@@ -96,6 +96,51 @@ type Key = usize;
 /// An event, numbered in the replay: the window's events in order.
 type Ix = usize;
 
+/// Records waiting on each other for their origins, from `start`: the
+/// standing moves whose copies are among them, each going inside the
+/// next, if there's a loop (mamre#40). Something typed among one move's
+/// copies goes with it by its origins even where its neighbours didn't
+/// decide it (at an edge), so a move put beside it can land inside the
+/// first move's copies while the first lands inside its own: a loop
+/// `goes_with` can't see. It's refused the same way.
+pub(crate) fn origins_loop(
+    start: Key,
+    waiting: impl Fn(Key) -> Vec<Key>,
+    copier: impl Fn(Key) -> Option<Ix>,
+    stands: impl Fn(Ix) -> bool,
+) -> Option<Vec<Ix>> {
+    // Depth first, along records not placed yet.
+    let mut path: Vec<(Key, Vec<Key>)> = vec![(start, waiting(start))];
+    let mut on: HashMap<Key, usize> = HashMap::from([(start, 0)]);
+    let mut done: HashSet<Key> = HashSet::new();
+    let keys = loop {
+        let (_, next) = path.last_mut()?;
+        match next.pop() {
+            Some(n) if on.contains_key(&n) => {
+                break path[on[&n]..].iter().map(|(k, _)| *k).collect::<Vec<Key>>();
+            }
+            Some(n) if done.contains(&n) => {}
+            Some(n) => {
+                on.insert(n, path.len());
+                let w = waiting(n);
+                path.push((n, w));
+            }
+            None => {
+                let (k, _) = path.pop().expect("not empty");
+                on.remove(&k);
+                done.insert(k);
+            }
+        }
+    };
+    let mut moves: Vec<Ix> = Vec::new();
+    for m in keys.into_iter().filter_map(copier) {
+        if stands(m) && !moves.contains(&m) {
+            moves.push(m);
+        }
+    }
+    (!moves.is_empty()).then_some(moves)
+}
+
 /// Where an insert, or a move's copies, go: its origins, and the visible
 /// neighbours that decide what it goes with.
 #[derive(Clone, Copy, Default)]
@@ -766,7 +811,19 @@ impl<'a, T: Clone> Replay<'a, T> {
                     .filter(|o| !index.contains_key(o))
                     .collect();
                 if !waiting.is_empty() {
-                    assert!(stack.len() <= 4 * self.n() + 8, "origins in a loop");
+                    if stack.len() > 4 * self.n() + 8 {
+                        let waiting = |k: Key| -> Vec<Key> {
+                            let (l, r) = origins(k);
+                            [l, r].into_iter().flatten().filter(|o| !index.contains_key(o)).collect()
+                        };
+                        let copier = |k: Key| {
+                            (k >= self.copy_base).then(|| self.copies[k - self.copy_base].0)
+                        };
+                        match origins_loop(k, waiting, copier, |m| active.contains(&m)) {
+                            Some(cycle) => return Err(cycle),
+                            None => panic!("origins in a loop"),
+                        }
+                    }
                     stack.extend(waiting);
                     continue;
                 }

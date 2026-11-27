@@ -265,6 +265,83 @@ fn moves_into_each_other_beside_a_third_drop_one() {
     merges_agree(&log, &[base, a_into_b, b_into_a, c_to_front, ab, ac, bc, all]);
 }
 
+/// A loop by way of typing, from a network run of text's
+/// replicas_converge (mamre#40), shrunk as far as dropping whole events
+/// goes. c's typing, done without seeing either of a's two moves, goes
+/// with one of them; c's move, put between two of those characters, so
+/// lands inside that move's copies while that move lands inside its own.
+/// No redirect says so, so it's the layout that finds records waiting on
+/// each other, and drops the latest move as for any other loop. (Every
+/// engine used to assert "origins in a loop".)
+#[test]
+fn a_loop_by_way_of_typing_from_the_network() {
+    enum Op {
+        Ins(usize, char),
+        Del(usize),
+        Mov(usize, usize, usize),
+        Mrk(usize, u8),
+    }
+    use Op::*;
+    let events: &[(&str, &[Lv], Op)] = &[
+        ("a", &[], Ins(0, 'b')),
+        ("a", &[0], Ins(1, 'a')),
+        ("a", &[1], Ins(2, '🦀')),
+        ("b", &[], Ins(0, 'é')),
+        ("b", &[3], Ins(1, '🦀')),
+        ("b", &[4], Ins(2, 'é')),
+        ("b", &[5], Ins(3, '\n')),
+        ("b", &[6], Del(2)),
+        ("b", &[7], Del(2)),
+        ("c", &[], Ins(0, 'é')),
+        ("c", &[9], Ins(1, '\n')),
+        ("c", &[10], Ins(2, '🦀')),
+        ("c", &[11], Ins(0, 'é')),
+        ("c", &[12], Mov(0, 1, 3)),
+        ("a", &[2, 8, 13], Mov(2, 6, 0)),
+        ("a", &[14], Ins(7, '\n')),
+        ("a", &[15], Ins(8, 'é')),
+        ("a", &[16], Ins(9, '🦀')),
+        ("a", &[17], Del(2)),
+        ("a", &[18], Del(5)),
+        ("a", &[19], Del(5)),
+        ("a", &[20], Ins(9, ' ')),
+        ("a", &[21], Ins(6, '🦀')),
+        ("a", &[22], Ins(7, '🦀')),
+        ("a", &[23], Mov(1, 4, 11)),
+        ("c", &[13], Ins(0, 'b')),
+        ("c", &[25], Ins(1, 'a')),
+        ("c", &[26], Ins(1, '\n')),
+        ("c", &[27, 8, 2], Ins(8, 'b')),
+        ("c", &[28], Ins(9, ' ')),
+        ("c", &[29], Mrk(11, 0)),
+        ("c", &[30], Ins(0, 'é')),
+        ("c", &[31], Ins(1, 'a')),
+        ("c", &[32], Ins(2, 'b')),
+        ("c", &[33], Ins(15, ' ')),
+        ("c", &[34], Ins(16, ' ')),
+        ("c", &[35], Ins(17, '\n')),
+        ("c", &[36, 21], Mrk(4, 0)),
+        ("c", &[37], Ins(14, 'a')),
+        ("c", &[38], Ins(15, 'é')),
+        ("c", &[39], Ins(16, 'b')),
+        ("c", &[40], Mov(15, 9, 6)),
+    ];
+    let mut log = OpLog::new();
+    for (lv, (who, parents, op)) in events.iter().enumerate() {
+        let me = log.agent(who);
+        let got = match *op {
+            Ins(pos, item) => log.add_insert(me, parents, pos, [item]),
+            Del(pos) => log.add_delete(me, parents, pos..pos + 1),
+            Mov(pos, len, to) => log.add_move(me, parents, pos..pos + len, to),
+            Mrk(pos, level) => log.add_mark(me, parents, pos, level),
+        };
+        assert_eq!(got, vec![lv]);
+    }
+    let (a, b, c) = (vec![24], vec![8], vec![events.len() - 1]);
+    let all = log.union(&log.union(&a, &b), &c);
+    merges_agree(&log, &[a.clone(), c.clone(), log.union(&a, &c), all]);
+}
+
 #[test]
 fn crossing_moves_drop_the_later() {
     let mut log = OpLog::new();
