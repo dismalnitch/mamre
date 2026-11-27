@@ -776,8 +776,16 @@ impl<'a, T: Clone> Replay<'a, T> {
                 (Some(key - 1), spot.right)
             }
         };
+        // Laid out in an order every replica agrees on, by the event that
+        // made each record: where a record lands can hang on what's laid
+        // out before it, when a move has carried an origin far off (see
+        // `order.rs`), and the order events are replayed in is neither
+        // the same on every replica nor, in a window, the same as from
+        // scratch (mamre#59).
+        let mut makers: Vec<Ix> = (0..self.n()).filter(|i| spots.contains_key(i)).collect();
+        makers.sort_by_key(|&i| self.key(i));
         let mut todo: Vec<Key> = Vec::new();
-        for i in (0..self.n()).filter(|i| spots.contains_key(i)) {
+        for i in makers {
             match &self.info[i] {
                 Info::Insert(_) => todo.push(self.events[i]),
                 Info::Move(mv) => todo.extend(mv.first_copy..mv.first_copy + mv.sources.len()),
@@ -796,7 +804,10 @@ impl<'a, T: Clone> Replay<'a, T> {
             });
             index.insert(k, i);
         }
-        // Each record after its origins.
+        // Each record after its origins, depth first. Those whose origins
+        // are being laid out are pending: a record waiting on one of them
+        // is a loop. (Each is expanded once, so this is linear.)
+        let mut pending: HashSet<Key> = HashSet::new();
         for key in todo {
             let mut stack = vec![key];
             while let Some(&k) = stack.last() {
@@ -811,7 +822,7 @@ impl<'a, T: Clone> Replay<'a, T> {
                     .filter(|o| !index.contains_key(o))
                     .collect();
                 if !waiting.is_empty() {
-                    if stack.len() > 4 * self.n() + 8 {
+                    if waiting.iter().any(|o| pending.contains(o)) {
                         let waiting = |k: Key| -> Vec<Key> {
                             let (l, r) = origins(k);
                             [l, r].into_iter().flatten().filter(|o| !index.contains_key(o)).collect()
@@ -824,9 +835,11 @@ impl<'a, T: Clone> Replay<'a, T> {
                             None => panic!("origins in a loop"),
                         }
                     }
+                    pending.insert(k);
                     stack.extend(waiting);
                     continue;
                 }
+                pending.remove(&k);
                 let by = self.made_by(k);
                 let dest = place(
                     &list,

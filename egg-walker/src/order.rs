@@ -40,7 +40,8 @@ pub(crate) fn place<P: Placed>(
     // where an item lands not to depend on the order things were laid out
     // in: a right origin carried deep into a sibling's subtree can still
     // put a later sibling either side of it (mamre#59). So both layouts
-    // lay records out in the same order, by the event that made each.
+    // lay records out in the same order, one every replica agrees on: by
+    // the event that made each, in Lamport order.
     let right_at = right
         .map(|r| index_of(r) as isize)
         .filter(|&r| r > left_at)

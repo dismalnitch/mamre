@@ -265,24 +265,80 @@ fn moves_into_each_other_beside_a_third_drop_one() {
     merges_agree(&log, &[base, a_into_b, b_into_a, c_to_front, ab, ac, bc, all]);
 }
 
-/// A loop by way of typing, from a network run of text's
-/// replicas_converge (mamre#40), shrunk as far as dropping whole events
-/// goes. c's typing, done without seeing either of a's two moves, goes
-/// with one of them; c's move, put between two of those characters, so
-/// lands inside that move's copies while that move lands inside its own.
-/// No redirect says so, so it's the layout that finds records waiting on
-/// each other, and drops the latest move as for any other loop. (Every
-/// engine used to assert "origins in a loop".)
-#[test]
-fn a_loop_by_way_of_typing_from_the_network() {
-    enum Op {
-        Ins(usize, char),
-        Del(usize),
-        Mov(usize, usize, usize),
-        Mrk(usize, u8),
+/// An event of a history written out by hand: who, its parents (by index
+/// into the history), and what it did.
+#[derive(Clone, Copy)]
+enum Ev {
+    Ins(usize, char),
+    Del(usize),
+    Mov(usize, usize, usize),
+    Mrk(usize, u8),
+}
+use Ev::*;
+
+type Written = &'static [(&'static str, &'static [usize], Ev)];
+
+/// `events` as a log, each added in `order` (after its parents), and the
+/// version each event got.
+fn written(events: Written, order: &[usize]) -> (OpLog<char>, Vec<Lv>) {
+    let mut log = OpLog::new();
+    let mut lvs = vec![usize::MAX; events.len()];
+    for &i in order {
+        let (who, parents, op) = events[i];
+        let parents: Vec<Lv> = parents
+            .iter()
+            .map(|&p| {
+                assert_ne!(lvs[p], usize::MAX, "parents first");
+                lvs[p]
+            })
+            .collect();
+        let me = log.agent(who);
+        let got = match op {
+            Ins(pos, item) => log.add_insert(me, &parents, pos, [item]),
+            Del(pos) => log.add_delete(me, &parents, pos..pos + 1),
+            Mov(pos, len, to) => log.add_move(me, &parents, pos..pos + len, to),
+            Mrk(pos, level) => log.add_mark(me, &parents, pos, level),
+        };
+        assert_eq!(got.len(), 1);
+        lvs[i] = got[0];
     }
-    use Op::*;
-    let events: &[(&str, &[Lv], Op)] = &[
+    (log, lvs)
+}
+
+/// The same history numbered as another replica might: each event as soon
+/// as its parents are in, the latest written first.
+fn renumbered(events: Written) -> Vec<usize> {
+    let n = events.len();
+    let mut done = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    while order.len() < n {
+        let i = (0..n)
+            .rev()
+            .find(|&i| !done[i] && events[i].1.iter().all(|&p| done[p]))
+            .expect("parents come first");
+        done[i] = true;
+        order.push(i);
+    }
+    order
+}
+
+/// Every replica reads a history the same, however its log numbers the
+/// events (mamre#59): the layout's order is one they all agree on.
+fn reads_the_same_renumbered(events: Written) {
+    let (one, _) = written(events, &(0..events.len()).collect::<Vec<_>>());
+    let (two, _) = written(events, &renumbered(events));
+    let text = |log: &OpLog<char>| -> String {
+        reference::checkout(log, log.version()).into_iter().collect()
+    };
+    assert_eq!(text(&one), text(&two), "the reference");
+    assert_eq!(
+        one.checkout(one.version()),
+        two.checkout(two.version()),
+        "the walk"
+    );
+}
+
+const NETWORK_LOOP: Written = &[
         ("a", &[], Ins(0, 'b')),
         ("a", &[0], Ins(1, 'a')),
         ("a", &[1], Ins(2, '🦀')),
@@ -325,41 +381,9 @@ fn a_loop_by_way_of_typing_from_the_network() {
         ("c", &[38], Ins(15, 'é')),
         ("c", &[39], Ins(16, 'b')),
         ("c", &[40], Mov(15, 9, 6)),
-    ];
-    let mut log = OpLog::new();
-    for (lv, (who, parents, op)) in events.iter().enumerate() {
-        let me = log.agent(who);
-        let got = match *op {
-            Ins(pos, item) => log.add_insert(me, parents, pos, [item]),
-            Del(pos) => log.add_delete(me, parents, pos..pos + 1),
-            Mov(pos, len, to) => log.add_move(me, parents, pos..pos + len, to),
-            Mrk(pos, level) => log.add_mark(me, parents, pos, level),
-        };
-        assert_eq!(got, vec![lv]);
-    }
-    let (a, b, c) = (vec![24], vec![8], vec![events.len() - 1]);
-    let all = log.union(&log.union(&a, &b), &c);
-    merges_agree(&log, &[a.clone(), c.clone(), log.union(&a, &c), all]);
-}
+];
 
-/// Where a record lands can hang on what's laid out before it (mamre#59):
-/// a copy whose right origin a move carried deep into a sibling's subtree
-/// can put a later sibling either side of it. The window laid out every
-/// insert before any copy; copies.rs lays records out by the event that
-/// made each, and the window now does the same. Here c types "b" just
-/// before its own move's copies of "af", while a moves everything round
-/// them; the window put the "b" after them. From a live replica's run,
-/// shrunk as far as dropping whole events goes.
-#[test]
-fn records_are_laid_out_in_the_same_order_everywhere() {
-    enum Op {
-        Ins(usize, char),
-        Del(usize),
-        Mov(usize, usize, usize),
-        Mrk(usize, u8),
-    }
-    use Op::*;
-    let events: &[(&str, &[Lv], Op)] = &[
+const LAID_OUT: Written = &[
         ("c", &[], Ins(0, 'e')),
         ("c", &[0], Ins(1, 'f')),
         ("c", &[1], Ins(1, 'a')),
@@ -394,20 +418,48 @@ fn records_are_laid_out_in_the_same_order_everywhere() {
         ("a", &[30], Ins(3, 'f')),
         ("a", &[31], Ins(4, 'e')),
         ("a", &[32], Mov(6, 12, 19)),
-    ];
-    let mut log = OpLog::new();
-    for (lv, (who, parents, op)) in events.iter().enumerate() {
-        let me = log.agent(who);
-        let got = match *op {
-            Ins(pos, item) => log.add_insert(me, parents, pos, [item]),
-            Del(pos) => log.add_delete(me, parents, pos..pos + 1),
-            Mov(pos, len, to) => log.add_move(me, parents, pos..pos + len, to),
-            Mrk(pos, level) => log.add_mark(me, parents, pos, level),
-        };
-        assert_eq!(got, vec![lv]);
-    }
+];
+
+/// A loop by way of typing, from a network run of text's
+/// replicas_converge (mamre#40), shrunk as far as dropping whole events
+/// goes. c's typing, done without seeing either of a's two moves, goes
+/// with one of them; c's move, put between two of those characters, so
+/// lands inside that move's copies while that move lands inside its own.
+/// No redirect says so, so it's the layout that finds records waiting on
+/// each other, and drops the latest move as for any other loop. (Every
+/// engine used to assert "origins in a loop".)
+#[test]
+fn a_loop_by_way_of_typing_from_the_network() {
+    let (log, _) = written(NETWORK_LOOP, &(0..NETWORK_LOOP.len()).collect::<Vec<_>>());
+    let (a, b, c) = (vec![24], vec![8], vec![NETWORK_LOOP.len() - 1]);
+    let all = log.union(&log.union(&a, &b), &c);
+    merges_agree(&log, &[a.clone(), c.clone(), log.union(&a, &c), all]);
+}
+
+/// Where a record lands can hang on what's laid out before it (mamre#59):
+/// a copy whose right origin a move carried deep into a sibling's subtree
+/// can put a later sibling either side of it. The window laid out every
+/// insert before any copy; copies.rs lays records out by the event that
+/// made each, and the window now does the same. Here c types "b" just
+/// before its own move's copies of "af", while a moves everything round
+/// them; the window put the "b" after them. From a live replica's run,
+/// shrunk as far as dropping whole events goes.
+#[test]
+fn records_are_laid_out_in_the_same_order_everywhere() {
+    let (log, _) = written(LAID_OUT, &(0..LAID_OUT.len()).collect::<Vec<_>>());
     let (a, c) = (vec![33], vec![21]);
     merges_agree(&log, &[a.clone(), c.clone(), log.union(&a, &c)]);
+}
+
+/// The layout's order is one every replica agrees on (mamre#59), not the
+/// order a replica's log happens to number events in: both histories
+/// above, numbered another way, read the same. (Text's
+/// replicas_read_the_same_whatever_order_they_merge_in is the case that
+/// found it, by way of the order a window replays events in.)
+#[test]
+fn a_history_reads_the_same_however_it_is_numbered() {
+    reads_the_same_renumbered(NETWORK_LOOP);
+    reads_the_same_renumbered(LAID_OUT);
 }
 
 #[test]
