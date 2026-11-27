@@ -32,11 +32,13 @@
 //!
 //! # What's not here yet
 //!
-//! - Undo (#14): undo groups come with the editor's needs in hand.
-//! - [`Edit::Lost`]: the interface has it, but nothing sends it until
-//!   moves become copies (#20). Until then a move made at the same time as
-//!   another that crosses it is dropped without a word, and a move of a
-//!   range that cuts into a moved block does nothing.
+//! - Undo: the history has it (undo steps, #14; a move's undo, #30), but
+//!   `Text` doesn't offer it yet.
+//! - [`Edit::Lost`]: the interface has it, but nothing sends it yet. Moves
+//!   made at the same time are settled by #20's rules (a move crossing
+//!   another, or one that would loop, is dropped; a move against a delete
+//!   loses), and the history reports each loss, but `Text` doesn't pass
+//!   the report on.
 //! - Peers aren't checked for honesty (#9): only talk to ones you trust.
 
 use std::collections::HashMap;
