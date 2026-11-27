@@ -128,6 +128,31 @@ fn two_writers_meet() {
     assert_eq!(b.text.to_string(), a.text.to_string());
 }
 
+/// Two blocks moved into each other while a third writer moves something
+/// else (mamre#40): one of the loop's moves is dropped, the third stands,
+/// and everyone ends up reading the same. (It used to overflow the stack.)
+#[test]
+fn moves_into_each_other_beside_a_third() {
+    let mut rs = [Replica::new("a"), Replica::new("b"), Replica::new("c")];
+    let e = rs[0].text.insert(0, "AAAA.BBBB.CC.").unwrap();
+    rs[0].apply(e);
+    let [a, b, c] = &mut rs;
+    sync(a, b);
+    sync(a, c);
+    let e = a.text.move_text(0..5, 7).unwrap();
+    a.apply(e);
+    let e = b.text.move_text(5..10, 2).unwrap();
+    b.apply(e);
+    let e = c.text.move_text(10..13, 0).unwrap();
+    c.apply(e);
+    sync(a, b);
+    sync(b, c);
+    sync(a, c);
+    for r in [&a, &b, &c] {
+        assert_eq!(r.text.to_string(), "CC.BBAAAA.BB.");
+    }
+}
+
 /// Typing in a paragraph while someone else moves it: the typing goes
 /// where the paragraph went.
 #[test]

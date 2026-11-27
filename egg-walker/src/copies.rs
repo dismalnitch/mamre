@@ -96,6 +96,51 @@ type Key = usize;
 /// An event, numbered in the replay: the window's events in order.
 type Ix = usize;
 
+/// Records waiting on each other for their origins, from `start`: the
+/// standing moves whose copies are among them, each going inside the
+/// next, if there's a loop (mamre#40). Something typed among one move's
+/// copies goes with it by its origins even where its neighbours didn't
+/// decide it (at an edge), so a move put beside it can land inside the
+/// first move's copies while the first lands inside its own: a loop
+/// `goes_with` can't see. It's refused the same way.
+pub(crate) fn origins_loop(
+    start: Key,
+    waiting: impl Fn(Key) -> Vec<Key>,
+    copier: impl Fn(Key) -> Option<Ix>,
+    stands: impl Fn(Ix) -> bool,
+) -> Option<Vec<Ix>> {
+    // Depth first, along records not placed yet.
+    let mut path: Vec<(Key, Vec<Key>)> = vec![(start, waiting(start))];
+    let mut on: HashMap<Key, usize> = HashMap::from([(start, 0)]);
+    let mut done: HashSet<Key> = HashSet::new();
+    let keys = loop {
+        let (_, next) = path.last_mut()?;
+        match next.pop() {
+            Some(n) if on.contains_key(&n) => {
+                break path[on[&n]..].iter().map(|(k, _)| *k).collect::<Vec<Key>>();
+            }
+            Some(n) if done.contains(&n) => {}
+            Some(n) => {
+                on.insert(n, path.len());
+                let w = waiting(n);
+                path.push((n, w));
+            }
+            None => {
+                let (k, _) = path.pop().expect("not empty");
+                on.remove(&k);
+                done.insert(k);
+            }
+        }
+    };
+    let mut moves: Vec<Ix> = Vec::new();
+    for m in keys.into_iter().filter_map(copier) {
+        if stands(m) && !moves.contains(&m) {
+            moves.push(m);
+        }
+    }
+    (!moves.is_empty()).then_some(moves)
+}
+
 /// Where an insert, or a move's copies, go: its origins, and the visible
 /// neighbours that decide what it goes with.
 #[derive(Clone, Copy, Default)]
@@ -202,6 +247,10 @@ pub(crate) struct Replay<'a, T> {
     looped: std::cell::RefCell<Vec<Ix>>,
     /// The moves undone, in the layout being built (#30).
     cancelled: std::cell::RefCell<Vec<Ix>>,
+    /// The events whose redirects are being worked out, innermost last,
+    /// and a loop of moves found among them (see `redirect`).
+    visiting: std::cell::RefCell<Vec<Ix>>,
+    found_loop: std::cell::RefCell<Option<Vec<Ix>>>,
 }
 
 /// The document drawn at a version.
@@ -331,9 +380,40 @@ impl<'a, T: Clone> Replay<'a, T> {
                 return found.clone();
             }
         }
+        if let Some(spot) = self.reentered(x, |m| active.contains(&m)) {
+            return spot;
+        }
+        self.visiting.borrow_mut().push(x);
         let found = self.find_redirect(x, active);
-        self.redirects.borrow_mut().2.insert(x, found.clone());
+        self.visiting.borrow_mut().pop();
+        if self.found_loop.borrow().is_none() {
+            self.redirects.borrow_mut().2.insert(x, found.clone());
+        }
         found
+    }
+
+    /// Whether `x`'s redirect is already being worked out, further out:
+    /// then where it goes depends on itself. That's moves whose copies
+    /// would each go with the other's, found by way of another move they
+    /// might both go with (mamre#40): the loop is noted, for `build` to
+    /// refuse as it refuses any other, and `x` stays put meanwhile.
+    fn reentered(&self, x: Ix, stands: impl Fn(Ix) -> bool) -> Option<(Spot, Vec<Ix>)> {
+        let visiting = self.visiting.borrow();
+        let i = visiting.iter().position(|&v| v == x)?;
+        let cycle: Vec<Ix> = visiting[i..]
+            .iter()
+            .copied()
+            .filter(|&v| matches!(self.info[v], Info::Move(_)) && stands(v))
+            .collect();
+        debug_assert!(
+            !cycle.is_empty(),
+            "a redirect only comes back round through standing moves"
+        );
+        let mut found = self.found_loop.borrow_mut();
+        if found.is_none() && !cycle.is_empty() {
+            *found = Some(cycle);
+        }
+        Some((self.spot(x), Vec::new()))
     }
 
     fn find_redirect(&self, x: Ix, active: &[Ix]) -> (Spot, Vec<Ix>) {
@@ -664,6 +744,9 @@ impl<'a, T: Clone> Replay<'a, T> {
                 }
             }
         }
+        if let Some(cycle) = self.found_loop.borrow_mut().take() {
+            return Err(cycle);
+        }
         // A loop of moves each going with the next is refused.
         for &start in active {
             let mut path = vec![start];
@@ -728,7 +811,19 @@ impl<'a, T: Clone> Replay<'a, T> {
                     .filter(|o| !index.contains_key(o))
                     .collect();
                 if !waiting.is_empty() {
-                    assert!(stack.len() <= 4 * self.n() + 8, "origins in a loop");
+                    if stack.len() > 4 * self.n() + 8 {
+                        let waiting = |k: Key| -> Vec<Key> {
+                            let (l, r) = origins(k);
+                            [l, r].into_iter().flatten().filter(|o| !index.contains_key(o)).collect()
+                        };
+                        let copier = |k: Key| {
+                            (k >= self.copy_base).then(|| self.copies[k - self.copy_base].0)
+                        };
+                        match origins_loop(k, waiting, copier, |m| active.contains(&m)) {
+                            Some(cycle) => return Err(cycle),
+                            None => panic!("origins in a loop"),
+                        }
+                    }
                     stack.extend(waiting);
                     continue;
                 }
@@ -983,6 +1078,8 @@ fn replay_checked<'a, T: Clone>(
         redirects: Default::default(),
         looped: Default::default(),
         cancelled: Default::default(),
+        visiting: Default::default(),
+        found_loop: Default::default(),
     };
     // The document after each event, while a later one still builds on it.
     let mut after: HashMap<Ix, View> = HashMap::new();

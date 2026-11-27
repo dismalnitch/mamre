@@ -36,7 +36,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
-use crate::copies::Loss;
+use crate::copies::{Loss, origins_loop};
 use crate::oplog::{Lv, Op, OpLog};
 use crate::walk::tie_break;
 
@@ -513,6 +513,11 @@ pub(crate) struct Replay<'a, T> {
     tracked: BTreeSet<Key>,
     records_of: HashMap<Lv, Vec<Key>>,
     redirects: RefCell<Redirects>,
+    /// The events whose redirects are being worked out, innermost last,
+    /// and a loop of moves found among them (see `copies.rs`'s
+    /// `reentered`).
+    visiting: RefCell<Vec<Ix>>,
+    found_loop: RefCell<Option<Vec<Ix>>>,
 }
 
 /// The document drawn at a version.
@@ -815,11 +820,37 @@ impl<'a, T: Clone> Replay<'a, T> {
             }
             memo.stamp == act.stamp
         };
+        if let Some(spot) = self.reentered(x, act) {
+            return spot;
+        }
+        self.visiting.borrow_mut().push(x);
         let found = self.find_redirect(x, act);
-        if current {
+        self.visiting.borrow_mut().pop();
+        if current && self.found_loop.borrow().is_none() {
             self.redirects.borrow_mut().found.insert(x, found.clone());
         }
         found
+    }
+
+    /// Whether `x`'s redirect is already being worked out: see
+    /// `copies.rs`.
+    fn reentered(&self, x: Ix, act: &Active) -> Option<(Spot, Vec<Ix>)> {
+        let visiting = self.visiting.borrow();
+        let i = visiting.iter().position(|&v| v == x)?;
+        let cycle: Vec<Ix> = visiting[i..]
+            .iter()
+            .copied()
+            .filter(|&v| matches!(self.info[v], Info::Move(_)) && act.on[v])
+            .collect();
+        debug_assert!(
+            !cycle.is_empty(),
+            "a redirect only comes back round through standing moves"
+        );
+        let mut found = self.found_loop.borrow_mut();
+        if found.is_none() && !cycle.is_empty() {
+            *found = Some(cycle);
+        }
+        Some((self.spot(x), Vec::new()))
     }
 
     fn find_redirect(&self, x: Ix, act: &Active) -> (Spot, Vec<Ix>) {
@@ -1118,6 +1149,9 @@ impl<'a, T: Clone> Replay<'a, T> {
                 }
             }
         }
+        if let Some(cycle) = self.found_loop.borrow_mut().take() {
+            return Err(cycle);
+        }
         for &start in &act.list {
             let mut path = vec![start];
             let mut todo = vec![(start, 0usize)];
@@ -1317,7 +1351,18 @@ impl<'a, T: Clone> Replay<'a, T> {
                     .filter(|&o| !list.has(o))
                     .collect();
                 if !waiting.is_empty() {
-                    assert!(stack.len() <= limit, "origins in a loop");
+                    if stack.len() > limit {
+                        // A loop: see `copies.rs`.
+                        let waiting = |k: Key| -> Vec<Key> {
+                            let (l, r) = origins(k);
+                            [l, r].into_iter().flatten().filter(|&o| !list.has(o)).collect()
+                        };
+                        let copier = |k: Key| (k >= self.copy_base).then(|| self.copier(k));
+                        match origins_loop(k, waiting, copier, |m| act.on[m]) {
+                            Some(cycle) => return Err(cycle),
+                            None => panic!("origins in a loop"),
+                        }
+                    }
                     stack.extend(waiting);
                     continue;
                 }
@@ -1655,6 +1700,8 @@ fn replay_checked<'a, T: Clone>(
         tracked: BTreeSet::new(),
         records_of: HashMap::new(),
         redirects: Default::default(),
+        visiting: Default::default(),
+        found_loop: Default::default(),
     };
     let mut next_copy = r.copy_base;
     let mut after: HashMap<Ix, View> = HashMap::new();
