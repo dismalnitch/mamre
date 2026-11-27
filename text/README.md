@@ -32,7 +32,7 @@ for msg in got.reply { /* send to ana */ }
 `Edit` is what the editor's layout needs, in order, each in the text as
 it was just before: `Insert { at, text }`, `Delete { range }`,
 `Move { range, to }` (`to` is before the move, outside the range),
-`Section { section, at, level }`, `Isolates` (they changed; the text didn't), and `Lost { ranges }`.
+`Section { section, at, level }`, `Isolates` (they changed; the text didn't), and `Lost { ranges }` (a move or section mark discarded for one made at the same time, and where its text is now).
 
 ## Wiring it into an editor
 
@@ -57,11 +57,5 @@ in a page.
 - Undo. The history has it: undo steps (#14), and undoing a move brings
   back what it moved (#30). `Text` has no `undo` of its own yet; it
   comes with the editor's needs in hand.
-- `Edit::Lost` is never sent yet. Moves made at the same time are settled
-  by the rules in #20: the same block moved twice, the later move wins; a
-  move crossing another, or one that would loop, is dropped; a move
-  against a delete loses to the delete. The history reports every loss,
-  but `Text` doesn't pass the report on yet, so a dropped move goes
-  unannounced.
 - Peers aren't checked for honesty (#9): talk only to ones you trust.
 - One writer name per replica: two windows on one device need two names.

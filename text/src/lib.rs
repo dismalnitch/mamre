@@ -34,11 +34,6 @@
 //!
 //! - Undo: the history has it (undo steps, #14; a move's undo, #30), but
 //!   `Text` doesn't offer it yet.
-//! - [`Edit::Lost`]: the interface has it, but nothing sends it yet. Moves
-//!   made at the same time are settled by #20's rules (a move crossing
-//!   another, or one that would loop, is dropped; a move against a delete
-//!   loses), and the history reports each loss, but `Text` doesn't pass
-//!   the report on.
 //! - Peers aren't checked for honesty (#9): only talk to ones you trust.
 
 use std::collections::HashMap;
@@ -106,8 +101,9 @@ pub enum Edit {
     /// [`Text::isolates`] what they are now.
     Isolates,
     /// A move or section mark that was discarded: it lost to something
-    /// done at the same time. Where its text is now. (Not sent yet: see
-    /// "What's not here yet" above.)
+    /// done at the same time (or did nothing from the start). Where its
+    /// text is now, as the text is at this point in the edits: none if
+    /// it's all been deleted. The text doesn't change.
     Lost { ranges: Vec<Range<usize>> },
 }
 
@@ -320,6 +316,17 @@ impl<M: Measure> Sequence<Piece> for Applying<'_, M> {
                 to: to_byte,
             });
         }
+    }
+
+    /// A move or mark discarded: where its text is now, in bytes. Only
+    /// markers there is no text; everything deleted, no ranges.
+    fn lost(&mut self, _op: Lv, _lost_to: Option<Lv>, ranges: &[Range<usize>]) {
+        let ranges = ranges
+            .iter()
+            .map(|r| self.byte(r.start)..self.byte(r.end))
+            .filter(|r| !r.is_empty())
+            .collect();
+        self.edits.push(Edit::Lost { ranges });
     }
 }
 

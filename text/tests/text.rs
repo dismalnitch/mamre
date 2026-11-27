@@ -76,6 +76,86 @@ fn sync(a: &mut Replica, b: &mut Replica) {
     panic!("they kept talking");
 }
 
+/// Applies `edits` to `r`'s editor, one by one: the text of each
+/// [`Edit::Lost`]'s ranges, read as the editor stood when it came.
+fn hearing_losses(r: &mut Replica, edits: Vec<Edit>) -> Vec<Vec<String>> {
+    let mut heard = Vec::new();
+    for edit in edits {
+        if let Edit::Lost { ranges } = &edit {
+            heard.push(ranges.iter().map(|g| r.editor[g.clone()].to_string()).collect());
+        }
+        apply(&mut r.editor, &edit);
+    }
+    assert_eq!(r.editor, r.text.to_string(), "the edits are the text's");
+    heard
+}
+
+/// [`sync`], hearing what each side lost.
+fn sync_hearing(a: &mut Replica, b: &mut Replica) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
+    let (mut heard_a, mut heard_b) = (Vec::new(), Vec::new());
+    let mut to_b = vec![a.text.hello()];
+    let mut to_a = vec![b.text.hello()];
+    while !to_a.is_empty() || !to_b.is_empty() {
+        for m in std::mem::take(&mut to_b) {
+            let got = b.text.receive(&m).unwrap();
+            to_a.extend(got.reply);
+            heard_b.extend(hearing_losses(b, got.edits));
+        }
+        for m in std::mem::take(&mut to_a) {
+            let got = a.text.receive(&m).unwrap();
+            to_b.extend(got.reply);
+            heard_a.extend(hearing_losses(a, got.edits));
+        }
+    }
+    (heard_a, heard_b)
+}
+
+/// Two moves that cross, made at the same time: the later is dropped,
+/// and both writers hear where its text is now.
+#[test]
+fn a_dropped_move_says_where_its_text_is() {
+    let (mut a, mut b) = (Replica::new("a"), Replica::new("b"));
+    let e = a.text.insert(0, "AAA.BBB.CCC.DDD.").unwrap();
+    a.apply(e);
+    sync(&mut a, &mut b);
+    let e = a.text.move_text(0..12, 16).unwrap();
+    a.apply(e);
+    let e = b.text.move_text(8..16, 0).unwrap();
+    b.apply(e);
+    let (heard_a, heard_b) = sync_hearing(&mut a, &mut b);
+    assert_eq!(a.text.to_string(), "DDD.AAA.BBB.CCC.");
+    assert_eq!(b.text.to_string(), a.text.to_string());
+    // b's move, of "CCC.DDD.", is the later: it's dropped. Its text
+    // is in two places now.
+    for heard in [&heard_a, &heard_b] {
+        assert_eq!(heard.len(), 1, "one loss: {heard:?}");
+        let mut texts = heard[0].clone();
+        texts.sort();
+        assert_eq!(texts, ["CCC.", "DDD."]);
+    }
+}
+
+/// A section mark that loses to a later one made at the same time is
+/// heard as lost too, at its character.
+#[test]
+fn a_dropped_section_mark_says_where_it_is() {
+    let (mut a, mut b) = (Replica::new("a"), Replica::new("b"));
+    let e = a.text.insert(0, "Title\nText").unwrap();
+    a.apply(e);
+    sync(&mut a, &mut b);
+    let (_, e) = a.text.mark_section(0, 1).unwrap();
+    a.apply(e);
+    let (_, e) = b.text.mark_section(0, 2).unwrap();
+    b.apply(e);
+    let (heard_a, heard_b) = sync_hearing(&mut a, &mut b);
+    assert_eq!(a.text.sections(), b.text.sections());
+    let all: Vec<_> = heard_a.iter().chain(&heard_b).collect();
+    assert!(!all.is_empty(), "someone hears the loss");
+    for heard in all {
+        assert_eq!(heard, &["T"]);
+    }
+}
+
 #[test]
 fn edits_are_in_bytes() {
     let mut r = Replica::new("me");
