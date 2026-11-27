@@ -242,6 +242,29 @@ fn moves_into_each_other_drop_one() {
     assert_eq!(got, "BBAAAA.BB.");
 }
 
+/// The same loop, with a third move made at the same time (mamre#40).
+/// Whether a's copies also go with c's move hangs on whether b's do, and
+/// that on a's: the loop is found while working that out, not only once
+/// every redirect is known, and dropped the same way. (It used to recurse
+/// until the stack ran out.)
+#[test]
+fn moves_into_each_other_beside_a_third_drop_one() {
+    let mut log = OpLog::new();
+    let base = typed(&mut log, "a", "AAAA.BBBB.CC.");
+    let (a, b, c) = (log.agent("a"), log.agent("b"), log.agent("c"));
+    let a_into_b = log.add_move(a, &base, 0..5, 7);
+    let b_into_a = log.add_move(b, &base, 5..10, 2);
+    let c_to_front = log.add_move(c, &base, 10..13, 0);
+    assert_eq!(text_at(&log, &c_to_front), "CC.AAAA.BBBB.");
+    let ab = merged(&log, &a_into_b, &b_into_a);
+    let all = merged(&log, &ab, &c_to_front);
+    // b's move is the latest of the loop: it's dropped; c's stands.
+    assert_eq!(text_at(&log, &all), "CC.BBAAAA.BB.");
+    let ac = merged(&log, &a_into_b, &c_to_front);
+    let bc = merged(&log, &b_into_a, &c_to_front);
+    merges_agree(&log, &[base, a_into_b, b_into_a, c_to_front, ab, ac, bc, all]);
+}
+
 #[test]
 fn crossing_moves_drop_the_later() {
     let mut log = OpLog::new();

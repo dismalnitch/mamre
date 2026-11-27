@@ -202,6 +202,10 @@ pub(crate) struct Replay<'a, T> {
     looped: std::cell::RefCell<Vec<Ix>>,
     /// The moves undone, in the layout being built (#30).
     cancelled: std::cell::RefCell<Vec<Ix>>,
+    /// The events whose redirects are being worked out, innermost last,
+    /// and a loop of moves found among them (see `redirect`).
+    visiting: std::cell::RefCell<Vec<Ix>>,
+    found_loop: std::cell::RefCell<Option<Vec<Ix>>>,
 }
 
 /// The document drawn at a version.
@@ -331,9 +335,40 @@ impl<'a, T: Clone> Replay<'a, T> {
                 return found.clone();
             }
         }
+        if let Some(spot) = self.reentered(x, |m| active.contains(&m)) {
+            return spot;
+        }
+        self.visiting.borrow_mut().push(x);
         let found = self.find_redirect(x, active);
-        self.redirects.borrow_mut().2.insert(x, found.clone());
+        self.visiting.borrow_mut().pop();
+        if self.found_loop.borrow().is_none() {
+            self.redirects.borrow_mut().2.insert(x, found.clone());
+        }
         found
+    }
+
+    /// Whether `x`'s redirect is already being worked out, further out:
+    /// then where it goes depends on itself. That's moves whose copies
+    /// would each go with the other's, found by way of another move they
+    /// might both go with (mamre#40): the loop is noted, for `build` to
+    /// refuse as it refuses any other, and `x` stays put meanwhile.
+    fn reentered(&self, x: Ix, stands: impl Fn(Ix) -> bool) -> Option<(Spot, Vec<Ix>)> {
+        let visiting = self.visiting.borrow();
+        let i = visiting.iter().position(|&v| v == x)?;
+        let cycle: Vec<Ix> = visiting[i..]
+            .iter()
+            .copied()
+            .filter(|&v| matches!(self.info[v], Info::Move(_)) && stands(v))
+            .collect();
+        debug_assert!(
+            !cycle.is_empty(),
+            "a redirect only comes back round through standing moves"
+        );
+        let mut found = self.found_loop.borrow_mut();
+        if found.is_none() && !cycle.is_empty() {
+            *found = Some(cycle);
+        }
+        Some((self.spot(x), Vec::new()))
     }
 
     fn find_redirect(&self, x: Ix, active: &[Ix]) -> (Spot, Vec<Ix>) {
@@ -664,6 +699,9 @@ impl<'a, T: Clone> Replay<'a, T> {
                 }
             }
         }
+        if let Some(cycle) = self.found_loop.borrow_mut().take() {
+            return Err(cycle);
+        }
         // A loop of moves each going with the next is refused.
         for &start in active {
             let mut path = vec![start];
@@ -983,6 +1021,8 @@ fn replay_checked<'a, T: Clone>(
         redirects: Default::default(),
         looped: Default::default(),
         cancelled: Default::default(),
+        visiting: Default::default(),
+        found_loop: Default::default(),
     };
     // The document after each event, while a later one still builds on it.
     let mut after: HashMap<Ix, View> = HashMap::new();
