@@ -18,7 +18,7 @@
 //!             1 delete:   pos, count          (each removes the item at pos)
 //!             2 undo:     count, then each target, a ref: a delete
 //!                         (undone for good), a move, or an undo of a
-//!                         move (a redo) (#30)
+//!                         move (a redo) (#30), that its event saw (#9)
 //!             3 move:     pos, count, to   (one event: moves don't run)
 //!             4 mark:     pos, level       (one event)
 //!             5 copy:     pos, count, then sources until their counts
@@ -663,6 +663,8 @@ struct Planner<'a, T> {
     ids: Vec<(usize, u64)>,
     /// The kinds of the new events so far.
     new_kinds: Vec<Kind>,
+    /// The parents of each new event so far.
+    new_parents: Vec<Vec<Lv>>,
     /// The number the next new event gets.
     next: Lv,
     /// The chunk's agents' names, for events side data names.
@@ -690,6 +692,7 @@ impl<'a, T: Clone> Planner<'a, T> {
             lvs: Vec::new(),
             ids: Vec::new(),
             new_kinds: Vec::new(),
+            new_parents: Vec::new(),
             next: log.len(),
             names,
             planned: vec![Vec::new(); names.len()],
@@ -731,13 +734,51 @@ impl<'a, T: Clone> Planner<'a, T> {
         self.lvs.extend(start..start + n);
         self.next += n;
         self.planned[run.agent].push((seq, start, n));
+        self.new_parents.push(parents.clone());
+        self.new_parents.extend((start..start + n - 1).map(|p| vec![p]));
         let op = self.plan_op(run.op, known, n, first)?;
+        // An undo names something its event saw (mamre#9): a peer could
+        // send one that doesn't, and the walk would take it back where it
+        // never was.
+        if let PlannedOp::Undos(ops) = &op {
+            for (k, op) in ops.iter().enumerate() {
+                let (Op::Undelete { target } | Op::Undo { target }) = *op else {
+                    unreachable!("an undo's op")
+                };
+                if !self.saw(&self.new_parents[start + k - self.log.len()], target) {
+                    return Err(DecodeError::Invalid("an undo of something its event didn't see"));
+                }
+            }
+        }
         Ok(Some(PlannedRun {
             agent: run.agent,
             seq,
             parents,
             op,
         }))
+    }
+
+    /// Whether an event after `parents` saw `target`: from the chunk's new
+    /// events back into the log. Parents come before their events, so
+    /// nothing before `target` can lead to it.
+    fn saw(&self, parents: &[Lv], target: Lv) -> bool {
+        let base = self.log.len();
+        let mut todo: Vec<Lv> = parents.to_vec();
+        let mut seen: std::collections::HashSet<Lv> = Default::default();
+        while let Some(v) = todo.pop() {
+            if v == target {
+                return true;
+            }
+            if v < target || !seen.insert(v) {
+                continue;
+            }
+            if v >= base {
+                todo.extend(&self.new_parents[v - base]);
+            } else {
+                todo.extend(self.log.event(v).parents.iter());
+            }
+        }
+        false
     }
 
     /// How many of `run`'s events, from its first, the log has already.
@@ -1283,6 +1324,41 @@ mod tests {
         bytes.insert(TAG + 1, 0);
         let mut log = OpLog::<char>::new();
         assert!(log.decode_chunk(&bytes).is_err());
+        assert_eq!(log.len(), 0);
+    }
+
+    /// a types "x" and deletes it; b undeletes it, after `parents` (refs).
+    fn an_undelete_by_b(parents: &[u8]) -> Vec<u8> {
+        let mut c = vec![0, 2, 1, b'a', 1, b'b', 3];
+        // a: insert "x" at 0.
+        c.extend([0, 0, 0, 0, 0, 1, 1, b'x']);
+        // a: delete at 0, after the insert (back 1).
+        c.extend([0, 0, 1, 2, 2, 0, 1]);
+        // b: an undo of the delete (back 1).
+        c.extend([1, 0, parents.len() as u8]);
+        c.extend(parents);
+        c.extend([4, 1, 2]);
+        c
+    }
+
+    #[test]
+    fn an_undelete_after_its_delete_reads() {
+        let mut log = OpLog::<char>::new();
+        assert_eq!(log.decode_chunk(&an_undelete_by_b(&[2])), Ok(3));
+    }
+
+    /// A peer could send an undo of something its event never saw (#9):
+    /// refused, as nothing there could have undone it.
+    #[test]
+    fn an_undelete_of_a_delete_it_didnt_see_is_refused() {
+        let refused = Err(DecodeError::Invalid(
+            "an undo of something its event didn't see",
+        ));
+        let mut log = OpLog::<char>::new();
+        assert_eq!(log.decode_chunk(&an_undelete_by_b(&[])), refused);
+        assert_eq!(log.len(), 0);
+        // After only the insert (back 2).
+        assert_eq!(log.decode_chunk(&an_undelete_by_b(&[4])), refused);
         assert_eq!(log.len(), 0);
     }
 }
