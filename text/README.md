@@ -53,9 +53,14 @@ in a page.
 
 ## Not here yet
 
-- Undo: undo groups (#14) come with the editor's needs in hand.
-- `Edit::Lost` is never sent yet. Until moves become copies (#20), a move
-  crossing another made at the same time is dropped silently, and a move
-  whose range cuts into a moved block does nothing.
+- Undo. The history has it: undo steps (#14), and undoing a move brings
+  back what it moved (#30). `Text` has no `undo` of its own yet; it
+  comes with the editor's needs in hand.
+- `Edit::Lost` is never sent yet. Moves made at the same time are settled
+  by the rules in #20: the same block moved twice, the later move wins; a
+  move crossing another, or one that would loop, is dropped; a move
+  against a delete loses to the delete. The history reports every loss,
+  but `Text` doesn't pass the report on yet, so a dropped move goes
+  unannounced.
 - Peers aren't checked for honesty (#9): talk only to ones you trust.
 - One writer name per replica: two windows on one device need two names.
