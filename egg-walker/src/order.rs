@@ -36,8 +36,11 @@ pub(crate) fn place<P: Placed>(
     let left_at = left.map_or(-1, |l| index_of(l) as isize);
     // A right origin laid out before the left one (moves' rules can map an
     // origin far off: see `copies.rs`) says nothing: as if there were none.
-    // Then every pair of origins is in order, and where an item lands
-    // doesn't depend on the order things were laid out in.
+    // Then every pair of origins is in order. That isn't quite enough for
+    // where an item lands not to depend on the order things were laid out
+    // in: a right origin carried deep into a sibling's subtree can still
+    // put a later sibling either side of it (mamre#59). So both layouts
+    // lay records out in the same order, by the event that made each.
     let right_at = right
         .map(|r| index_of(r) as isize)
         .filter(|&r| r > left_at)

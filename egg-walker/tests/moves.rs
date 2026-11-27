@@ -342,6 +342,74 @@ fn a_loop_by_way_of_typing_from_the_network() {
     merges_agree(&log, &[a.clone(), c.clone(), log.union(&a, &c), all]);
 }
 
+/// Where a record lands can hang on what's laid out before it (mamre#59):
+/// a copy whose right origin a move carried deep into a sibling's subtree
+/// can put a later sibling either side of it. The window laid out every
+/// insert before any copy; copies.rs lays records out by the event that
+/// made each, and the window now does the same. Here c types "b" just
+/// before its own move's copies of "af", while a moves everything round
+/// them; the window put the "b" after them. From a live replica's run,
+/// shrunk as far as dropping whole events goes.
+#[test]
+fn records_are_laid_out_in_the_same_order_everywhere() {
+    enum Op {
+        Ins(usize, char),
+        Del(usize),
+        Mov(usize, usize, usize),
+        Mrk(usize, u8),
+    }
+    use Op::*;
+    let events: &[(&str, &[Lv], Op)] = &[
+        ("c", &[], Ins(0, 'e')),
+        ("c", &[0], Ins(1, 'f')),
+        ("c", &[1], Ins(1, 'a')),
+        ("b", &[], Ins(0, 'b')),
+        ("b", &[3], Ins(0, 'b')),
+        ("c", &[2], Ins(3, 'e')),
+        ("c", &[5], Mov(1, 2, 0)),
+        ("a", &[1], Ins(1, 'e')),
+        ("b", &[4, 6], Ins(3, 'b')),
+        ("b", &[8], Ins(4, 'b')),
+        ("b", &[9], Ins(5, 'a')),
+        ("b", &[10], Ins(6, 'f')),
+        ("a", &[7], Ins(2, 'f')),
+        ("c", &[6], Ins(4, 'a')),
+        ("c", &[13], Ins(5, 'f')),
+        ("a", &[6, 12], Ins(6, 'o')),
+        ("b", &[7, 11], Del(7)),
+        ("c", &[7, 14], Mov(5, 2, 4)),
+        ("b", &[16], Ins(5, 'u')),
+        ("b", &[18], Del(1)),
+        ("a", &[15, 19], Ins(2, 'w')),
+        ("c", &[17], Ins(4, 'b')),
+        ("a", &[20], Mrk(4, 0)),
+        ("a", &[22], Ins(10, 'u')),
+        ("a", &[23], Ins(2, 'g')),
+        ("a", &[24], Del(3)),
+        ("a", &[25], Del(9)),
+        ("a", &[26], Ins(10, 'y')),
+        ("a", &[27], Ins(0, 'e')),
+        ("a", &[28], Ins(1, 'u')),
+        ("a", &[29], Ins(2, 'y')),
+        ("a", &[30], Ins(3, 'f')),
+        ("a", &[31], Ins(4, 'e')),
+        ("a", &[32], Mov(6, 12, 19)),
+    ];
+    let mut log = OpLog::new();
+    for (lv, (who, parents, op)) in events.iter().enumerate() {
+        let me = log.agent(who);
+        let got = match *op {
+            Ins(pos, item) => log.add_insert(me, parents, pos, [item]),
+            Del(pos) => log.add_delete(me, parents, pos..pos + 1),
+            Mov(pos, len, to) => log.add_move(me, parents, pos..pos + len, to),
+            Mrk(pos, level) => log.add_mark(me, parents, pos, level),
+        };
+        assert_eq!(got, vec![lv]);
+    }
+    let (a, c) = (vec![33], vec![21]);
+    merges_agree(&log, &[a.clone(), c.clone(), log.union(&a, &c)]);
+}
+
 #[test]
 fn crossing_moves_drop_the_later() {
     let mut log = OpLog::new();

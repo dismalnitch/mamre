@@ -1319,6 +1319,10 @@ impl<'a, T: Clone> Replay<'a, T> {
             );
             (left, right)
         };
+        // In the order copies.rs lays them out, by the event that made
+        // each, then by key: with origins a move has carried far off,
+        // where a record lands can hang on what's laid out before it
+        // (mamre#59), so the order is part of the rule.
         let mut todo: Vec<Key> = Vec::new();
         for run in &inserts {
             todo.extend(atoms.range(run.clone()).map(|(&k, _)| k));
@@ -1331,6 +1335,7 @@ impl<'a, T: Clone> Replay<'a, T> {
                     .map(|(&k, _)| k),
             );
         }
+        todo.sort_unstable_by_key(|&k| (self.by(k).expect("a replayed record"), k));
         let mut list = Linked::with_capacity(atoms.len());
         for (i, &k) in base_atoms.iter().enumerate() {
             list.push_back(k, i.checked_sub(1).map(|p| base_atoms[p]), None);
