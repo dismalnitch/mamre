@@ -1319,10 +1319,9 @@ impl<'a, T: Clone> Replay<'a, T> {
             );
             (left, right)
         };
-        // In the order copies.rs lays them out, by the event that made
-        // each, then by key: with origins a move has carried far off,
-        // where a record lands can hang on what's laid out before it
-        // (mamre#59), so the order is part of the rule.
+        // In the order copies.rs lays them out: by the event that made
+        // each, in an order every replica agrees on, then by key (see
+        // copies.rs, mamre#59).
         let mut todo: Vec<Key> = Vec::new();
         for run in &inserts {
             todo.extend(atoms.range(run.clone()).map(|(&k, _)| k));
@@ -1335,13 +1334,15 @@ impl<'a, T: Clone> Replay<'a, T> {
                     .map(|(&k, _)| k),
             );
         }
-        todo.sort_unstable_by_key(|&k| (self.by(k).expect("a replayed record"), k));
+        todo.sort_by_key(|&k| (self.key(self.by(k).expect("a replayed record")), k));
         let mut list = Linked::with_capacity(atoms.len());
         for (i, &k) in base_atoms.iter().enumerate() {
             list.push_back(k, i.checked_sub(1).map(|p| base_atoms[p]), None);
         }
         list.relabel();
-        let limit = 4 * atoms.len() + 8;
+        // Depth first, as copies.rs: a record waiting on a pending one is
+        // a loop.
+        let mut pending: HashSet<Key> = HashSet::new();
         for key in todo {
             let mut stack = vec![key];
             while let Some(&k) = stack.last() {
@@ -1356,7 +1357,7 @@ impl<'a, T: Clone> Replay<'a, T> {
                     .filter(|&o| !list.has(o))
                     .collect();
                 if !waiting.is_empty() {
-                    if stack.len() > limit {
+                    if waiting.iter().any(|o| pending.contains(o)) {
                         // A loop: see `copies.rs`.
                         let waiting = |k: Key| -> Vec<Key> {
                             let (l, r) = origins(k);
@@ -1368,9 +1369,11 @@ impl<'a, T: Clone> Replay<'a, T> {
                             None => panic!("origins in a loop"),
                         }
                     }
+                    pending.insert(k);
                     stack.extend(waiting);
                     continue;
                 }
+                pending.remove(&k);
                 let by = self.made_by(k);
                 list.place(k, left, right, |other| {
                     tie_break(self.log, by, self.made_by(other))
