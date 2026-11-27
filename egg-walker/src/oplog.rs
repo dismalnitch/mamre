@@ -11,6 +11,10 @@
 //!
 //! Across replicas an event is named by its agent and sequence number.
 //!
+//! A paste (#36) is inserts like any other, with new ids; each also
+//! remembers the insert it copies (its lineage, which history reads and
+//! the merge never does).
+//!
 //! Events are stored as runs: one agent's consecutive events, each right
 //! after the last, typing forward or deleting forward, are one entry with
 //! their items, not one event (and one list of parents) per item. That's
@@ -236,6 +240,11 @@ pub struct OpLog<T> {
     /// Per agent, how deep in [`begin_group`](Self::begin_group)s it is
     /// here: this replica's, never sent.
     depth: Vec<u32>,
+    /// Where pasted characters came from (#36), in pieces: the paste's
+    /// inserts `first..first + len` came from inserts `source..source +
+    /// len`, which lie in one run. A paste is an insert in every other
+    /// way: this is lineage, which the merge never reads.
+    pub(crate) lineage: BTreeMap<Lv, (Lv, usize)>,
 }
 
 impl<T> Default for OpLog<T> {
@@ -249,6 +258,7 @@ impl<T> Default for OpLog<T> {
             frontier: Vec::new(),
             step_ends: Vec::new(),
             depth: Vec::new(),
+            lineage: BTreeMap::new(),
         }
     }
 }
@@ -335,6 +345,46 @@ impl<T: Clone> OpLog<T> {
             version = vec![lv];
         }
         version
+    }
+
+    /// Pastes (#36): puts in at `pos`, in a document at `parents`, as
+    /// `agent`, copies of the inserts `sources`, in order (what the
+    /// document had at the copied positions: see
+    /// [`Identities::item`](crate::Identities::item)). The copies are new
+    /// inserts, with ids of their own; each remembers its source, which
+    /// [`source`](Self::source) gives. Returns the version after.
+    ///
+    /// The sources can be any earlier inserts, deleted ones too: text
+    /// copied from an older version.
+    pub fn add_paste(&mut self, agent: AgentId, parents: &[Lv], pos: usize, sources: &[Lv]) -> Vec<Lv> {
+        let items: Vec<T> = sources
+            .iter()
+            .map(|&s| {
+                assert!(s < self.len() && self.is_insert(s), "a paste's source {s} isn't an insert");
+                self.item(s)
+            })
+            .collect();
+        debug_assert!(
+            {
+                let seen = self.closure(parents);
+                sources.iter().all(|&s| seen[s])
+            },
+            "a paste's sources are in its document's history"
+        );
+        let first = self.len();
+        let version = self.add_insert(agent, parents, pos, items);
+        for (k, &s) in sources.iter().enumerate() {
+            self.note_source(first + k, s);
+        }
+        version
+    }
+
+    /// The item insert `lv` put in.
+    pub(crate) fn item(&self, lv: Lv) -> T {
+        match self.op(lv) {
+            Op::Insert { item, .. } => item,
+            _ => unreachable!("event {lv} isn't an insert"),
+        }
     }
 
     /// Removes the items in `range`, in a document at `parents`, as `agent`:
@@ -724,7 +774,11 @@ impl<T: Clone> OpLog<T> {
                 })),
                 op => op,
             };
-            self.push(agent, event.seq, parents, op);
+            let new = self.push(agent, event.seq, parents, op);
+            if let Some(s) = other.source(lv) {
+                let s = self.local(other, s).expect("a paste's source arrives before it");
+                self.note_source(new, s);
+            }
             added += 1;
         }
         for (a, ends) in other.step_ends.iter().enumerate() {
@@ -937,6 +991,48 @@ impl<T> OpLog<T> {
             self.spans[agent.index()].insert(seq, (lv, len));
         }
         lv
+    }
+
+    /// Where pasted insert `lv` came from (#36): the insert it copies.
+    /// `None` for anything else, typed text included.
+    pub fn source(&self, lv: Lv) -> Option<Lv> {
+        let (&first, &(source, len)) = self.lineage.range(..=lv).next_back()?;
+        (lv < first + len).then(|| source + (lv - first))
+    }
+
+    /// The pieces of lineage over events `range`, clipped to it: each
+    /// `(first, source, len)`.
+    pub(crate) fn sources_in(&self, range: Range<Lv>) -> Vec<(Lv, Lv, usize)> {
+        let start = self
+            .lineage
+            .range(..=range.start)
+            .next_back()
+            .map_or(range.start, |(&first, _)| first);
+        self.lineage
+            .range(start..range.end)
+            .filter_map(|(&first, &(source, len))| {
+                let from = first.max(range.start);
+                let to = (first + len).min(range.end);
+                (from < to).then(|| (from, source + (from - first), to - from))
+            })
+            .collect()
+    }
+
+    /// Notes that new insert `lv` (the log's last) copies insert `source`,
+    /// extending the last piece of lineage if it can: a piece's sources
+    /// are all before its first event, and in one run.
+    pub(crate) fn note_source(&mut self, lv: Lv, source: Lv) {
+        debug_assert!(source < lv && self.is_insert(source));
+        if let Some((&first, &(from, len))) = self.lineage.iter().next_back()
+            && first + len == lv
+            && from + len == source
+            && source < first
+            && self.run_index(from) == self.run_index(source)
+        {
+            self.lineage.insert(first, (from, len + 1));
+            return;
+        }
+        self.lineage.insert(lv, (source, 1));
     }
 
     pub(crate) fn agent_by_name(&self, name: &str) -> Option<AgentId> {

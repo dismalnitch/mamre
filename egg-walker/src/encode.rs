@@ -21,7 +21,14 @@
 //!                         move (a redo) (#30)
 //!             3 move:     pos, count, to   (one event: moves don't run)
 //!             4 mark:     pos, level       (one event)
-//!             (5 is kept for #36's copy: pos, count, to)
+//!             5 copy:     pos, count, then sources until their counts
+//!                         add up to count, each a ref and a count: a
+//!                         paste (#36), inserts at pos like op 0, of copies
+//!                         of the source inserts' items. A source is the
+//!                         ref's event and the next count - 1 of its
+//!                         agent's (by seq), all earlier inserts. Pasted
+//!                         item k copies the k-th source event: that's
+//!                         its lineage, which the merge never reads.
 //!             6 aside:    an extension (see `ext.rs`): the event as JSON,
 //!                         one event per run, the events it names by
 //!                         agent name and seq. Ranges (#32): {"range_add":
@@ -80,6 +87,7 @@ const DELETE: u64 = 1;
 const UNDO: u64 = 2;
 const MOVE: u64 = 3;
 const MARK: u64 = 4;
+const COPY: u64 = 5;
 const ASIDE: u64 = 6;
 
 // Encoding and decoding mirror each other, step by step:
@@ -111,6 +119,8 @@ enum RawOp<T> {
     Undo { targets: Vec<Ref> },
     Move { pos: usize, len: usize, to: usize },
     Mark { pos: usize, level: u8 },
+    /// Sources as (the first, how many of its agent's from there).
+    Copy { pos: usize, len: usize, sources: Vec<(Ref, usize)> },
     Aside(AsideJson),
 }
 
@@ -125,7 +135,7 @@ impl<T> RawRun<T> {
     fn len(&self) -> usize {
         match &self.op {
             RawOp::Insert { items, .. } => items.len(),
-            RawOp::Delete { len, .. } => *len,
+            RawOp::Delete { len, .. } | RawOp::Copy { len, .. } => *len,
             RawOp::Undo { targets } => targets.len(),
             RawOp::Move { .. } | RawOp::Mark { .. } | RawOp::Aside(_) => 1,
         }
@@ -282,11 +292,65 @@ impl<T: Clone + Codec> OpLog<T> {
             while let Some(run) = self.runs.get(r)
                 && run.start < span.end
             {
-                pieces.push((r, run.start.max(span.start)..run.end().min(span.end)));
+                let range = run.start.max(span.start)..run.end().min(span.end);
+                if matches!(run.op, RunOp::Insert { .. }) {
+                    pieces.extend(self.split_pasted(range).into_iter().map(|p| (r, p)));
+                } else {
+                    pieces.push((r, range));
+                }
                 r += 1;
             }
         }
         pieces
+    }
+
+    /// Inserts `range`, one run's, split where pastes start and end: each
+    /// stretch all typed or all pasted, to be written as an insert or a
+    /// copy. A pasted stretch's sources are all before its first event,
+    /// since a chunk names them from there (a paste of what was pasted just
+    /// before it, in the same run, starts a stretch of its own).
+    fn split_pasted(&self, range: Range<Lv>) -> Vec<Range<Lv>> {
+        let mut out = Vec::new();
+        let mut at = range.start;
+        for (first, source, len) in self.sources_in(range.clone()) {
+            if first > at {
+                out.push(at..first);
+            }
+            match out.last_mut() {
+                // Pasted right after pasted, of what's before both: one copy.
+                Some(last)
+                    if last.end == first
+                        && self.source(last.start).is_some()
+                        && source + len <= last.start =>
+                {
+                    last.end = first + len
+                }
+                _ => out.push(first..first + len),
+            }
+            at = first + len;
+        }
+        if at < range.end {
+            out.push(at..range.end);
+        }
+        out
+    }
+
+    /// The sources of pasted inserts `range`, as a chunk names them: each
+    /// the first source event and how many of its agent's follow it by
+    /// seq. Mirrors the decoder's reading of them in [`Planner::plan_op`].
+    fn copy_sources(&self, range: Range<Lv>) -> Vec<(Lv, usize)> {
+        let mut out: Vec<(Lv, usize)> = Vec::new();
+        let mut end: Option<(AgentId, u64)> = None;
+        for (_, source, len) in self.sources_in(range) {
+            let run = self.run_of(source);
+            let seq = run.seq + (source - run.start) as u64;
+            match out.last_mut() {
+                Some(last) if end == Some((run.agent, seq)) => last.1 += len,
+                _ => out.push((source, len)),
+            }
+            end = Some((run.agent, seq + len as u64));
+        }
+        out
     }
 
     /// The agents a chunk names: those of its own events, and those of
@@ -311,6 +375,11 @@ impl<T: Clone + Codec> OpLog<T> {
                     }
                 }
                 RunOp::Undo { target } => outside(target),
+                RunOp::Insert { .. } => {
+                    for (source, _) in self.copy_sources(range.clone()) {
+                        outside(source);
+                    }
+                }
                 _ => {}
             }
         }
@@ -387,6 +456,15 @@ impl<T: Clone + Codec> OpLog<T> {
                         parents = vec![lv];
                     }
                 }
+                PlannedOp::Copy { pos, sources } => {
+                    // The sources are earlier, so here by now.
+                    let items = sources.iter().map(|&s| self.item(s)).collect();
+                    let op = RunOp::Insert { pos, items };
+                    let first = self.push_run(ids[agent], seq, normalize(parents), op);
+                    for (k, s) in sources.into_iter().enumerate() {
+                        self.note_source(first + k, s);
+                    }
+                }
             }
         }
     }
@@ -420,7 +498,26 @@ impl<T: Clone + Codec> Writer<'_, T> {
         for p in parents {
             self.put_ref(out, p, first);
         }
-        self.put_op(out, &run.op, k..k + range.len(), first);
+        if self.log.source(range.start).is_some() {
+            self.put_copy(out, &run.op, k, range.clone(), first);
+        } else {
+            self.put_op(out, &run.op, k..k + range.len(), first);
+        }
+    }
+
+    /// Writes pasted inserts `range`, from `k` in their run: a copy.
+    /// Mirrors the copy in [`get_op`].
+    fn put_copy(&self, out: &mut Vec<u8>, op: &RunOp<T>, k: usize, range: Range<Lv>, first: usize) {
+        let RunOp::Insert { pos, .. } = op else {
+            unreachable!("only inserts are pasted")
+        };
+        put_varint(out, COPY << 1);
+        put_usize(out, pos + k);
+        put_usize(out, range.len());
+        for (source, len) in self.log.copy_sources(range) {
+            self.put_ref(out, source, first);
+            put_usize(out, len);
+        }
     }
 
     /// Writes events `ks` (counted from the run's first) of a run's op: its
@@ -533,6 +630,8 @@ impl<T: Clone + Codec> Writer<'_, T> {
 enum PlannedOp<T> {
     Run(RunOp<T>),
     Undos(Vec<Op<T>>),
+    /// A paste: inserts at `pos`, each copying its source.
+    Copy { pos: usize, sources: Vec<Lv> },
 }
 
 /// A run of a chunk with the events this log has already left out: the
@@ -560,6 +659,8 @@ struct Planner<'a, T> {
     next_seq: Vec<u64>,
     /// Each of the chunk's events so far, as numbered in the log.
     lvs: Vec<Lv>,
+    /// Each of the chunk's events so far, as (agent, seq).
+    ids: Vec<(usize, u64)>,
     /// The kinds of the new events so far.
     new_kinds: Vec<Kind>,
     /// The number the next new event gets.
@@ -587,6 +688,7 @@ impl<'a, T: Clone> Planner<'a, T> {
             next_seq: have.clone(),
             have,
             lvs: Vec::new(),
+            ids: Vec::new(),
             new_kinds: Vec::new(),
             next: log.len(),
             names,
@@ -606,6 +708,7 @@ impl<'a, T: Clone> Planner<'a, T> {
             .checked_add(len as u64)
             .ok_or(DecodeError::Overflow)?;
         let first = self.lvs.len();
+        self.ids.extend((0..len as u64).map(|k| (run.agent, run.seq + k)));
         let known = self.known(&run);
         if known == len {
             return Ok(None);
@@ -684,6 +787,37 @@ impl<'a, T: Clone> Planner<'a, T> {
                 self.new_kinds.push(Kind::Mark);
                 PlannedOp::Run(RunOp::Mark { pos, level })
             }
+            RawOp::Copy { pos, sources, .. } => {
+                let pos = pos.checked_add(known).ok_or(DecodeError::Overflow)?;
+                // The run's first event, which every source is before.
+                let before = self.lvs[first];
+                let mut each = Vec::with_capacity(n);
+                for (r, len) in sources {
+                    let (agent, seq) = match r {
+                        Ref::Back(d) => *first
+                            .checked_sub(d)
+                            .filter(|_| d > 0)
+                            .and_then(|i| self.ids.get(i))
+                            .ok_or(DecodeError::Invalid("a reference past the chunk's start"))?,
+                        Ref::Before { agent, seq } => (agent, seq),
+                    };
+                    for j in 0..len as u64 {
+                        let seq = seq.checked_add(j).ok_or(DecodeError::Overflow)?;
+                        let at = self.lv_of(agent, seq)?;
+                        if at >= before || self.kind(at) != Some(Kind::Insert) {
+                            return Err(DecodeError::Invalid(
+                                "a copy of something not an earlier insert",
+                            ));
+                        }
+                        each.push(at);
+                    }
+                }
+                self.new_kinds.extend(std::iter::repeat_n(Kind::Insert, n));
+                PlannedOp::Copy {
+                    pos,
+                    sources: each.split_off(known),
+                }
+            }
             RawOp::Aside(json) => {
                 let lv = self.next - 1;
                 let aside = self.aside(json, lv)?;
@@ -744,25 +878,34 @@ impl<'a, T: Clone> Planner<'a, T> {
 
     /// The event side data names: in the log, or new in this chunk.
     fn named(&self, named: &Named) -> Result<Lv, DecodeError> {
-        let unknown = DecodeError::Invalid("an event this log doesn't have");
         let Some(i) = self.names.iter().position(|n| *n == named.agent) else {
             // An agent the chunk doesn't name: one the log has.
             return self
                 .log
                 .agent_by_name(&named.agent)
                 .and_then(|a| self.log.find(a, named.seq))
-                .ok_or(unknown);
+                .ok_or(DecodeError::Invalid("an event this log doesn't have"));
         };
-        if named.seq < self.have[i] {
+        self.lv_of(i, named.seq)
+    }
+
+    /// Event `seq` of agent `i` (into the chunk's names): in the log, or
+    /// new in this chunk so far.
+    fn lv_of(&self, i: usize, seq: u64) -> Result<Lv, DecodeError> {
+        let unknown = DecodeError::Invalid("an event this log doesn't have");
+        let Some(&have) = self.have.get(i) else {
+            return Err(DecodeError::Invalid("an agent the chunk doesn't name"));
+        };
+        if seq < have {
             let a = self.agents[i].expect("a known event's agent is known");
-            return self.log.find(a, named.seq).ok_or(unknown);
+            return self.log.find(a, seq).ok_or(unknown);
         }
         let runs = &self.planned[i];
-        let k = runs.partition_point(|&(seq, _, _)| seq <= named.seq);
+        let k = runs.partition_point(|&(s, _, _)| s <= seq);
         k.checked_sub(1)
             .map(|k| runs[k])
-            .filter(|&(seq, _, n)| named.seq < seq + n as u64)
-            .map(|(seq, lv, _)| lv + (named.seq - seq) as usize)
+            .filter(|&(s, _, n)| seq < s + n as u64)
+            .map(|(s, lv, _)| lv + (seq - s) as usize)
             .ok_or(unknown)
     }
 
@@ -887,6 +1030,17 @@ pub(crate) fn dump_chunk<T: Codec + serde::Serialize>(
             }}),
             RawOp::Move { pos, len, to } => json!({"move": {"pos": pos, "count": len, "to": to}}),
             RawOp::Mark { pos, level } => json!({"mark": {"pos": pos, "level": level}}),
+            RawOp::Copy { pos, len, sources } => {
+                let sources = sources
+                    .iter()
+                    .map(|(r, n)| {
+                        let mut v = spell(r)?;
+                        v["count"] = json!(n);
+                        Ok(v)
+                    })
+                    .collect::<Result<Vec<_>, DecodeError>>()?;
+                json!({"copy": {"pos": pos, "count": len, "sources": sources}})
+            }
             RawOp::Aside(aside) => json!({"aside": aside}),
         };
         out.push(json!({"agent": name(run.agent)?, "seq": run.seq, "parents": parents, "op": op}));
@@ -1004,6 +1158,21 @@ fn get_op<T: Codec>(input: &mut &[u8]) -> Result<RawOp<T>, DecodeError> {
             level: u8::try_from(get_usize(input)?)
                 .map_err(|_| DecodeError::Invalid("a section level past 255"))?,
         },
+        COPY => {
+            let pos = get_usize(input)?;
+            let len = get_usize(input)?;
+            let mut sources = Vec::new();
+            let mut got = 0usize;
+            while got < len {
+                let r = get_ref(input)?;
+                let n = get_usize(input)?;
+                got = got.checked_add(n).filter(|&g| n > 0 && g <= len).ok_or(
+                    DecodeError::Invalid("a copy's sources that don't add up to its count"),
+                )?;
+                sources.push((r, n));
+            }
+            RawOp::Copy { pos, len, sources }
+        }
         ASIDE => RawOp::Aside(ext::get_json(input)?),
         _ => {
             return Err(DecodeError::Invalid(

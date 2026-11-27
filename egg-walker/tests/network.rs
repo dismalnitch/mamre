@@ -32,6 +32,14 @@ enum Act {
         p: usize,
         pick: u16,
     },
+    /// Peer `p` copies its text from `a` to `b` and pastes it at `at`
+    /// (#36).
+    Paste {
+        p: usize,
+        a: u16,
+        b: u16,
+        at: u16,
+    },
     /// Peer `p` sends its summary to peer `to`.
     Gossip {
         p: usize,
@@ -73,6 +81,17 @@ impl Peer {
     fn version(&self) -> Vec<Lv> {
         self.log.version().to_vec()
     }
+}
+
+/// Each pasted event and its source, named by agent and seq (#36).
+fn lineage(log: &OpLog<char>) -> std::collections::BTreeSet<((String, u64), (String, u64))> {
+    let name = |lv: Lv| {
+        let e = log.event(lv);
+        (log.agent_name(e.agent).to_string(), e.seq)
+    };
+    (0..log.len())
+        .filter_map(|lv| log.source(lv).map(|s| (name(lv), name(s))))
+        .collect()
 }
 
 fn frac(len: usize, f: u16) -> usize {
@@ -189,6 +208,23 @@ fn run(n: usize, acts: &[Act]) -> Result<(), String> {
                 }
                 vec![p]
             }
+            Act::Paste { p, a, b, at } => {
+                let peer = &mut peers[p];
+                let (a, b) = (frac(peer.doc.len(), a), frac(peer.doc.len(), b));
+                let range = a.min(b)..a.max(b);
+                if !range.is_empty() {
+                    let agent = peer.log.agent(&peer.name.clone());
+                    let sources: Vec<Lv> = range.clone().map(|k| peer.ids.item(k)).collect();
+                    let pos = frac(peer.doc.len(), at);
+                    let v = peer.version();
+                    peer.log.add_paste(agent, &v, pos, &sources);
+                    let n = range.len();
+                    peer.ids.insert(pos, peer.log.len() - n, n);
+                    let items: Vec<char> = peer.doc[range].to_vec();
+                    peer.doc.splice(pos..pos, items);
+                }
+                vec![p]
+            }
             Act::Gossip { p, to } => {
                 if p != to {
                     queue.push((p, to, Message::Summary(peers[p].log.summary()).encode()));
@@ -293,6 +329,12 @@ fn run(n: usize, acts: &[Act]) -> Result<(), String> {
                 peer.name, peers[0].name
             ));
         }
+        if lineage(&peer.log) != lineage(&peers[0].log) {
+            return Err(format!(
+                "{} has different lineage from {}",
+                peer.name, peers[0].name
+            ));
+        }
         if peer.doc != peers[0].doc {
             return Err(format!(
                 "diverged: {} has {:?}, {} has {:?}",
@@ -310,6 +352,8 @@ fn acts(n: usize) -> impl Strategy<Value = Vec<Act>> {
             4 => (p.clone(), any::<u16>(), 1usize..4).prop_map(|(p, at, n)| Act::Insert { p, at, n }),
             2 => (p.clone(), any::<u16>(), any::<u16>()).prop_map(|(p, a, b)| Act::Delete { p, a, b }),
             1 => (p.clone(), any::<u16>()).prop_map(|(p, pick)| Act::Undo { p, pick }),
+            1 => (p.clone(), any::<u16>(), any::<u16>(), any::<u16>())
+                .prop_map(|(p, a, b, at)| Act::Paste { p, a, b, at }),
             3 => (p.clone(), p.clone()).prop_map(|(p, to)| Act::Gossip { p, to }),
             2 => (p.clone(), p.clone(), 1usize..6).prop_map(|(p, to, k)| Act::Push { p, to, k }),
             5 => any::<u16>().prop_map(|pick| Act::Deliver { pick }),
