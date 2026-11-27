@@ -379,22 +379,41 @@ fn files_keep_everything() {
 // ---- Many writers, a bad network ----
 
 #[derive(Clone, Debug)]
-enum Act {
-    Insert(usize, prop::sample::Index, String),
-    Delete(usize, prop::sample::Index, prop::sample::Index),
+enum Act<I = prop::sample::Index> {
+    Insert(usize, I, String),
+    Delete(usize, I, I),
     Move(
         usize,
-        prop::sample::Index,
-        prop::sample::Index,
-        prop::sample::Index,
+        I,
+        I,
+        I,
     ),
-    Mark(usize, prop::sample::Index, u8),
+    Mark(usize, I, u8),
     /// A replica says hello to another.
     Hello(usize, usize),
     /// A message in flight arrives (or arrives again, if `keep`).
-    Deliver(prop::sample::Index, bool),
+    Deliver(I, bool),
     /// A message in flight is lost.
-    Drop(prop::sample::Index),
+    Drop(I),
+}
+
+/// Picks one of `len` things: at random in a run, or as written in a
+/// pinned case.
+trait Pick {
+    fn pick(&self, len: usize) -> usize;
+}
+
+impl Pick for prop::sample::Index {
+    fn pick(&self, len: usize) -> usize {
+        self.index(len)
+    }
+}
+
+impl Pick for usize {
+    fn pick(&self, len: usize) -> usize {
+        assert!(*self < len, "a pinned case picks one of the {len}");
+        *self
+    }
 }
 
 fn acts() -> impl Strategy<Value = Vec<Act>> {
@@ -421,6 +440,145 @@ fn boundaries(s: &str) -> Vec<usize> {
     s.char_indices().map(|(i, _)| i).chain([s.len()]).collect()
 }
 
+/// Three replicas editing at once over a network that drops, duplicates
+/// and reorders: each editor's copy, kept only from the edits handed back,
+/// always reads as its text; and once everything's delivered, all three
+/// read the same.
+fn converge<I: Pick>(acts: Vec<Act<I>>) -> Result<(), TestCaseError> {
+    let mut rs: Vec<Replica> = ["a", "b", "c"].iter().map(|n| Replica::new(n)).collect();
+    // In flight: (to, message).
+    let mut wire: Vec<(usize, Vec<u8>)> = Vec::new();
+    for act in acts {
+        match act {
+            Act::Insert(r, p, t) => {
+                let at = {
+                    let bs = boundaries(&rs[r].editor);
+                    bs[p.pick(bs.len())]
+                };
+                let e = rs[r].text.insert(at, &t).unwrap();
+                rs[r].apply(e);
+            }
+            Act::Delete(r, a, b) => {
+                let bs = boundaries(&rs[r].editor);
+                let (a, b) = (bs[a.pick(bs.len())], bs[b.pick(bs.len())]);
+                let e = rs[r].text.delete(a.min(b)..a.max(b)).unwrap();
+                rs[r].apply(e);
+            }
+            Act::Move(r, a, b, t) => {
+                let bs = boundaries(&rs[r].editor);
+                let (a, b, t) = (bs[a.pick(bs.len())], bs[b.pick(bs.len())], bs[t.pick(bs.len())]);
+                let e = rs[r].text.move_text(a.min(b)..a.max(b), t).unwrap();
+                rs[r].apply(e);
+            }
+            Act::Mark(r, p, level) => {
+                let bs = boundaries(&rs[r].editor);
+                if bs.len() > 1 {
+                    let at = bs[p.pick(bs.len() - 1)];
+                    let (_, e) = rs[r].text.mark_section(at, level).unwrap();
+                    rs[r].apply(e);
+                }
+            }
+            Act::Hello(a, b) if a != b => wire.push((b, rs[a].text.hello())),
+            Act::Hello(..) => {}
+            Act::Deliver(i, keep) if !wire.is_empty() => {
+                let k = i.pick(wire.len());
+                let (to, m) = if keep { wire[k].clone() } else { wire.remove(k) };
+                // Who it's from isn't on the wire: answers go to everyone.
+                let got = rs[to].text.receive(&m).unwrap();
+                rs[to].apply(got.edits);
+                for reply in got.reply {
+                    for other in (0..3).filter(|&o| o != to) {
+                        wire.push((other, reply.clone()));
+                    }
+                }
+            }
+            Act::Drop(i) if !wire.is_empty() => {
+                let k = i.pick(wire.len());
+                wire.remove(k);
+            }
+            _ => {}
+        }
+    }
+    // The network heals.
+    for a in 0..3 {
+        for b in 0..3 {
+            if a != b {
+                let (x, y) = if a < b {
+                    let (l, r) = rs.split_at_mut(b);
+                    (&mut l[a], &mut r[0])
+                } else {
+                    let (l, r) = rs.split_at_mut(a);
+                    (&mut r[0], &mut l[b])
+                };
+                sync(x, y);
+            }
+        }
+    }
+    let texts: Vec<String> = rs.iter().map(|r| r.text.to_string()).collect();
+    prop_assert_eq!(&texts[0], &texts[1]);
+    prop_assert_eq!(&texts[1], &texts[2]);
+    let sections: Vec<Vec<(usize, u8)>> = rs
+        .iter()
+        // Headless sections (#19) are each replica's own: one that never
+        // showed a heading before it went keeps no place for it.
+        .map(|r| {
+            r.text
+                .sections()
+                .iter()
+                .filter(|s| s.start == mamre_egg_walker::Start::Heading)
+                .map(|s| (s.at, s.level))
+                .collect()
+        })
+        .collect();
+    prop_assert_eq!(&sections[0], &sections[1]);
+    prop_assert_eq!(&sections[1], &sections[2]);
+    Ok(())
+}
+
+/// Replicas that had seen the same edits read them differently (mamre#59):
+/// each merge laid records out in the order its window replayed events in,
+/// which isn't the same from one replica, or one merge, to the next. A
+/// network run, step by step as it went.
+#[test]
+fn replicas_read_the_same_whatever_order_they_merge_in() {
+    use Act::*;
+    let steps: Vec<Act<usize>> = vec![
+        Hello(0, 1),
+        Insert(1, 0, "a".into()),
+        Hello(2, 1),
+        Deliver(0, false),
+        Hello(0, 1),
+        Deliver(1, false),
+        Hello(0, 1),
+        Deliver(1, false),
+        Insert(1, 1, "aaa".into()),
+        Insert(0, 0, "a".into()),
+        Insert(1, 0, "a".into()),
+        Insert(0, 0, "aaa".into()),
+        Hello(2, 1),
+        Drop(0),
+        Insert(0, 5, "aaa".into()),
+        Move(0, 0, 0, 1),
+        Drop(0),
+        Insert(2, 0, "a\n".into()),
+        Deliver(1, false),
+        Insert(1, 3, "\n\nb".into()),
+        Deliver(0, false),
+        Deliver(2, true),
+        Insert(0, 4, "aa".into()),
+        Move(0, 4, 1, 7),
+        Deliver(1, false),
+        Hello(1, 2),
+        Deliver(3, true),
+        Deliver(4, true),
+        Insert(2, 1, "é\n".into()),
+        Drop(7),
+        Move(0, 1, 15, 18),
+        Insert(1, 1, "é\n".into()),
+    ];
+    converge(steps).unwrap();
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -430,90 +588,7 @@ proptest! {
     /// delivered, all three read the same.
     #[test]
     fn replicas_converge(acts in acts()) {
-        let mut rs: Vec<Replica> = ["a", "b", "c"].iter().map(|n| Replica::new(n)).collect();
-        // In flight: (to, message).
-        let mut wire: Vec<(usize, Vec<u8>)> = Vec::new();
-        for act in acts {
-            match act {
-                Act::Insert(r, p, t) => {
-                    let at = *p.get(&boundaries(&rs[r].editor));
-                    let e = rs[r].text.insert(at, &t).unwrap();
-                    rs[r].apply(e);
-                }
-                Act::Delete(r, a, b) => {
-                    let bs = boundaries(&rs[r].editor);
-                    let (a, b) = (*a.get(&bs), *b.get(&bs));
-                    let e = rs[r].text.delete(a.min(b)..a.max(b)).unwrap();
-                    rs[r].apply(e);
-                }
-                Act::Move(r, a, b, t) => {
-                    let bs = boundaries(&rs[r].editor);
-                    let (a, b, t) = (*a.get(&bs), *b.get(&bs), *t.get(&bs));
-                    let e = rs[r].text.move_text(a.min(b)..a.max(b), t).unwrap();
-                    rs[r].apply(e);
-                }
-                Act::Mark(r, p, level) => {
-                    let bs = boundaries(&rs[r].editor);
-                    if bs.len() > 1 {
-                        let at = *p.get(&bs[..bs.len() - 1]);
-                        let (_, e) = rs[r].text.mark_section(at, level).unwrap();
-                        rs[r].apply(e);
-                    }
-                }
-                Act::Hello(a, b) if a != b => wire.push((b, rs[a].text.hello())),
-                Act::Hello(..) => {}
-                Act::Deliver(i, keep) if !wire.is_empty() => {
-                    let k = i.index(wire.len());
-                    let (to, m) = if keep { wire[k].clone() } else { wire.remove(k) };
-                    // Who it's from isn't on the wire: answers go to everyone.
-                    let got = rs[to].text.receive(&m).unwrap();
-                    rs[to].apply(got.edits);
-                    for reply in got.reply {
-                        for other in (0..3).filter(|&o| o != to) {
-                            wire.push((other, reply.clone()));
-                        }
-                    }
-                }
-                Act::Drop(i) if !wire.is_empty() => {
-                    let k = i.index(wire.len());
-                    wire.remove(k);
-                }
-                _ => {}
-            }
-        }
-        // The network heals.
-        for a in 0..3 {
-            for b in 0..3 {
-                if a != b {
-                    let (x, y) = if a < b {
-                        let (l, r) = rs.split_at_mut(b);
-                        (&mut l[a], &mut r[0])
-                    } else {
-                        let (l, r) = rs.split_at_mut(a);
-                        (&mut r[0], &mut l[b])
-                    };
-                    sync(x, y);
-                }
-            }
-        }
-        let texts: Vec<String> = rs.iter().map(|r| r.text.to_string()).collect();
-        prop_assert_eq!(&texts[0], &texts[1]);
-        prop_assert_eq!(&texts[1], &texts[2]);
-        let sections: Vec<Vec<(usize, u8)>> = rs
-            .iter()
-            // Headless sections (#19) are each replica's own: one that never
-            // showed a heading before it went keeps no place for it.
-            .map(|r| {
-                r.text
-                    .sections()
-                    .iter()
-                    .filter(|s| s.start == mamre_egg_walker::Start::Heading)
-                    .map(|s| (s.at, s.level))
-                    .collect()
-            })
-            .collect();
-        prop_assert_eq!(&sections[0], &sections[1]);
-        prop_assert_eq!(&sections[1], &sections[2]);
+        converge(acts)?;
     }
 }
 
@@ -601,11 +676,12 @@ fn section_edits_keep_an_outline() {
     assert_eq!(want.len(), 2);
 }
 
-/// A move, and an insert made inside what it moves at the same time,
-/// panic the merge: "origins in a loop", in egg-walker's `copies.rs`.
-/// Found by the isolates' two-writer test; nothing here is an isolate.
+/// A move, and an insert made inside what it moves at the same time, used
+/// to panic the merge: "origins in a loop", in egg-walker's `copies.rs`,
+/// with no loop there (mamre#59: the check was a limit on the stack, not a
+/// loop found). Found by the isolates' two-writer test; nothing here is an
+/// isolate.
 #[test]
-#[ignore = "panics in egg-walker's moves: origins in a loop"]
 fn a_move_and_an_insert_at_once() {
     fn talk(a: &mut Text, b: &mut Text) {
         let mut to_b = vec![a.hello()];
