@@ -49,12 +49,14 @@ use mamre_rope::Measure;
 pub use mamre_rope::{Plain, Rope, Unit, Units};
 
 mod isolates;
+mod paragraphs;
 mod piece;
 mod units;
 
 mod reconcile;
 
 pub use isolates::{Direction, Isolate, IsolateId};
+pub use paragraphs::{Kind, Paragraph};
 use piece::Piece;
 
 /// One writer's replica of a document: the text, its history, and the
@@ -162,6 +164,9 @@ pub enum TextError {
     NoSuchIsolate(IsolateId),
     /// The range takes part of an isolate and not the rest.
     CrossesIsolate,
+    /// The paragraph at `at` has no line break before it to carry a kind:
+    /// it's the text before the first one.
+    NoBreak { at: usize },
 }
 
 /// Why a message couldn't be read: damaged, or not one of ours. Nothing
@@ -191,6 +196,9 @@ impl fmt::Display for TextError {
             TextError::NoSuchSection(id) => write!(f, "no section {}", id.0),
             TextError::NoSuchIsolate(id) => write!(f, "no isolate {:x} there", id.0),
             TextError::CrossesIsolate => write!(f, "the range takes part of an isolate"),
+            TextError::NoBreak { at } => {
+                write!(f, "the paragraph at byte {at} has no line break before it")
+            }
         }
     }
 }
