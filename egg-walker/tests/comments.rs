@@ -132,12 +132,7 @@ fn comments_round_trip_in_chunks() {
     let mut bytes = Vec::new();
     log.encode_chunk(0..log.len(), &mut bytes);
     let text = String::from_utf8_lossy(&bytes);
-    for want in [
-        r#"{"comment_add":{"start":"#,
-        r#""item":"h"}}"#,
-        r#""state":"resolved"}}"#,
-        r#"{"body_delete":"#,
-    ] {
+    for want in [r#"{"comment_add":{"start":"#, r#""item":"h"}}"#, r#""state":"resolved"}}"#, r#"{"body_delete":"#] {
         assert!(text.contains(want), "{want} in {text}");
     }
     let mut back = OpLog::<char>::new();
@@ -147,11 +142,7 @@ fn comments_round_trip_in_chunks() {
     }
     assert_eq!(back.comment_body(c, log.version()), "h");
     // A body edit naming something that isn't a comment is refused.
-    let bad = String::from_utf8_lossy(&bytes).replacen(
-        r#"{"body_insert":{"comment":{"agent":"w","seq":11}"#,
-        r#"{"body_insert":{"comment":{"agent":"w","seq":10}"#,
-        1,
-    );
+    let bad = String::from_utf8_lossy(&bytes).replacen(r#"{"body_insert":{"comment":{"agent":"w","seq":11}"#, r#"{"body_insert":{"comment":{"agent":"w","seq":10}"#, 1);
     assert_ne!(bad.as_bytes(), &bytes[..], "the test changed something");
     assert!(OpLog::<char>::new().decode_chunk(bad.as_bytes()).is_err());
 }
@@ -377,11 +368,5 @@ fn ends_live(log: &OpLog<char>, c: Lv, ids: &BTreeSet<Lv>) -> bool {
 /// agents in the order the chunk names them.
 fn event(log: &OpLog<char>, lv: Lv) -> String {
     let e = log.event(lv);
-    format!(
-        "{} {} {:?} {:?}",
-        log.agent_name(e.agent),
-        e.seq,
-        e.parents,
-        e.op
-    )
+    format!("{} {} {:?} {:?}", log.agent_name(e.agent), e.seq, e.parents, e.op)
 }

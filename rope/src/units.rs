@@ -218,11 +218,7 @@ impl Unit {
         for (i, c) in text.char_indices() {
             let (next, start, end) = step(state, c);
             if end {
-                ends.push(if self.holds(state) {
-                    held.unwrap_or(i)
-                } else {
-                    i
-                });
+                ends.push(if self.holds(state) { held.unwrap_or(i) } else { i });
             }
             if start {
                 starts.push(i);
@@ -428,20 +424,13 @@ mod mamre_word {
     /// stop or an ayin is often typed), a hyphen (plain or non-breaking),
     /// or an underscore.
     fn joiner(c: char) -> bool {
-        matches!(
-            c,
-            '\'' | '\u{2018}' | '\u{2019}' | '-' | '\u{2010}' | '\u{2011}' | '_'
-        )
+        matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '-' | '\u{2010}' | '\u{2011}' | '_')
     }
 
     pub fn step(state: u8, c: char) -> (u8, bool, bool) {
         if rides(c) {
             // On its own it's a word of one mark, as a letter would be.
-            return if state == GAP {
-                (LETTER, true, false)
-            } else {
-                (state, false, false)
-            };
+            return if state == GAP { (LETTER, true, false) } else { (state, false, false) };
         }
         if let Some(to) = word(c) {
             return match state {
@@ -700,14 +689,7 @@ mod tests {
         // An apostrophe or a hyphen between word characters is the word's.
         assert_eq!(
             words("don't she'ol Qur\u{2019}an Ka\u{2018}ba dub-sar mu-un-du3"),
-            [
-                "don't",
-                "she'ol",
-                "Qur\u{2019}an",
-                "Ka\u{2018}ba",
-                "dub-sar",
-                "mu-un-du3"
-            ]
+            ["don't", "she'ol", "Qur\u{2019}an", "Ka\u{2018}ba", "dub-sar", "mu-un-du3"]
         );
         assert_eq!(words("rock'n'roll"), ["rock'n'roll"]);
         // At a word's edge it isn't: a quote mark, a dash.
@@ -715,10 +697,7 @@ mod tests {
         assert_eq!(words("'tis the dogs' bowl"), ["tis", "the", "dogs", "bowl"]);
         assert_eq!(words("-a- b - c"), ["a", "b", "c"]);
         // Two in a row join nothing, and neither does a dash.
-        assert_eq!(
-            words("a--b c\u{2014}d e'-f"),
-            ["a", "b", "c", "d", "e", "f"]
-        );
+        assert_eq!(words("a--b c\u{2014}d e'-f"), ["a", "b", "c", "d", "e", "f"]);
         // A mark on the joiner doesn't hide it.
         assert_eq!(words("a'\u{301} b"), ["a", "b"]);
         // Left hanging at the end of the text.
@@ -735,15 +714,9 @@ mod tests {
     #[test]
     fn mamre_words_join_numbers() {
         let words = |text| pieces(Unit::MamreWord, text);
-        assert_eq!(
-            words("3.14 1,000,000.5 v1.2"),
-            ["3.14", "1,000,000.5", "v1.2"]
-        );
+        assert_eq!(words("3.14 1,000,000.5 v1.2"), ["3.14", "1,000,000.5", "v1.2"]);
         // Only between digits.
-        assert_eq!(
-            words("3. 4, 5.x a.b a,b 1..2"),
-            ["3", "4", "5", "x", "a", "b", "a", "b", "1", "2"]
-        );
+        assert_eq!(words("3. 4, 5.x a.b a,b 1..2"), ["3", "4", "5", "x", "a", "b", "a", "b", "1", "2"]);
         assert_eq!(Unit::MamreWord.ranges("pi is 3.14."), [0..2, 3..5, 6..10]);
         assert_eq!(words("12-15 1'000"), ["12-15", "1'000"]);
     }
@@ -758,10 +731,7 @@ mod tests {
         );
         // Gershayim, typed either way, between Hebrew letters only.
         assert_eq!(words("צה\u{5f4}ל צה\"ל"), ["צה\u{5f4}ל", "צה\"ל"]);
-        assert_eq!(
-            words("\"שלום\" ל\u{5f4} a\"b ל\"b"),
-            ["שלום", "ל", "a", "b", "ל", "b"]
-        );
+        assert_eq!(words("\"שלום\" ל\u{5f4} a\"b ל\"b"), ["שלום", "ל", "a", "b", "ל", "b"]);
         // Through the points on the letter before.
         assert_eq!(words("צָהַ\"ל"), ["צָהַ\"ל"]);
     }

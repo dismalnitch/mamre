@@ -34,11 +34,7 @@ impl Replica {
                 Edit::Section { .. } | Edit::Isolates | Edit::Lost { .. } => {}
             }
         }
-        assert_eq!(
-            self.editor,
-            self.text.to_string(),
-            "the edits are the text's"
-        );
+        assert_eq!(self.editor, self.text.to_string(), "the edits are the text's");
     }
 
     fn type_(&mut self, at: usize, text: &str) {
@@ -194,11 +190,7 @@ fn a_caret_in_moved_text_goes_with_it() {
     assert_eq!(a.editor, "one threetwo ");
     assert_eq!(a.text.position(&mine), Some(10));
     sync(&mut a, &mut b);
-    assert_eq!(
-        b.text.position(&theirs),
-        Some(10),
-        "on the other replica too"
-    );
+    assert_eq!(b.text.position(&theirs), Some(10), "on the other replica too");
 }
 
 #[test]
@@ -295,10 +287,7 @@ fn a_moved_section_keeps_its_id_and_its_kind() {
         assert_eq!(r.text.section_range(later), Some(0..12));
         assert_eq!(r.text.section_range(intro), Some(12..23));
         assert_eq!(r.text.kind_at(r.editor.find("more").unwrap()), Kind::Quote);
-        assert_eq!(
-            r.text.kind_at(r.editor.find("Later").unwrap()),
-            Kind::Heading(1)
-        );
+        assert_eq!(r.text.kind_at(r.editor.find("Later").unwrap()), Kind::Heading(1));
         let ids: Vec<_> = r.text.sections().iter().map(|s| s.id).collect();
         assert!(ids.contains(&later) && ids.contains(&intro) && ids.contains(&quote));
     }

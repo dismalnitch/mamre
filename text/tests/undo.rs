@@ -36,11 +36,7 @@ impl Replica {
                 Edit::Section { .. } | Edit::Isolates | Edit::Lost { .. } => {}
             }
         }
-        assert_eq!(
-            self.editor,
-            self.text.to_string(),
-            "the edits are the text's"
-        );
+        assert_eq!(self.editor, self.text.to_string(), "the edits are the text's");
     }
 
     fn type_(&mut self, at: usize, text: &str) {
@@ -181,10 +177,7 @@ fn an_isolate_is_undone() {
     a.type_(0, "say שלום now");
     let start = "say ".len();
     let end = start + "שלום".len();
-    let (_, e) = a
-        .text
-        .mark_isolate(start..end, Direction::RightToLeft)
-        .unwrap();
+    let (_, e) = a.text.mark_isolate(start..end, Direction::RightToLeft).unwrap();
     a.apply(e);
     assert_eq!(a.text.isolates().len(), 1);
     assert!(a.undo());

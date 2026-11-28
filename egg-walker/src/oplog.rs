@@ -368,20 +368,11 @@ impl<T: Clone> OpLog<T> {
     ///
     /// The sources can be any earlier inserts, deleted ones too: text
     /// copied from an older version.
-    pub fn add_paste(
-        &mut self,
-        agent: AgentId,
-        parents: &[Lv],
-        pos: usize,
-        sources: &[Lv],
-    ) -> Vec<Lv> {
+    pub fn add_paste(&mut self, agent: AgentId, parents: &[Lv], pos: usize, sources: &[Lv]) -> Vec<Lv> {
         let items: Vec<T> = sources
             .iter()
             .map(|&s| {
-                assert!(
-                    s < self.len() && self.is_insert(s),
-                    "a paste's source {s} isn't an insert"
-                );
+                assert!(s < self.len() && self.is_insert(s), "a paste's source {s} isn't an insert");
                 self.item(s)
             })
             .collect();
@@ -818,9 +809,7 @@ impl<T: Clone> OpLog<T> {
             };
             let new = self.push(agent, event.seq, parents, op);
             if let Some(s) = other.source(lv) {
-                let s = self
-                    .local(other, s)
-                    .expect("a paste's source arrives before it");
+                let s = self.local(other, s).expect("a paste's source arrives before it");
                 self.note_source(new, s);
             }
             added += 1;

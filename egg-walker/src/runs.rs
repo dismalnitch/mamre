@@ -1361,11 +1361,7 @@ impl<'a, T: Clone> Replay<'a, T> {
                         // A loop: see `copies.rs`.
                         let waiting = |k: Key| -> Vec<Key> {
                             let (l, r) = origins(k);
-                            [l, r]
-                                .into_iter()
-                                .flatten()
-                                .filter(|&o| !list.has(o))
-                                .collect()
+                            [l, r].into_iter().flatten().filter(|&o| !list.has(o)).collect()
                         };
                         let copier = |k: Key| (k >= self.copy_base).then(|| self.copier(k));
                         match origins_loop(k, waiting, copier, |m| act.on[m]) {

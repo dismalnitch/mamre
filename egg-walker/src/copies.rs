@@ -825,11 +825,7 @@ impl<'a, T: Clone> Replay<'a, T> {
                     if waiting.iter().any(|o| pending.contains(o)) {
                         let waiting = |k: Key| -> Vec<Key> {
                             let (l, r) = origins(k);
-                            [l, r]
-                                .into_iter()
-                                .flatten()
-                                .filter(|o| !index.contains_key(o))
-                                .collect()
+                            [l, r].into_iter().flatten().filter(|o| !index.contains_key(o)).collect()
                         };
                         let copier = |k: Key| {
                             (k >= self.copy_base).then(|| self.copies[k - self.copy_base].0)

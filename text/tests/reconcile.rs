@@ -91,11 +91,7 @@ fn a_whole_file_replaced_keeps_nothing() {
     assert_eq!(t.to_string(), "something\nelse entirely\n");
     // No heading is kept. Its section stays, headless, at its place (#19).
     let left: Vec<_> = t.sections().into_iter().filter(|s| s.id == sec).collect();
-    assert!(
-        left.iter()
-            .all(|s| s.start != mamre_egg_walker::Start::Heading),
-        "{left:?}"
-    );
+    assert!(left.iter().all(|s| s.start != mamre_egg_walker::Start::Heading), "{left:?}");
 }
 
 #[test]

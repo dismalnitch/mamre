@@ -265,10 +265,7 @@ fn moves_into_each_other_beside_a_third_drop_one() {
     assert_eq!(text_at(&log, &all), "CC.BBAAAA.BB.");
     let ac = merged(&log, &a_into_b, &c_to_front);
     let bc = merged(&log, &b_into_a, &c_to_front);
-    merges_agree(
-        &log,
-        &[base, a_into_b, b_into_a, c_to_front, ab, ac, bc, all],
-    );
+    merges_agree(&log, &[base, a_into_b, b_into_a, c_to_front, ab, ac, bc, all]);
 }
 
 /// An event of a history written out by hand: who, its parents (by index
@@ -334,9 +331,7 @@ fn reads_the_same_renumbered(events: Written) {
     let (one, _) = written(events, &(0..events.len()).collect::<Vec<_>>());
     let (two, _) = written(events, &renumbered(events));
     let text = |log: &OpLog<char>| -> String {
-        reference::checkout(log, log.version())
-            .into_iter()
-            .collect()
+        reference::checkout(log, log.version()).into_iter().collect()
     };
     assert_eq!(text(&one), text(&two), "the reference");
     assert_eq!(
@@ -347,85 +342,85 @@ fn reads_the_same_renumbered(events: Written) {
 }
 
 const NETWORK_LOOP: Written = &[
-    ("a", &[], Ins(0, 'b')),
-    ("a", &[0], Ins(1, 'a')),
-    ("a", &[1], Ins(2, '🦀')),
-    ("b", &[], Ins(0, 'é')),
-    ("b", &[3], Ins(1, '🦀')),
-    ("b", &[4], Ins(2, 'é')),
-    ("b", &[5], Ins(3, '\n')),
-    ("b", &[6], Del(2)),
-    ("b", &[7], Del(2)),
-    ("c", &[], Ins(0, 'é')),
-    ("c", &[9], Ins(1, '\n')),
-    ("c", &[10], Ins(2, '🦀')),
-    ("c", &[11], Ins(0, 'é')),
-    ("c", &[12], Mov(0, 1, 3)),
-    ("a", &[2, 8, 13], Mov(2, 6, 0)),
-    ("a", &[14], Ins(7, '\n')),
-    ("a", &[15], Ins(8, 'é')),
-    ("a", &[16], Ins(9, '🦀')),
-    ("a", &[17], Del(2)),
-    ("a", &[18], Del(5)),
-    ("a", &[19], Del(5)),
-    ("a", &[20], Ins(9, ' ')),
-    ("a", &[21], Ins(6, '🦀')),
-    ("a", &[22], Ins(7, '🦀')),
-    ("a", &[23], Mov(1, 4, 11)),
-    ("c", &[13], Ins(0, 'b')),
-    ("c", &[25], Ins(1, 'a')),
-    ("c", &[26], Ins(1, '\n')),
-    ("c", &[27, 8, 2], Ins(8, 'b')),
-    ("c", &[28], Ins(9, ' ')),
-    ("c", &[29], Mrk(11, 0)),
-    ("c", &[30], Ins(0, 'é')),
-    ("c", &[31], Ins(1, 'a')),
-    ("c", &[32], Ins(2, 'b')),
-    ("c", &[33], Ins(15, ' ')),
-    ("c", &[34], Ins(16, ' ')),
-    ("c", &[35], Ins(17, '\n')),
-    ("c", &[36, 21], Mrk(4, 0)),
-    ("c", &[37], Ins(14, 'a')),
-    ("c", &[38], Ins(15, 'é')),
-    ("c", &[39], Ins(16, 'b')),
-    ("c", &[40], Mov(15, 9, 6)),
+        ("a", &[], Ins(0, 'b')),
+        ("a", &[0], Ins(1, 'a')),
+        ("a", &[1], Ins(2, '🦀')),
+        ("b", &[], Ins(0, 'é')),
+        ("b", &[3], Ins(1, '🦀')),
+        ("b", &[4], Ins(2, 'é')),
+        ("b", &[5], Ins(3, '\n')),
+        ("b", &[6], Del(2)),
+        ("b", &[7], Del(2)),
+        ("c", &[], Ins(0, 'é')),
+        ("c", &[9], Ins(1, '\n')),
+        ("c", &[10], Ins(2, '🦀')),
+        ("c", &[11], Ins(0, 'é')),
+        ("c", &[12], Mov(0, 1, 3)),
+        ("a", &[2, 8, 13], Mov(2, 6, 0)),
+        ("a", &[14], Ins(7, '\n')),
+        ("a", &[15], Ins(8, 'é')),
+        ("a", &[16], Ins(9, '🦀')),
+        ("a", &[17], Del(2)),
+        ("a", &[18], Del(5)),
+        ("a", &[19], Del(5)),
+        ("a", &[20], Ins(9, ' ')),
+        ("a", &[21], Ins(6, '🦀')),
+        ("a", &[22], Ins(7, '🦀')),
+        ("a", &[23], Mov(1, 4, 11)),
+        ("c", &[13], Ins(0, 'b')),
+        ("c", &[25], Ins(1, 'a')),
+        ("c", &[26], Ins(1, '\n')),
+        ("c", &[27, 8, 2], Ins(8, 'b')),
+        ("c", &[28], Ins(9, ' ')),
+        ("c", &[29], Mrk(11, 0)),
+        ("c", &[30], Ins(0, 'é')),
+        ("c", &[31], Ins(1, 'a')),
+        ("c", &[32], Ins(2, 'b')),
+        ("c", &[33], Ins(15, ' ')),
+        ("c", &[34], Ins(16, ' ')),
+        ("c", &[35], Ins(17, '\n')),
+        ("c", &[36, 21], Mrk(4, 0)),
+        ("c", &[37], Ins(14, 'a')),
+        ("c", &[38], Ins(15, 'é')),
+        ("c", &[39], Ins(16, 'b')),
+        ("c", &[40], Mov(15, 9, 6)),
 ];
 
 const LAID_OUT: Written = &[
-    ("c", &[], Ins(0, 'e')),
-    ("c", &[0], Ins(1, 'f')),
-    ("c", &[1], Ins(1, 'a')),
-    ("b", &[], Ins(0, 'b')),
-    ("b", &[3], Ins(0, 'b')),
-    ("c", &[2], Ins(3, 'e')),
-    ("c", &[5], Mov(1, 2, 0)),
-    ("a", &[1], Ins(1, 'e')),
-    ("b", &[4, 6], Ins(3, 'b')),
-    ("b", &[8], Ins(4, 'b')),
-    ("b", &[9], Ins(5, 'a')),
-    ("b", &[10], Ins(6, 'f')),
-    ("a", &[7], Ins(2, 'f')),
-    ("c", &[6], Ins(4, 'a')),
-    ("c", &[13], Ins(5, 'f')),
-    ("a", &[6, 12], Ins(6, 'o')),
-    ("b", &[7, 11], Del(7)),
-    ("c", &[7, 14], Mov(5, 2, 4)),
-    ("b", &[16], Ins(5, 'u')),
-    ("b", &[18], Del(1)),
-    ("a", &[15, 19], Ins(2, 'w')),
-    ("c", &[17], Ins(4, 'b')),
-    ("a", &[20], Mrk(4, 0)),
-    ("a", &[22], Ins(10, 'u')),
-    ("a", &[23], Ins(2, 'g')),
-    ("a", &[24], Del(3)),
-    ("a", &[25], Del(9)),
-    ("a", &[26], Ins(10, 'y')),
-    ("a", &[27], Ins(0, 'e')),
-    ("a", &[28], Ins(1, 'u')),
-    ("a", &[29], Ins(2, 'y')),
-    ("a", &[30], Ins(3, 'f')),
-    ("a", &[31], Ins(4, 'e')),
-    ("a", &[32], Mov(6, 12, 19)),
+        ("c", &[], Ins(0, 'e')),
+        ("c", &[0], Ins(1, 'f')),
+        ("c", &[1], Ins(1, 'a')),
+        ("b", &[], Ins(0, 'b')),
+        ("b", &[3], Ins(0, 'b')),
+        ("c", &[2], Ins(3, 'e')),
+        ("c", &[5], Mov(1, 2, 0)),
+        ("a", &[1], Ins(1, 'e')),
+        ("b", &[4, 6], Ins(3, 'b')),
+        ("b", &[8], Ins(4, 'b')),
+        ("b", &[9], Ins(5, 'a')),
+        ("b", &[10], Ins(6, 'f')),
+        ("a", &[7], Ins(2, 'f')),
+        ("c", &[6], Ins(4, 'a')),
+        ("c", &[13], Ins(5, 'f')),
+        ("a", &[6, 12], Ins(6, 'o')),
+        ("b", &[7, 11], Del(7)),
+        ("c", &[7, 14], Mov(5, 2, 4)),
+        ("b", &[16], Ins(5, 'u')),
+        ("b", &[18], Del(1)),
+        ("a", &[15, 19], Ins(2, 'w')),
+        ("c", &[17], Ins(4, 'b')),
+        ("a", &[20], Mrk(4, 0)),
+        ("a", &[22], Ins(10, 'u')),
+        ("a", &[23], Ins(2, 'g')),
+        ("a", &[24], Del(3)),
+        ("a", &[25], Del(9)),
+        ("a", &[26], Ins(10, 'y')),
+        ("a", &[27], Ins(0, 'e')),
+        ("a", &[28], Ins(1, 'u')),
+        ("a", &[29], Ins(2, 'y')),
+        ("a", &[30], Ins(3, 'f')),
+        ("a", &[31], Ins(4, 'e')),
+        ("a", &[32], Mov(6, 12, 19)),
 ];
 
 /// A loop by way of typing, from a network run of text's
@@ -601,8 +596,7 @@ fn history(actions: Vec<Action>) -> (OpLog<char>, Vec<Vec<Lv>>) {
                     Edit::Mark(p, level) if len > 0 => log.add_mark(agent, &v, p.index(len), level),
                     Edit::Paste(a, b, t) if len > 0 => {
                         let (a, b) = (a.index(len), b.index(len));
-                        let sources =
-                            reference::identities(&log, &v)[a.min(b)..a.max(b) + 1].to_vec();
+                        let sources = reference::identities(&log, &v)[a.min(b)..a.max(b) + 1].to_vec();
                         log.add_paste(agent, &v, t.index(len + 1), &sources)
                     }
                     _ => continue,

@@ -463,8 +463,7 @@ mod outline_tests {
         // The ghost goes beside the books, as JSON.
         let side = serde_json::to_string(&books.side()).unwrap();
         assert_eq!(side, r#"{"ghosts":[{"item":4,"place":4}]}"#);
-        back.apply_side(&serde_json::from_str(&side).unwrap())
-            .unwrap();
+        back.apply_side(&serde_json::from_str(&side).unwrap()).unwrap();
         assert_eq!(back.sections(), books.sections());
         assert_eq!(back.level(4), 1, "a deleted item keeps its mark");
         // And its section, headless, at its place (#19).

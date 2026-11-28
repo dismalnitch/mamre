@@ -305,16 +305,8 @@ fn step_ends_round_trip_in_chunks() {
         out.extend(json.bytes());
         out
     };
-    assert!(
-        OpLog::<char>::new()
-            .decode_chunk(&with(r#"{"steps":{"p":[5]}}"#))
-            .is_err()
-    );
-    assert!(
-        OpLog::<char>::new()
-            .decode_chunk(&with(r#"{"steps":{"q":[0]}}"#))
-            .is_err()
-    );
+    assert!(OpLog::<char>::new().decode_chunk(&with(r#"{"steps":{"p":[5]}}"#)).is_err());
+    assert!(OpLog::<char>::new().decode_chunk(&with(r#"{"steps":{"q":[0]}}"#)).is_err());
     let good = with(r#"{"steps":{"p":[0]}}"#);
     let mut back = OpLog::<char>::new();
     assert_eq!(back.decode_chunk(&good), Ok(1));

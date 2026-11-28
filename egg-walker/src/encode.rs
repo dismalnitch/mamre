@@ -121,32 +121,13 @@ enum Ref {
 }
 
 enum RawOp<T> {
-    Insert {
-        pos: usize,
-        items: Vec<T>,
-    },
-    Delete {
-        pos: usize,
-        len: usize,
-    },
-    Undo {
-        targets: Vec<Ref>,
-    },
-    Move {
-        pos: usize,
-        len: usize,
-        to: usize,
-    },
-    Mark {
-        pos: usize,
-        level: u8,
-    },
+    Insert { pos: usize, items: Vec<T> },
+    Delete { pos: usize, len: usize },
+    Undo { targets: Vec<Ref> },
+    Move { pos: usize, len: usize, to: usize },
+    Mark { pos: usize, level: u8 },
     /// Sources as (the first, how many of its agent's from there).
-    Copy {
-        pos: usize,
-        len: usize,
-        sources: Vec<(Ref, usize)>,
-    },
+    Copy { pos: usize, len: usize, sources: Vec<(Ref, usize)> },
     Aside(AsideJson),
 }
 
@@ -299,24 +280,15 @@ impl<T: Clone + Codec> OpLog<T> {
             let first = run.seq + (range.start - run.start) as u64;
             let last = first + range.len() as u64 - 1;
             let ends = &self.step_ends[run.agent.index()];
-            let found: Vec<u64> = ends
-                .range(first.saturating_sub(1)..=last)
-                .copied()
-                .collect();
+            let found: Vec<u64> = ends.range(first.saturating_sub(1)..=last).copied().collect();
             if !found.is_empty() {
                 steps
-                    .entry(
-                        self.agent_name(agents.agents[agents.index[&run.agent]])
-                            .to_string(),
-                    )
+                    .entry(self.agent_name(agents.agents[agents.index[&run.agent]]).to_string())
                     .or_default()
                     .extend(found);
             }
         }
-        steps
-            .into_iter()
-            .map(|(name, ends)| (name, ends.into_iter().collect()))
-            .collect()
+        steps.into_iter().map(|(name, ends)| (name, ends.into_iter().collect())).collect()
     }
 
     /// The stretches of runs in `spans`, in order.
@@ -650,10 +622,7 @@ impl<T: Clone + Codec> Writer<'_, T> {
                     {
                         last.len += 1;
                     } else {
-                        from.push(ext::NamedRun {
-                            start: named,
-                            len: 1,
-                        });
+                        from.push(ext::NamedRun { start: named, len: 1 });
                     }
                 }
                 AsideJson::CameFrom {
@@ -690,10 +659,7 @@ enum PlannedOp<T> {
     Run(RunOp<T>),
     Undos(Vec<Op<T>>),
     /// A paste: inserts at `pos`, each copying its source.
-    Copy {
-        pos: usize,
-        sources: Vec<Lv>,
-    },
+    Copy { pos: usize, sources: Vec<Lv> },
 }
 
 /// A run of a chunk with the events this log has already left out: the
@@ -773,8 +739,7 @@ impl<'a, T: Clone> Planner<'a, T> {
             .checked_add(len as u64)
             .ok_or(DecodeError::Overflow)?;
         let first = self.lvs.len();
-        self.ids
-            .extend((0..len as u64).map(|k| (run.agent, run.seq + k)));
+        self.ids.extend((0..len as u64).map(|k| (run.agent, run.seq + k)));
         let known = self.known(&run);
         if known == len {
             return Ok(None);
@@ -798,8 +763,7 @@ impl<'a, T: Clone> Planner<'a, T> {
         self.next += n;
         self.planned[run.agent].push((seq, start, n));
         self.new_parents.push(parents.clone());
-        self.new_parents
-            .extend((start..start + n - 1).map(|p| vec![p]));
+        self.new_parents.extend((start..start + n - 1).map(|p| vec![p]));
         let op = self.plan_op(run.op, known, n, first)?;
         // An undo names something its event saw (mamre#9): a peer could
         // send one that doesn't, and the walk would take it back where it
@@ -810,9 +774,7 @@ impl<'a, T: Clone> Planner<'a, T> {
                     unreachable!("an undo's op")
                 };
                 if !self.saw(&self.new_parents[start + k - self.log.len()], target) {
-                    return Err(DecodeError::Invalid(
-                        "an undo of something its event didn't see",
-                    ));
+                    return Err(DecodeError::Invalid("an undo of something its event didn't see"));
                 }
             }
         }
@@ -1022,11 +984,7 @@ impl<'a, T: Clone> Planner<'a, T> {
     fn aside(&self, json: AsideJson, lv: Lv) -> Result<Aside, DecodeError> {
         let earlier = |named: &Named, ok: &dyn Fn(Lv) -> bool, what| {
             let at = self.named(named)?;
-            if at < lv && ok(at) {
-                Ok(at)
-            } else {
-                Err(DecodeError::Invalid(what))
-            }
+            if at < lv && ok(at) { Ok(at) } else { Err(DecodeError::Invalid(what)) }
         };
         let insert = |at: Lv| self.kind(at) == Some(Kind::Insert);
         let range = |at: Lv| {
@@ -1038,10 +996,7 @@ impl<'a, T: Clone> Planner<'a, T> {
         };
         let comment = |at: Lv| {
             if at < self.log.len() {
-                matches!(
-                    self.log.run_of(at).op,
-                    RunOp::Aside(Aside::CommentAdd { .. })
-                )
+                matches!(self.log.run_of(at).op, RunOp::Aside(Aside::CommentAdd { .. }))
             } else {
                 self.new_comments.contains(&at)
             }
@@ -1049,11 +1004,7 @@ impl<'a, T: Clone> Planner<'a, T> {
         let not_comment = "an event about a comment that isn't an earlier comment";
         Ok(match json {
             AsideJson::RangeAdd { start, end, tag } => Aside::RangeAdd {
-                start: earlier(
-                    &start,
-                    &insert,
-                    "a range's end that isn't an earlier insert",
-                )?,
+                start: earlier(&start, &insert, "a range's end that isn't an earlier insert")?,
                 end: earlier(&end, &insert, "a range's end that isn't an earlier insert")?,
                 tag,
             },
@@ -1062,26 +1013,14 @@ impl<'a, T: Clone> Planner<'a, T> {
                 tag,
             },
             AsideJson::CommentAdd { start, end } => Aside::CommentAdd {
-                start: earlier(
-                    &start,
-                    &insert,
-                    "a comment's end that isn't an earlier insert",
-                )?,
-                end: earlier(
-                    &end,
-                    &insert,
-                    "a comment's end that isn't an earlier insert",
-                )?,
+                start: earlier(&start, &insert, "a comment's end that isn't an earlier insert")?,
+                end: earlier(&end, &insert, "a comment's end that isn't an earlier insert")?,
             },
             AsideJson::CommentSet { comment: c, state } => Aside::CommentSet {
                 comment: earlier(&c, &comment, not_comment)?,
                 state,
             },
-            AsideJson::BodyInsert {
-                comment: c,
-                pos,
-                item,
-            } => Aside::BodyInsert {
+            AsideJson::BodyInsert { comment: c, pos, item } => Aside::BodyInsert {
                 comment: earlier(&c, &comment, not_comment)?,
                 pos,
                 item,
@@ -1091,8 +1030,7 @@ impl<'a, T: Clone> Planner<'a, T> {
                 pos,
             },
             AsideJson::CameFrom { first, len, from } => {
-                const NOT_INSERT: &str =
-                    "a came-from naming something that isn't an earlier insert";
+                const NOT_INSERT: &str = "a came-from naming something that isn't an earlier insert";
                 // Event `k` after `named`, by the same agent.
                 let nth = |named: &Named, k: usize| Named {
                     agent: named.agent.clone(),
@@ -1174,15 +1112,9 @@ pub(crate) fn dump_chunk<T: Codec + serde::Serialize>(
             };
             Ok(json!({"agent": name(agent)?, "seq": seq}))
         };
-        let parents = run
-            .parents
-            .iter()
-            .map(spell)
-            .collect::<Result<Vec<_>, _>>()?;
+        let parents = run.parents.iter().map(spell).collect::<Result<Vec<_>, _>>()?;
         let op = match &run.op {
-            RawOp::Insert { pos, items } => {
-                json!({"insert": {"pos": pos, "items": items_json(items)}})
-            }
+            RawOp::Insert { pos, items } => json!({"insert": {"pos": pos, "items": items_json(items)}}),
             RawOp::Delete { pos, len } => json!({"delete": {"pos": pos, "count": len}}),
             RawOp::Undo { targets } => json!({"undo": {
                 "targets": targets.iter().map(spell).collect::<Result<Vec<_>, _>>()?
@@ -1235,9 +1167,7 @@ fn get_steps(side: &ChunkExt, names: &[String]) -> Result<Vec<(usize, Vec<u64>)>
             let agent = names
                 .iter()
                 .position(|n| n == name)
-                .ok_or(DecodeError::Invalid(
-                    "step ends for an agent the chunk doesn't name",
-                ))?;
+                .ok_or(DecodeError::Invalid("step ends for an agent the chunk doesn't name"))?;
             if !ends.windows(2).all(|w| w[0] < w[1]) {
                 return Err(DecodeError::Invalid("step ends out of order"));
             }

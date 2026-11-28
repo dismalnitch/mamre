@@ -192,10 +192,7 @@ fn ranges_round_trip_in_chunks() {
     assert!(text.contains(r#"{"range_set":{"range":{"agent":"alice","seq":3},"tag":null}}"#));
     let same = |back: &OpLog<char>| {
         for lv in 0..log.len() {
-            assert_eq!(
-                format!("{:?}", back.event(lv)),
-                format!("{:?}", log.event(lv))
-            );
+            assert_eq!(format!("{:?}", back.event(lv)), format!("{:?}", log.event(lv)));
         }
     };
     let mut back = OpLog::<char>::new();
@@ -228,21 +225,9 @@ fn a_range_naming_what_it_cant_is_refused() {
     };
     for (from, to, why) in [
         (r#""seq":1}"#, r#""seq":7}"#, "an end this log doesn't have"),
-        (
-            r#""seq":1}"#,
-            r#""seq":2}"#,
-            "an end that's the range itself",
-        ),
-        (
-            r#""agent":"a","seq":0"#,
-            r#""agent":"z","seq":0"#,
-            "an agent nobody has",
-        ),
-        (
-            "range_add",
-            "range_zzz",
-            "an aside this version doesn't know",
-        ),
+        (r#""seq":1}"#, r#""seq":2}"#, "an end that's the range itself"),
+        (r#""agent":"a","seq":0"#, r#""agent":"z","seq":0"#, "an agent nobody has"),
+        ("range_add", "range_zzz", "an aside this version doesn't know"),
     ] {
         let mut back = OpLog::<char>::new();
         assert!(back.decode_chunk(&swap(from, to)).is_err(), "{why}");

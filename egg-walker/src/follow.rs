@@ -99,13 +99,7 @@ impl Moves {
         // Its copies, theirs, and so on: newly watched, placed in one pass
         // (text that was never moved has none, and costs nothing).
         let mut new = BTreeSet::new();
-        let mut todo: Vec<Lv> = self
-            .copies
-            .get(&item)
-            .into_iter()
-            .flatten()
-            .copied()
-            .collect();
+        let mut todo: Vec<Lv> = self.copies.get(&item).into_iter().flatten().copied().collect();
         while let Some(x) = todo.pop() {
             let n = self.reasons.entry(x).or_insert(0);
             *n += 1;
@@ -184,13 +178,7 @@ impl Moves {
             return Follow::Here(pos);
         }
         let mut found = Vec::new();
-        let mut todo: Vec<Lv> = self
-            .copies
-            .get(&item)
-            .into_iter()
-            .flatten()
-            .copied()
-            .collect();
+        let mut todo: Vec<Lv> = self.copies.get(&item).into_iter().flatten().copied().collect();
         while let Some(x) = todo.pop() {
             match anchors.position(x) {
                 Some(pos) => found.push(pos),

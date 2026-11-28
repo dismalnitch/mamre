@@ -193,8 +193,7 @@ impl<M: Measure, const N: usize> Rope<M, N> {
         // Where the joiner the machine is holding began. A scan starts at
         // a sync point, and the machine holds nothing there.
         let mut held = None;
-        let place = |at: usize, anchor: Anchor, line_start: usize, held: Option<usize>| match anchor
-        {
+        let place = |at: usize, anchor: Anchor, line_start: usize, held: Option<usize>| match anchor {
             Anchor::Here => at,
             Anchor::LineStart => line_start,
             Anchor::BeforeJoiner => held.unwrap_or(at),
@@ -209,12 +208,7 @@ impl<M: Measure, const N: usize> Rope<M, N> {
                 return;
             }
             if starts
-                && f(
-                    place(i, unit.start_anchor(), line_start, None),
-                    Edge::Start,
-                    i,
-                )
-                .is_break()
+                && f(place(i, unit.start_anchor(), line_start, None), Edge::Start, i).is_break()
             {
                 return;
             }

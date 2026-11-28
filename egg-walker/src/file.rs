@@ -185,9 +185,7 @@ fn read_record<T: Clone + Codec>(
 /// what they carry beside the books (the books themselves are binary, and
 /// shown by size). A record that's cut off or damaged ends the list, as it
 /// ends loading, with a note saying so.
-pub fn dump<T: Clone + Codec + serde::Serialize>(
-    bytes: &[u8],
-) -> Result<serde_json::Value, LoadError> {
+pub fn dump<T: Clone + Codec + serde::Serialize>(bytes: &[u8]) -> Result<serde_json::Value, LoadError> {
     use serde_json::json;
     let version = header(bytes)?;
     let mut log = OpLog::<T>::new();
@@ -303,10 +301,7 @@ mod tests {
             runs[1]["parents"],
             serde_json::json!([{"agent": "alice", "seq": 4}])
         );
-        assert_eq!(
-            runs[1]["op"]["delete"],
-            serde_json::json!({"pos": 1, "count": 1})
-        );
+        assert_eq!(runs[1]["op"]["delete"], serde_json::json!({"pos": 1, "count": 1}));
         assert_eq!(records[1]["record"], "snapshot");
         assert_eq!(records[1]["document"], "hllo");
     }
@@ -421,10 +416,7 @@ mod tests {
         put_usize(&mut body, 2);
         char::encode_run(&['h', 'i'], &mut body);
         books.encode(&mut body);
-        ext::put_json(
-            &mut body,
-            &serde_json::json!({"ghosts": [{"item": 0, "place": 0}]}),
-        );
+        ext::put_json(&mut body, &serde_json::json!({"ghosts": [{"item": 0, "place": 0}]}));
         record(&mut file, SNAPSHOT, &body);
         let loaded = load::<char>(&file).unwrap();
         assert!(loaded.damaged);
