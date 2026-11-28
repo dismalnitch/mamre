@@ -52,6 +52,8 @@ struct Entry {
     tag: Option<String>,
     /// The event that set `tag`: the add, or the latest set.
     set_by: Lv,
+    /// The event that pinned its ends: the add, or the latest re-pin (#85).
+    pinned_by: Lv,
 }
 
 #[derive(Clone)]
@@ -103,6 +105,7 @@ impl Ranges {
                             end,
                             tag: Some(tag),
                             set_by: lv,
+                            pinned_by: lv,
                         },
                     );
                     self.watch(start, ids);
@@ -115,6 +118,18 @@ impl Ranges {
                     {
                         entry.tag = tag;
                         entry.set_by = lv;
+                    }
+                }
+                Op::Aside(Aside::Repin { link, start, end }) => {
+                    let key = |e: Lv| (log.lamport(e), log.order_key(e));
+                    if let Some(entry) = self.entries.get_mut(&link)
+                        && key(lv) > key(entry.pinned_by)
+                    {
+                        entry.start = start;
+                        entry.end = end;
+                        entry.pinned_by = lv;
+                        self.watch(start, ids);
+                        self.watch(end, ids);
                     }
                 }
                 _ => {}
@@ -189,6 +204,16 @@ impl Ranges {
         self.entries.get(&id).map(|e| e.tag.clone())
     }
 
+    /// Range `id`'s ends now: the items it's pinned to.
+    pub(crate) fn ends(&self, id: Lv) -> Option<(Lv, Lv)> {
+        self.entries.get(&id).map(|e| (e.start, e.end))
+    }
+
+    /// The event that pinned range `id`'s ends now.
+    pub(crate) fn pinned_by(&self, id: Lv) -> Option<Lv> {
+        self.entries.get(&id).map(|e| e.pinned_by)
+    }
+
     /// The event that set range `id`'s tag now.
     pub(crate) fn set_by(&self, id: Lv) -> Option<Lv> {
         self.entries.get(&id).map(|e| e.set_by)
@@ -200,12 +225,13 @@ impl Ranges {
 /// removed).
 #[doc(hidden)]
 pub fn reference<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<(Lv, Lv, Lv, Option<String>)> {
-    let mut out: BTreeMap<Lv, (Lv, Lv, Option<String>, Lv)> = BTreeMap::new();
+    // Each range: its ends, its tag, what set the tag, what pinned the ends.
+    let mut out: BTreeMap<Lv, (Lv, Lv, Option<String>, Lv, Lv)> = BTreeMap::new();
     let key = |e: Lv| (log.lamport(e), log.order_key(e));
     for lv in (0..log.len()).filter(|&lv| log.contains(version, lv)) {
         match log.event(lv).op {
             Op::Aside(Aside::RangeAdd { start, end, tag }) => {
-                out.insert(lv, (start, end, Some(tag), lv));
+                out.insert(lv, (start, end, Some(tag), lv, lv));
             }
             Op::Aside(Aside::RangeSet { range, tag }) => {
                 let e = out.get_mut(&range).expect("a set after its add");
@@ -214,10 +240,17 @@ pub fn reference<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<(Lv, Lv, Lv, O
                     e.3 = lv;
                 }
             }
+            Op::Aside(Aside::Repin { link, start, end }) => {
+                if let Some(e) = out.get_mut(&link)
+                    && key(lv) > key(e.4)
+                {
+                    (e.0, e.1, e.4) = (start, end, lv);
+                }
+            }
             _ => {}
         }
     }
     out.into_iter()
-        .map(|(id, (s, e, tag, _))| (id, s, e, tag))
+        .map(|(id, (s, e, tag, _, _))| (id, s, e, tag))
         .collect()
 }

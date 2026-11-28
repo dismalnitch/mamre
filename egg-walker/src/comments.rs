@@ -46,6 +46,8 @@ struct Entry {
     end: Lv,
     state: CommentState,
     set_by: Lv,
+    /// The event that pinned its ends: the add, or the latest re-pin (#85).
+    pinned_by: Lv,
 }
 
 /// Anchors that count how many comments watch each item.
@@ -121,6 +123,7 @@ impl Comments {
                             end,
                             state: CommentState::Open,
                             set_by: lv,
+                            pinned_by: lv,
                         },
                     );
                     self.starts.watch(start, ids);
@@ -133,6 +136,18 @@ impl Comments {
                     {
                         entry.state = state;
                         entry.set_by = lv;
+                    }
+                }
+                Op::Aside(Aside::Repin { link, start, end }) => {
+                    let key = |e: Lv| (log.lamport(e), log.order_key(e));
+                    if let Some(entry) = self.entries.get_mut(&link)
+                        && key(lv) > key(entry.pinned_by)
+                    {
+                        entry.start = start;
+                        entry.end = end;
+                        entry.pinned_by = lv;
+                        self.starts.watch(start, ids);
+                        self.ends.watch(end, ids);
                     }
                 }
                 _ => {}
@@ -186,5 +201,15 @@ impl Comments {
 
     pub(crate) fn set_by(&self, id: Lv) -> Option<Lv> {
         self.entries.get(&id).map(|e| e.set_by)
+    }
+
+    /// Comment `id`'s ends now: the items it's pinned to.
+    pub(crate) fn ends(&self, id: Lv) -> Option<(Lv, Lv)> {
+        self.entries.get(&id).map(|e| (e.start, e.end))
+    }
+
+    /// The event that pinned comment `id`'s ends now.
+    pub(crate) fn pinned_by(&self, id: Lv) -> Option<Lv> {
+        self.entries.get(&id).map(|e| e.pinned_by)
     }
 }

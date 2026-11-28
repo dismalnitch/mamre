@@ -40,7 +40,10 @@
 //!                         {"comment_set": {"comment", "state"}}, and a
 //!                         body's edits, a character each:
 //!                         {"body_insert": {"comment", "pos", "item"}},
-//!                         {"body_delete": {"comment", "pos"}}
+//!                         {"body_delete": {"comment", "pos"}}. A
+//!                         re-pin (#85): {"repin": {"link", "start",
+//!                         "end"}}, a comment or range pinned to other
+//!                         inserts
 //!             (other kinds are reserved for other kinds of event)
 //! extension = what the chunk carries beside its runs, as JSON (see
 //!             `ext.rs`); only when there's something in it. So far:
@@ -601,6 +604,11 @@ impl<T: Clone + Codec> Writer<'_, T> {
                 pos: *pos,
                 item: *item,
             },
+            Aside::Repin { link, start, end } => AsideJson::Repin {
+                link: self.named(*link),
+                start: self.named(*start),
+                end: self.named(*end),
+            },
             Aside::BodyDelete { comment, pos } => AsideJson::BodyDelete {
                 comment: self.named(*comment),
                 pos: *pos,
@@ -1002,6 +1010,15 @@ impl<'a, T: Clone> Planner<'a, T> {
             AsideJson::BodyDelete { comment: c, pos } => Aside::BodyDelete {
                 comment: earlier(&c, &comment, not_comment)?,
                 pos,
+            },
+            AsideJson::Repin { link, start, end } => Aside::Repin {
+                link: earlier(
+                    &link,
+                    &|at| comment(at) || range(at),
+                    "a re-pin of something not an earlier comment or range",
+                )?,
+                start: earlier(&start, &insert, "a re-pin's end that isn't an earlier insert")?,
+                end: earlier(&end, &insert, "a re-pin's end that isn't an earlier insert")?,
             },
         })
     }

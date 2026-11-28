@@ -253,9 +253,96 @@ fn edits_that_arent_moves_touch_nothing() {
     }
 }
 
+// ---- Re-pinning (#85) ----
+
+/// The editor's answer: the comment was about "three", not "two". It's in
+/// the move's step, so undo takes back both.
+#[test]
+fn a_repin_moves_a_comment_and_undo_takes_it_back() {
+    let (mut log, mut w, c, _) = three();
+    w.move_items(&mut log, 4..8, 13);
+    assert_eq!(w.text(), "one threetwo ");
+    log.begin_group(w.me);
+    let v = log.add_repin(w.me, w.books.version(), c, w.item(4), w.item(8));
+    w.merge(&log, &v);
+    log.end_group(w.me);
+    assert_eq!(w.at(w.books.comment(c).unwrap().span), "three");
+    w.undo(&mut log);
+    assert_eq!(w.at(w.books.comment(c).unwrap().span), "two", "following the move again");
+    w.undo(&mut log);
+    assert_eq!(w.text(), "one two three");
+    assert_eq!(w.books.comment(c).unwrap().span, 4..7);
+}
+
+/// Two editors re-pin one range at once: the latest wins, the same on both.
+#[test]
+fn the_latest_repin_wins_everywhere() {
+    let (mut log, mut w, _, r) = three();
+    let mut other = Writer::new(&mut log, "other");
+    other.merge(&log, w.books.version());
+    let base = w.books.version().to_vec();
+    let a = log.add_repin(w.me, &base, r, w.item(0), w.item(2));
+    let b = log.add_repin(other.me, &base, r, other.item(4), other.item(6));
+    let all = log.union(&a, &b);
+    w.merge(&log, &all);
+    other.merge(&log, &all);
+    let span = w.books.range(r).unwrap().span;
+    assert!(span == (0..3) || span == (4..7), "{span:?}");
+    assert_eq!(other.books.range(r), w.books.range(r));
+}
+
+fn repinned() -> (OpLog<char>, Writer, Lv) {
+    let (mut log, mut w, c, _) = three();
+    let v = log.add_repin(w.me, w.books.version(), c, w.item(0), w.item(2));
+    w.merge(&log, &v);
+    (log, w, c)
+}
+
+#[test]
+fn a_repin_round_trips_in_a_chunk() {
+    let (log, _, _) = repinned();
+    let mut bytes = Vec::new();
+    log.encode_chunk(0..log.len(), &mut bytes);
+    let json = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(json.contains(r#"{"repin":{"link":{"agent":"w","seq":13}"#), "{json}");
+    let mut back = OpLog::<char>::new();
+    assert_eq!(back.decode_chunk(&bytes), Ok(log.len()));
+    let last = log.len() - 1;
+    assert_eq!(back.event(last).op, log.event(last).op);
+    // A re-pin of something that isn't a comment or range is refused (#9):
+    // event 12 is an insert.
+    let bad = json.replacen(r#""link":{"agent":"w","seq":13}"#, r#""link":{"agent":"w","seq":12}"#, 1);
+    let k = json.bytes().zip(bad.bytes()).position(|(x, y)| x != y).unwrap();
+    let mut wrong = bytes.clone();
+    wrong[k] = bad.as_bytes()[k];
+    assert_eq!(
+        OpLog::<char>::new().decode_chunk(&wrong),
+        Err(mamre::codec::DecodeError::Invalid(
+            "a re-pin of something not an earlier comment or range"
+        ))
+    );
+}
+
+#[test]
+fn a_repin_survives_a_load() {
+    let (log, w, c) = repinned();
+    let mut file = mamre_egg_walker::file::create();
+    mamre_egg_walker::file::save(&mut file, &log, 0, w.doc.clone(), &w.books);
+    let loaded = mamre_egg_walker::file::load::<char>(&file).unwrap();
+    let snapshot = loaded.snapshot.expect("a snapshot");
+    let mut again = Writer {
+        me: w.me,
+        books: snapshot.accountant,
+        doc: snapshot.doc,
+    };
+    let version = loaded.log.version().to_vec();
+    again.merge(&loaded.log, &version);
+    assert_eq!(again.books.comment(c).unwrap().span, 0..3);
+}
+
 // ---- Many writers ----
 
-use mamre_egg_walker::{Aside, Follow, Op};
+use mamre_egg_walker::Follow;
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -265,6 +352,8 @@ enum Act {
     Move(usize, prop::sample::Index, prop::sample::Index, prop::sample::Index),
     Comment(usize, prop::sample::Index, prop::sample::Index),
     Range(usize, prop::sample::Index, prop::sample::Index),
+    /// Re-pins one of the comments or ranges shown to other text.
+    Repin(usize, prop::sample::Index, prop::sample::Index, prop::sample::Index),
     Undo(usize),
     Sync(usize, usize),
 }
@@ -277,6 +366,7 @@ fn acts() -> impl Strategy<Value = Vec<Act>> {
         3 => (0..3usize, i(), i(), i()).prop_map(|(w, a, b, t)| Act::Move(w, a, b, t)),
         2 => (0..3usize, i(), i()).prop_map(|(w, a, b)| Act::Comment(w, a, b)),
         1 => (0..3usize, i(), i()).prop_map(|(w, a, b)| Act::Range(w, a, b)),
+        1 => (0..3usize, i(), i(), i()).prop_map(|(w, k, a, b)| Act::Repin(w, k, a, b)),
         1 => (0..3usize).prop_map(Act::Undo),
         2 => (0..3usize, 0..3usize).prop_map(|(a, b)| Act::Sync(a, b)),
     ];
@@ -287,12 +377,8 @@ fn acts() -> impl Strategy<Value = Vec<Act>> {
 /// ends show, or both moved and still in order. Otherwise an end has fallen
 /// back to where it was, which is each replica's own (#34 will make it
 /// shared).
-fn placed_by_the_log(w: &Writer, log: &OpLog<char>, id: Lv) -> bool {
-    let (Op::Aside(Aside::CommentAdd { start, end }) | Op::Aside(Aside::RangeAdd { start, end, .. })) =
-        log.event(id).op
-    else {
-        unreachable!("{id} pins nothing")
-    };
+fn placed_by_the_log(w: &Writer, pin: Pin) -> bool {
+    let (start, end) = w.books.ends(pin).expect("it's shown");
     match (w.books.follow(start), w.books.follow(end)) {
         (Follow::Here(_), Follow::Here(_)) => true,
         (Follow::Moved(s), Follow::Moved(e)) => s <= e,
@@ -315,7 +401,7 @@ proptest! {
             let w = match act {
                 Act::Sync(_, b) => b,
                 Act::Type(w, ..) | Act::Delete(w, ..) | Act::Move(w, ..) | Act::Comment(w, ..)
-                | Act::Range(w, ..) | Act::Undo(w) => w,
+                | Act::Range(w, ..) | Act::Repin(w, ..) | Act::Undo(w) => w,
             };
             let me = ws[w].me;
             let len = ws[w].doc.len();
@@ -353,6 +439,26 @@ proptest! {
                     ws[w].merge(&log, &v);
                     log.end_group(me);
                 }
+                Act::Repin(_, k, a, b) if len > 0 => {
+                    let mut pins: Vec<Pin> = ws[w].books.comments().iter().map(|c| Pin::Comment(c.id)).collect();
+                    pins.extend(ws[w].books.ranges().iter().map(|r| Pin::Range(r.id)));
+                    if !pins.is_empty() {
+                        let link = match pins[k.index(pins.len())] {
+                            Pin::Comment(id) | Pin::Range(id) => id,
+                        };
+                        let (a, b) = (a.index(len), b.index(len));
+                        let (s, e) = (ws[w].item(a.min(b)), ws[w].item(a.max(b)));
+                        log.begin_group(me);
+                        let v = log.add_repin(me, ws[w].books.version(), link, s, e);
+                        ws[w].merge(&log, &v);
+                        log.end_group(me);
+                        let span = match pins[k.index(pins.len())] {
+                            Pin::Comment(id) => ws[w].books.comment(id).map(|c| c.span),
+                            Pin::Range(id) => ws[w].books.range(id).map(|r| r.span),
+                        };
+                        prop_assert_eq!(span, Some(a.min(b)..a.max(b) + 1), "where it was re-pinned");
+                    }
+                }
                 Act::Undo(_) => {
                     if let Some(changes) = ws[w].books.undo_group(&mut log, me) {
                         ws[w].apply(changes);
@@ -376,10 +482,10 @@ proptest! {
             w.merge(&log, &all);
         }
         let comments = |w: &Writer| -> Vec<_> {
-            w.books.comments().into_iter().filter(|c| placed_by_the_log(w, &log, c.id)).collect()
+            w.books.comments().into_iter().filter(|c| placed_by_the_log(w, Pin::Comment(c.id))).collect()
         };
         let ranges = |w: &Writer| -> Vec<_> {
-            w.books.ranges().into_iter().filter(|r| placed_by_the_log(w, &log, r.id)).collect()
+            w.books.ranges().into_iter().filter(|r| placed_by_the_log(w, Pin::Range(r.id))).collect()
         };
         prop_assert_eq!(&ws[0].doc, &ws[1].doc);
         prop_assert_eq!(&ws[1].doc, &ws[2].doc);

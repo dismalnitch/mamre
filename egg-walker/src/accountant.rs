@@ -306,12 +306,23 @@ impl Accountant {
         (changes, touched)
     }
 
+    /// The items `pin` is pinned to now, its first and last: the ones it
+    /// was added on, or the latest re-pin's (#85).
+    pub fn ends(&self, pin: Pin) -> Option<(Lv, Lv)> {
+        match pin {
+            Pin::Comment(id) => self.comments.ends(id),
+            Pin::Range(id) => self.ranges.ends(id),
+        }
+    }
+
     /// Pins the ends of the ranges and comments `events` add, so they can
     /// follow moves (#85).
     fn pin_ends<T: Clone>(&mut self, log: &OpLog<T>, events: &[Lv]) {
         for &lv in events {
             if let crate::Op::Aside(
-                crate::Aside::RangeAdd { start, end, .. } | crate::Aside::CommentAdd { start, end },
+                crate::Aside::RangeAdd { start, end, .. }
+                | crate::Aside::CommentAdd { start, end }
+                | crate::Aside::Repin { start, end, .. },
             ) = log.event(lv).op
             {
                 for item in [start, end] {

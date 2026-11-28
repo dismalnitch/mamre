@@ -185,6 +185,10 @@ impl Accountant {
         // Comments: the step's own taken back; its states put back.
         let mut comments: Vec<(Lv, CommentState)> = Vec::new();
         let mut states: Vec<Lv> = Vec::new();
+        // Re-pins (#85): put back to the ends before the step, where
+        // they're still the latest.
+        let mut repins: Vec<Lv> = Vec::new();
+        let mut repinned: Vec<(Lv, Lv, Lv)> = Vec::new();
         let commented: HashSet<Lv> = events
             .iter()
             .copied()
@@ -247,6 +251,12 @@ impl Accountant {
                 // A body's edits aren't undone with the step yet: its
                 // undo needs undeletes of body deletes (a follow-up).
                 Op::Aside(Aside::BodyInsert { .. } | Aside::BodyDelete { .. }) => {}
+                Op::Aside(Aside::Repin { link, .. }) => {
+                    let latest = self.ranges.pinned_by(link).or(self.comments.pinned_by(link));
+                    if !added.contains(&link) && !commented.contains(&link) && latest == Some(e) {
+                        repins.push(link);
+                    }
+                }
             }
         }
         let start = log.next_seq[agent.index()];
@@ -294,7 +304,7 @@ impl Accountant {
         }
         // Sets and states put back to what they were before the step: the
         // books there.
-        if !sets.is_empty() || !states.is_empty() {
+        if !sets.is_empty() || !states.is_empty() || !repins.is_empty() {
             let mut before = Accountant::new();
             before.merge(log, &log.event(events[0]).parents);
             for (range, _) in sets {
@@ -307,12 +317,20 @@ impl Accountant {
                     .unwrap_or(CommentState::Removed);
                 comments.push((comment, was));
             }
+            for link in repins {
+                if let Some((s, e)) = before.ranges.ends(link).or(before.comments.ends(link)) {
+                    repinned.push((link, s, e));
+                }
+            }
         }
         for (comment, state) in comments {
             v = log.set_comment(agent, &v, comment, state);
         }
         for (range, tag) in ranges {
             v = log.set_range(agent, &v, range, tag.as_deref());
+        }
+        for (link, s, e) in repinned {
+            v = log.add_repin(agent, &v, link, s, e);
         }
         log.end_group(agent);
         (start..log.next_seq[agent.index()], v)
