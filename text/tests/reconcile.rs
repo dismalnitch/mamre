@@ -41,9 +41,9 @@ fn a_moved_paragraph_keeps_who_it_is() {
     let edits = t.reconcile("One.\nThree.\nFour.\nTwo, which moves.\n");
     assert_eq!(t.to_string(), "One.\nThree.\nFour.\nTwo, which moves.\n");
     // A move is a delete and an insert of the same text (#68), nothing
-    // retyped, and what's on what moved goes along.
+    // retyped, hinted as a move, and what's on what moved goes along.
     assert!(
-        matches!(&edits[..], [Edit::Delete { range }, Edit::Insert { text, .. }] if range.len() == text.len()),
+        matches!(&edits[..], [Edit::Delete { range }, Edit::Insert { text, .. }, Edit::Moved { to, .. }] if range.len() == text.len() && to.len() == text.len()),
         "{edits:?}"
     );
     assert_eq!(t.sections()[0].id, two);
@@ -91,7 +91,11 @@ fn a_whole_file_replaced_keeps_nothing() {
     assert_eq!(t.to_string(), "something\nelse entirely\n");
     // No heading is kept. Its section stays, headless, at its place (#19).
     let left: Vec<_> = t.sections().into_iter().filter(|s| s.id == sec).collect();
-    assert!(left.iter().all(|s| s.start != mamre_egg_walker::Start::Heading), "{left:?}");
+    assert!(
+        left.iter()
+            .all(|s| s.start != mamre_egg_walker::Start::Heading),
+        "{left:?}"
+    );
 }
 
 #[test]

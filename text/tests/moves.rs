@@ -9,6 +9,8 @@ use mamre_text::{Edit, Kind, Text};
 struct Replica {
     text: Text,
     editor: String,
+    /// The moves hinted: where from, and the text that arrived.
+    moved: Vec<(usize, String)>,
 }
 
 impl Replica {
@@ -16,6 +18,7 @@ impl Replica {
         Replica {
             text: Text::new(name),
             editor: String::new(),
+            moved: Vec::new(),
         }
     }
 
@@ -24,10 +27,18 @@ impl Replica {
             match edit {
                 Edit::Insert { at, text } => self.editor.insert_str(at, &text),
                 Edit::Delete { range } => self.editor.replace_range(range, ""),
+                Edit::Moved { from, to } => {
+                    assert!(from <= self.editor.len(), "from {from}");
+                    self.moved.push((from, self.editor[to].to_string()));
+                }
                 Edit::Section { .. } | Edit::Isolates | Edit::Lost { .. } => {}
             }
         }
-        assert_eq!(self.editor, self.text.to_string(), "the edits are the text's");
+        assert_eq!(
+            self.editor,
+            self.text.to_string(),
+            "the edits are the text's"
+        );
     }
 
     fn type_(&mut self, at: usize, text: &str) {
@@ -85,10 +96,90 @@ fn a_move_is_a_delete_and_an_insert() {
             Edit::Insert {
                 at: 9,
                 text: "two ".into()
-            }
+            },
+            // And a hint that it was a move: from where the delete left a
+            // gap, to the insert.
+            Edit::Moved { from: 4, to: 9..13 }
         ]
     );
     assert_eq!(a.editor, "one threetwo ");
+}
+
+#[test]
+fn a_move_is_hinted_on_the_other_replica_too() {
+    let (mut a, mut b) = (Replica::new("a"), Replica::new("b"));
+    a.type_(0, "one two three");
+    sync(&mut a, &mut b);
+    a.move_text(4..8, 0);
+    sync(&mut a, &mut b);
+    assert_eq!(b.editor, "two one three");
+    // The gap "two " left is after "one ", which now comes after it.
+    assert_eq!(b.moved, [(8, "two ".to_string())]);
+    assert_eq!(a.moved, b.moved);
+}
+
+#[test]
+fn undo_and_redo_are_hinted_as_moves_back_and_forth() {
+    let (mut a, mut b) = (Replica::new("a"), Replica::new("b"));
+    a.type_(0, "one two three");
+    sync(&mut a, &mut b);
+    a.move_text(4..8, 13);
+    sync(&mut a, &mut b);
+    a.moved.clear();
+    b.moved.clear();
+    a.undo();
+    assert_eq!(a.editor, "one two three");
+    // Back from the end, where the copy was.
+    assert_eq!(a.moved, [(13, "two ".to_string())]);
+    sync(&mut a, &mut b);
+    assert_eq!(b.moved, a.moved, "an undo from elsewhere too");
+    a.moved.clear();
+    b.moved.clear();
+    a.redo();
+    assert_eq!(a.moved, [(4, "two ".to_string())]);
+    sync(&mut a, &mut b);
+    assert_eq!(b.moved, a.moved, "and a redo");
+}
+
+#[test]
+fn typing_and_deleting_are_no_moves() {
+    let (mut a, mut b) = (Replica::new("a"), Replica::new("b"));
+    a.type_(0, "one two three");
+    let e = a.text.delete(4..8).unwrap();
+    a.apply(e);
+    a.type_(0, "two ");
+    sync(&mut a, &mut b);
+    a.undo();
+    sync(&mut a, &mut b);
+    assert!(a.moved.is_empty() && b.moved.is_empty());
+}
+
+/// Text two writers move at once shows twice: each replica hints the move
+/// it made, and the other's copy is only an insert there (its originals
+/// were gone already).
+#[test]
+fn text_both_moved_is_hinted_once_on_each() {
+    let (mut a, mut b) = (Replica::new("a"), Replica::new("b"));
+    a.type_(0, "xx yy zz");
+    sync(&mut a, &mut b);
+    a.move_text(3..6, 0);
+    b.move_text(3..6, 8);
+    sync(&mut a, &mut b);
+    assert_eq!(a.editor, "yy xx zzyy ");
+    assert_eq!(a.moved, [(6, "yy ".to_string())]);
+    assert_eq!(b.moved, [(3, "yy ".to_string())]);
+}
+
+#[test]
+fn a_moved_section_is_hinted() {
+    let mut a = Replica::new("a");
+    a.type_(0, "Title\nbody\nEnd\n");
+    let (end, e) = a.text.mark_section(11, 1).unwrap();
+    a.apply(e);
+    let e = a.text.move_section(end, 0).unwrap();
+    a.apply(e);
+    assert_eq!(a.editor, "End\nTitle\nbody\n");
+    assert_eq!(a.moved, [(15, "End\n".to_string())]);
 }
 
 #[test]
@@ -103,7 +194,11 @@ fn a_caret_in_moved_text_goes_with_it() {
     assert_eq!(a.editor, "one threetwo ");
     assert_eq!(a.text.position(&mine), Some(10));
     sync(&mut a, &mut b);
-    assert_eq!(b.text.position(&theirs), Some(10), "on the other replica too");
+    assert_eq!(
+        b.text.position(&theirs),
+        Some(10),
+        "on the other replica too"
+    );
 }
 
 #[test]
@@ -200,7 +295,10 @@ fn a_moved_section_keeps_its_id_and_its_kind() {
         assert_eq!(r.text.section_range(later), Some(0..12));
         assert_eq!(r.text.section_range(intro), Some(12..23));
         assert_eq!(r.text.kind_at(r.editor.find("more").unwrap()), Kind::Quote);
-        assert_eq!(r.text.kind_at(r.editor.find("Later").unwrap()), Kind::Heading(1));
+        assert_eq!(
+            r.text.kind_at(r.editor.find("Later").unwrap()),
+            Kind::Heading(1)
+        );
         let ids: Vec<_> = r.text.sections().iter().map(|s| s.id).collect();
         assert!(ids.contains(&later) && ids.contains(&intro) && ids.contains(&quote));
     }

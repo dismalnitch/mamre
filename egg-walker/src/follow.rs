@@ -69,6 +69,11 @@ impl Moves {
         self.sources.get(&item).copied()
     }
 
+    /// The copies moves made of `item`.
+    pub(crate) fn copies_of(&self, item: Lv) -> &[Lv] {
+        self.copies.get(&item).map_or(&[], Vec::as_slice)
+    }
+
     /// Watches `item`, the one at `pos` now, for its own sake.
     pub(crate) fn watch(&mut self, anchors: &mut Anchors, ids: &Identities, pos: usize, item: Lv) {
         if self.direct.insert(item) {
@@ -94,7 +99,13 @@ impl Moves {
         // Its copies, theirs, and so on: newly watched, placed in one pass
         // (text that was never moved has none, and costs nothing).
         let mut new = BTreeSet::new();
-        let mut todo: Vec<Lv> = self.copies.get(&item).into_iter().flatten().copied().collect();
+        let mut todo: Vec<Lv> = self
+            .copies
+            .get(&item)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
         while let Some(x) = todo.pop() {
             let n = self.reasons.entry(x).or_insert(0);
             *n += 1;
@@ -173,7 +184,13 @@ impl Moves {
             return Follow::Here(pos);
         }
         let mut found = Vec::new();
-        let mut todo: Vec<Lv> = self.copies.get(&item).into_iter().flatten().copied().collect();
+        let mut todo: Vec<Lv> = self
+            .copies
+            .get(&item)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
         while let Some(x) = todo.pop() {
             match anchors.position(x) {
                 Some(pos) => found.push(pos),

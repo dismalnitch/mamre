@@ -12,7 +12,9 @@ fn round_trip(log: &OpLog<char>) -> OpLog<char> {
     let mut chunk = Vec::new();
     log.encode_chunk(0..log.len(), &mut chunk);
     let mut other = OpLog::new();
-    other.decode_chunk(&chunk).expect("a chunk we wrote reads back");
+    other
+        .decode_chunk(&chunk)
+        .expect("a chunk we wrote reads back");
     other
 }
 
@@ -70,7 +72,10 @@ fn a_paste_is_inserts_that_remember_their_sources() {
     let v = log.add_paste(a, &v, 6, &[0, 1, 2, 3, 4]);
     assert_eq!(text(&log), "hello hello");
     assert_eq!(v, [10]);
-    assert_eq!((0..6).map(|lv| log.source(lv)).collect::<Vec<_>>(), [None; 6]);
+    assert_eq!(
+        (0..6).map(|lv| log.source(lv)).collect::<Vec<_>>(),
+        [None; 6]
+    );
     assert_eq!(
         (6..11).map(|lv| log.source(lv)).collect::<Vec<_>>(),
         [Some(0), Some(1), Some(2), Some(3), Some(4)]
@@ -87,7 +92,10 @@ fn a_chunk_carries_a_paste_by_its_source() {
     log.add_paste(a, &v, 16, &sources);
     let mut chunk = Vec::new();
     log.encode_chunk(0..log.len(), &mut chunk);
-    let once = chunk.windows(15).filter(|w| *w == b"a long sentence").count();
+    let once = chunk
+        .windows(15)
+        .filter(|w| *w == b"a long sentence")
+        .count();
     assert_eq!(once, 1, "{chunk:?}");
     let other = round_trip(&log);
     assert_eq!(text(&other), "a long sentence a long sentence ");
@@ -143,7 +151,10 @@ fn a_paste_of_what_an_earlier_chunk_brought_round_trips() {
     log.encode_chunk(0..typed, &mut first);
     log.encode_chunk(typed..log.len(), &mut second);
     let mut other = OpLog::new();
-    assert!(other.decode_chunk(&second).is_err(), "its source isn't here yet");
+    assert!(
+        other.decode_chunk(&second).is_err(),
+        "its source isn't here yet"
+    );
     other.decode_chunk(&first).unwrap();
     other.decode_chunk(&second).unwrap();
     assert_eq!(text(&other), "bcabc");
@@ -162,7 +173,9 @@ fn typing_in_the_source_meanwhile_stays_out_of_the_copy() {
     let pasted = log.add_paste(b, &v, 2, &[0, 1]);
     let both = log.union(&typed, &pasted);
     assert_eq!(
-        copies::checkout(&log, &both).into_iter().collect::<String>(),
+        copies::checkout(&log, &both)
+            .into_iter()
+            .collect::<String>(),
         "a-bab"
     );
 }
@@ -205,10 +218,22 @@ fn a_copy_of_what_isnt_an_insert_is_refused() {
 #[test]
 fn a_copy_whose_sources_dont_add_up_is_refused() {
     let mut log = OpLog::<char>::new();
-    assert!(log.decode_chunk(&copy_chunk(1, &[(4, 2)])).is_err(), "too many");
-    assert!(log.decode_chunk(&copy_chunk(1, &[(4, 0), (4, 1)])).is_err(), "a source of none");
-    assert!(log.decode_chunk(&copy_chunk(2, &[(4, 1)])).is_err(), "too few");
+    assert!(
+        log.decode_chunk(&copy_chunk(1, &[(4, 2)])).is_err(),
+        "too many"
+    );
+    assert!(
+        log.decode_chunk(&copy_chunk(1, &[(4, 0), (4, 1)])).is_err(),
+        "a source of none"
+    );
+    assert!(
+        log.decode_chunk(&copy_chunk(2, &[(4, 1)])).is_err(),
+        "too few"
+    );
     // Back 0: the copy itself.
-    assert!(log.decode_chunk(&copy_chunk(1, &[(0, 1)])).is_err(), "itself");
+    assert!(
+        log.decode_chunk(&copy_chunk(1, &[(0, 1)])).is_err(),
+        "itself"
+    );
     assert!(log.is_empty());
 }

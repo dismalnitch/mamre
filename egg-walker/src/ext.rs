@@ -42,7 +42,9 @@ pub(crate) fn get_json<V: DeserializeOwned>(input: &mut &[u8]) -> Result<V, Deco
     let (&format, rest) = input.split_first().ok_or(DecodeError::UnexpectedEnd)?;
     *input = rest;
     if format != JSON {
-        return Err(DecodeError::Invalid("an extension in a format this version doesn't know"));
+        return Err(DecodeError::Invalid(
+            "an extension in a format this version doesn't know",
+        ));
     }
     serde_json::from_str(get_str(input)?)
         .map_err(|_| DecodeError::Invalid("an extension that isn't the JSON it should be"))
@@ -122,7 +124,10 @@ mod tests {
         put_json(&mut out, &Later { later: vec![3, 9] });
         assert_eq!(out[0], JSON);
         let mut input = &out[..];
-        assert_eq!(get_json::<Later>(&mut input), Ok(Later { later: vec![3, 9] }));
+        assert_eq!(
+            get_json::<Later>(&mut input),
+            Ok(Later { later: vec![3, 9] })
+        );
         assert!(input.is_empty());
     }
 
@@ -165,21 +170,36 @@ pub(crate) struct Named {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum AsideJson {
     /// A range from `start` to `end` (inserts, both included), tagged.
-    RangeAdd { start: Named, end: Named, tag: String },
+    RangeAdd {
+        start: Named,
+        end: Named,
+        tag: String,
+    },
     /// A range's tag set, or the range removed (`null`).
     RangeSet { range: Named, tag: Option<String> },
     /// A comment on `start` to `end` (inserts, both included).
     CommentAdd { start: Named, end: Named },
     /// A comment's state: "open", "resolved" or "removed".
-    CommentSet { comment: Named, state: crate::CommentState },
+    CommentSet {
+        comment: Named,
+        state: crate::CommentState,
+    },
     /// A character typed into a comment's body at `pos`.
-    BodyInsert { comment: Named, pos: usize, item: char },
+    BodyInsert {
+        comment: Named,
+        pos: usize,
+        item: char,
+    },
     /// The character at `pos` taken out of a comment's body.
     BodyDelete { comment: Named, pos: usize },
     /// A move's copies (#68): `first` and the `len - 1` inserts its agent
     /// made after it, copies of the `from` runs in order. Each run is
     /// `start` and the `len - 1` events its agent made after it.
-    CameFrom { first: Named, len: usize, from: Vec<NamedRun> },
+    CameFrom {
+        first: Named,
+        len: usize,
+        from: Vec<NamedRun>,
+    },
 }
 
 /// Events in a run of one agent's: the first, and how many.

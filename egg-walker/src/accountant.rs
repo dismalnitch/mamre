@@ -23,7 +23,7 @@ use crate::anchors::Anchors;
 use crate::blocks::Blocks;
 use crate::ext::{Ghost, SnapshotExt};
 use crate::ids::Identities;
-use crate::oplog::{Lv, OpLog};
+use crate::oplog::{Aside, Lv, Op, OpLog};
 use crate::outline::{Ambiguity, Next, Outline, Policies, Policy, Section};
 use crate::recent::Recent;
 use crate::walk::Change;
@@ -123,6 +123,51 @@ impl Accountant {
     /// The item a move copied `item` from, if a move made it (#68).
     pub fn moved_from(&self, item: Lv) -> Option<Lv> {
         self.moves.source(item)
+    }
+
+    /// The copies moves made of `item`, in the order they were made.
+    pub fn copies(&self, item: Lv) -> &[Lv] {
+        self.moves.copies_of(item)
+    }
+
+    /// The moves `events` (not merged yet) make, undo or redo: each copy
+    /// and its source, from their came-from records and from the deletes
+    /// they undo. For saying a move happened (`mamre-text`'s
+    /// `Edit::Moved`): the merge never needs it.
+    pub fn moves_among<T: Clone>(
+        &self,
+        log: &OpLog<T>,
+        events: std::ops::Range<Lv>,
+    ) -> Vec<(Lv, Lv)> {
+        let mut pairs = Vec::new();
+        let mut lv = events.start;
+        while lv < events.end {
+            let run = log.run_of(lv);
+            let end = run.end().min(events.end);
+            match &run.op {
+                crate::oplog::RunOp::Aside(_) => {
+                    for x in lv..end {
+                        if let Op::Aside(Aside::CameFrom { copies, sources }) = log.event(x).op {
+                            pairs.extend(copies.into_iter().zip(sources));
+                        }
+                    }
+                }
+                crate::oplog::RunOp::Undelete { .. } => {
+                    for x in lv..end {
+                        let Some(item) = self.ids.removed(log.undeleted(x)) else {
+                            continue;
+                        };
+                        if let Some(source) = self.moved_from(item) {
+                            pairs.push((item, source));
+                        }
+                        pairs.extend(self.copies(item).iter().map(|&c| (c, item)));
+                    }
+                }
+                _ => {}
+            }
+            lv = end;
+        }
+        pairs
     }
 
     /// The sections the document shows, in order: each marked item, where
@@ -418,7 +463,8 @@ mod outline_tests {
         // The ghost goes beside the books, as JSON.
         let side = serde_json::to_string(&books.side()).unwrap();
         assert_eq!(side, r#"{"ghosts":[{"item":4,"place":4}]}"#);
-        back.apply_side(&serde_json::from_str(&side).unwrap()).unwrap();
+        back.apply_side(&serde_json::from_str(&side).unwrap())
+            .unwrap();
         assert_eq!(back.sections(), books.sections());
         assert_eq!(back.level(4), 1, "a deleted item keeps its mark");
         // And its section, headless, at its place (#19).

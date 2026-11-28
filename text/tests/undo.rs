@@ -11,6 +11,8 @@ use proptest::prelude::*;
 struct Replica {
     text: Text,
     editor: String,
+    /// The moves hinted: where from, and the text that arrived.
+    moved: Vec<(usize, String)>,
 }
 
 impl Replica {
@@ -18,6 +20,7 @@ impl Replica {
         Replica {
             text: Text::new(name),
             editor: String::new(),
+            moved: Vec::new(),
         }
     }
 
@@ -26,10 +29,18 @@ impl Replica {
             match edit {
                 Edit::Insert { at, text } => self.editor.insert_str(at, &text),
                 Edit::Delete { range } => self.editor.replace_range(range, ""),
+                Edit::Moved { from, to } => {
+                    assert!(from <= self.editor.len() && to.end <= self.editor.len());
+                    self.moved.push((from, self.editor[to].to_string()));
+                }
                 Edit::Section { .. } | Edit::Isolates | Edit::Lost { .. } => {}
             }
         }
-        assert_eq!(self.editor, self.text.to_string(), "the edits are the text's");
+        assert_eq!(
+            self.editor,
+            self.text.to_string(),
+            "the edits are the text's"
+        );
     }
 
     fn type_(&mut self, at: usize, text: &str) {
@@ -170,7 +181,10 @@ fn an_isolate_is_undone() {
     a.type_(0, "say שלום now");
     let start = "say ".len();
     let end = start + "שלום".len();
-    let (_, e) = a.text.mark_isolate(start..end, Direction::RightToLeft).unwrap();
+    let (_, e) = a
+        .text
+        .mark_isolate(start..end, Direction::RightToLeft)
+        .unwrap();
     a.apply(e);
     assert_eq!(a.text.isolates().len(), 1);
     assert!(a.undo());

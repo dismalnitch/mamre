@@ -40,7 +40,21 @@ fn apply(s: &mut String, edit: &Edit) {
         Edit::Delete { range } => {
             s.replace_range(range.clone(), "");
         }
+        Edit::Moved { from, to } => hint_fits(s, *from, to),
         Edit::Section { .. } | Edit::Isolates | Edit::Lost { .. } => {}
+    }
+}
+
+/// A move's hint names places in the text as it is where the hint comes.
+fn hint_fits(s: &str, from: usize, to: &std::ops::Range<usize>) {
+    assert!(
+        !to.is_empty() && to.end <= s.len(),
+        "{to:?} in {} bytes",
+        s.len()
+    );
+    assert!(from <= s.len(), "from {from} in {} bytes", s.len());
+    for b in [from, to.start, to.end] {
+        assert!(s.is_char_boundary(b), "{b} in {s:?}");
     }
 }
 
@@ -72,7 +86,12 @@ fn hearing_losses(r: &mut Replica, edits: Vec<Edit>) -> Vec<Vec<String>> {
     let mut heard = Vec::new();
     for edit in edits {
         if let Edit::Lost { ranges } = &edit {
-            heard.push(ranges.iter().map(|g| r.editor[g.clone()].to_string()).collect());
+            heard.push(
+                ranges
+                    .iter()
+                    .map(|g| r.editor[g.clone()].to_string())
+                    .collect(),
+            );
         }
         apply(&mut r.editor, &edit);
     }
@@ -368,12 +387,7 @@ fn files_keep_everything() {
 enum Act<I = prop::sample::Index> {
     Insert(usize, I, String),
     Delete(usize, I, I),
-    Move(
-        usize,
-        I,
-        I,
-        I,
-    ),
+    Move(usize, I, I, I),
     Mark(usize, I, u8),
     /// A replica says hello to another.
     Hello(usize, usize),
@@ -460,7 +474,11 @@ fn converge<I: Pick>(acts: Vec<Act<I>>) -> Result<(), TestCaseError> {
             }
             Act::Move(r, a, b, t) => {
                 let bs = boundaries(&rs[r].editor);
-                let (a, b, t) = (bs[a.pick(bs.len())], bs[b.pick(bs.len())], bs[t.pick(bs.len())]);
+                let (a, b, t) = (
+                    bs[a.pick(bs.len())],
+                    bs[b.pick(bs.len())],
+                    bs[t.pick(bs.len())],
+                );
                 let e = rs[r].text.move_text(a.min(b)..a.max(b), t).unwrap();
                 rs[r].apply(e);
             }
@@ -476,7 +494,11 @@ fn converge<I: Pick>(acts: Vec<Act<I>>) -> Result<(), TestCaseError> {
             Act::Hello(..) => {}
             Act::Deliver(i, keep) if !wire.is_empty() => {
                 let k = i.pick(wire.len());
-                let (to, m) = if keep { wire[k].clone() } else { wire.remove(k) };
+                let (to, m) = if keep {
+                    wire[k].clone()
+                } else {
+                    wire.remove(k)
+                };
                 // Who it's from isn't on the wire: answers go to everyone.
                 let got = rs[to].text.receive(&m).unwrap();
                 rs[to].apply(got.edits);

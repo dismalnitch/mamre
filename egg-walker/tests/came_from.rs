@@ -69,9 +69,17 @@ fn a_bad_one_is_refused() {
     let json = String::from_utf8_lossy(&bytes).into_owned();
     assert!(json.contains("\"len\":2"), "{json}");
     for (from, to, why) in [
-        ("\"len\":2,", "\"len\":3,", "a came-from whose copies and sources don't pair up"),
+        (
+            "\"len\":2,",
+            "\"len\":3,",
+            "a came-from whose copies and sources don't pair up",
+        ),
         // The copies start at a's delete, not its insert.
-        ("\"seq\":8", "\"seq\":6", "a came-from naming something that isn't an earlier insert"),
+        (
+            "\"seq\":8",
+            "\"seq\":6",
+            "a came-from naming something that isn't an earlier insert",
+        ),
     ] {
         let bad = json.replacen(from, to, 1);
         assert_ne!(bad, json, "{from} is in {json}");

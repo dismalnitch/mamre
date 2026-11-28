@@ -543,6 +543,9 @@ fn apply(editor: &mut String, edits: &[Edit]) {
             Edit::Delete { range } => {
                 editor.drain(range.clone());
             }
+            Edit::Moved { from, to } => {
+                assert!(*from <= editor.len() && to.end <= editor.len());
+            }
             Edit::Section { .. } | Edit::Isolates | Edit::Lost { .. } => {}
         }
     }

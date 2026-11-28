@@ -36,7 +36,7 @@
 //!
 //! - Peers aren't checked for honesty (#9): only talk to ones you trust.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::ops::Range;
 
@@ -103,6 +103,18 @@ pub enum Edit {
     /// text is now, as the text is at this point in the edits: none if
     /// it's all been deleted. The text doesn't change.
     Lost { ranges: Vec<Range<usize>> },
+    /// A hint, safe to ignore: the text at `to` was just moved there from
+    /// `from`, where a [`Delete`](Edit::Delete) before it took it out (an
+    /// empty spot now). Positions are as the text is at this point in the
+    /// edits. The text doesn't change: the delete and the insert already
+    /// did it, so this is for showing it, as a move to follow with the eye,
+    /// say (#68). Undo and redo of a move are moves back and forth.
+    ///
+    /// Moved text split up by others' edits made at the same time comes
+    /// as a hint for each piece. Text two writers both moved has only the
+    /// first copy a replica sees hinted, and typing that stays where moved
+    /// text was is no part of any hint.
+    Moved { from: usize, to: Range<usize> },
 }
 
 /// A place in the text that stays put through every edit, merge and
@@ -344,6 +356,22 @@ fn root(books: &Accountant, item: Lv) -> Lv {
     x
 }
 
+/// Byte `at`, carried through `edits`: where that spot is after them. A
+/// spot inside a delete goes to where the delete was; one an insert lands
+/// on stays before it.
+fn through(mut at: usize, edits: &[Edit]) -> usize {
+    for edit in edits {
+        match edit {
+            Edit::Insert { at: i, text } if *i < at => at += text.len(),
+            Edit::Delete { range } if range.start < at => {
+                at = range.start.max(at.saturating_sub(range.len()));
+            }
+            _ => {}
+        }
+    }
+    at
+}
+
 /// Puts the CRDT's `changes` into the rope and markers: the edits they
 /// make.
 fn apply<M: Measure>(
@@ -468,6 +496,86 @@ impl<M: Measure> Text<M> {
         apply(&mut self.rope, &mut self.markers, &self.books, &changes)
     }
 
+    /// As [`catch_up`](Self::catch_up), for events from `fresh` on, not
+    /// merged yet: the moves among them, undone or redone, are hinted
+    /// ([`Edit::Moved`]).
+    fn catch_up_hinting(&mut self, fresh: Lv, to: &[Lv]) -> Vec<Edit> {
+        let pairs = self.books.moves_among(&self.log, fresh..self.log.len());
+        let before = self.shown_bytes(pairs.iter().flat_map(|&(c, s)| [c, s]));
+        let mut edits = self.catch_up(to);
+        let hints = self.hints(&pairs, &before, &edits);
+        edits.extend(hints);
+        edits
+    }
+
+    /// The byte offset of item position `pos`.
+    fn byte_of(&self, pos: usize) -> usize {
+        self.rope.char_to_offset(self.markers.to_char(pos))
+    }
+
+    /// Where each of `items` that shows starts, in bytes.
+    fn shown_bytes(&self, items: impl IntoIterator<Item = Lv>) -> HashMap<Lv, usize> {
+        let items: BTreeSet<Lv> = items.into_iter().collect();
+        if items.is_empty() {
+            return HashMap::new();
+        }
+        self.books
+            .identities()
+            .positions(&items)
+            .into_iter()
+            .map(|(item, pos)| (item, self.byte_of(pos)))
+            .collect()
+    }
+
+    /// The moves `pairs` (each copy and its source) made, now `edits` are
+    /// made: a side that showed `before` and doesn't now, whose other side
+    /// shows now and didn't, went there. One hint for each run of what
+    /// arrived, in the text as `edits` leave it.
+    fn hints(&self, pairs: &[(Lv, Lv)], before: &HashMap<Lv, usize>, edits: &[Edit]) -> Vec<Edit> {
+        if pairs.is_empty() {
+            return Vec::new();
+        }
+        let ids = self.books.identities();
+        let all: BTreeSet<Lv> = pairs.iter().flat_map(|&(c, s)| [c, s]).collect();
+        let now: HashMap<Lv, usize> = ids.positions(&all).into_iter().collect();
+        // Each item that arrived (by where it is now), and the byte where
+        // the one it stands for was.
+        let mut arrived: Vec<(usize, usize)> = Vec::new();
+        for &(c, s) in pairs {
+            for (gone, came) in [(s, c), (c, s)] {
+                if let (Some(&was), None, Some(&pos), false) = (
+                    before.get(&gone),
+                    now.get(&gone),
+                    now.get(&came),
+                    before.contains_key(&came),
+                ) {
+                    arrived.push((pos, was));
+                }
+            }
+        }
+        arrived.sort_unstable();
+        arrived.dedup_by_key(|&mut (pos, _)| pos);
+        let mut out = Vec::new();
+        let mut k = 0;
+        while k < arrived.len() {
+            let (first, was) = arrived[k];
+            let mut last = first;
+            while k + 1 < arrived.len() && arrived[k + 1].0 == last + 1 {
+                k += 1;
+                last += 1;
+            }
+            k += 1;
+            let to = self.byte_of(first)..self.byte_of(last + 1);
+            if !to.is_empty() {
+                out.push(Edit::Moved {
+                    from: through(was, edits),
+                    to,
+                });
+            }
+        }
+        out
+    }
+
     /// Runs `f` as one step: one undo, unless it's inside a group the
     /// editor began, which it's then part of.
     fn stepped<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -514,8 +622,9 @@ impl<M: Measure> Text<M> {
     ///
     /// Inside a group.
     pub fn undo(&mut self) -> Option<Vec<Edit>> {
-        let changes = self.books.undo_group(&mut self.log, self.me)?;
-        Some(apply(&mut self.rope, &mut self.markers, &self.books, &changes))
+        let fresh = self.log.len();
+        let v = self.books.make_undo(&mut self.log, self.me)?;
+        Some(self.catch_up_hinting(fresh, &v))
     }
 
     /// Redoes the step [`undo`](Self::undo) last undid, if this writer has
@@ -525,8 +634,9 @@ impl<M: Measure> Text<M> {
     ///
     /// Inside a group.
     pub fn redo(&mut self) -> Option<Vec<Edit>> {
-        let changes = self.books.redo_group(&mut self.log, self.me)?;
-        Some(apply(&mut self.rope, &mut self.markers, &self.books, &changes))
+        let fresh = self.log.len();
+        let v = self.books.make_redo(&mut self.log, self.me)?;
+        Some(self.catch_up_hinting(fresh, &v))
     }
 
     /// Puts `text` in at byte `at`. Where an isolate starts or ends
@@ -745,6 +855,7 @@ impl<M: Measure> Text<M> {
             text.push_str(chunk);
         }
         let pieces = self.markers.pieces_in(items.clone(), text.chars());
+        let before = self.shown_bytes(sources.iter().copied());
         let mut edits = Vec::new();
         for &(k, _) in &marks {
             let v = self
@@ -766,7 +877,12 @@ impl<M: Measure> Text<M> {
             .log
             .add_insert(self.me, self.books.version(), at, pieces);
         edits.extend(self.catch_up(&v));
-        let copies = (first..first + items.len()).collect();
+        let copies: Vec<Lv> = (first..first + items.len()).collect();
+        let pairs: Vec<(Lv, Lv)> = copies
+            .iter()
+            .copied()
+            .zip(sources.iter().copied())
+            .collect();
         let v = self
             .log
             .add_came_from(self.me, self.books.version(), copies, sources);
@@ -777,6 +893,8 @@ impl<M: Measure> Text<M> {
                 .add_mark(self.me, self.books.version(), at + k, level);
             edits.extend(self.catch_up(&v));
         }
+        let hints = self.hints(&pairs, &before, &edits);
+        edits.extend(hints);
         edits
     }
 
@@ -1057,12 +1175,13 @@ impl<M: Measure> Text<M> {
                 }
             }
             Message::Events(chunk) => {
+                let fresh = self.log.len();
                 if self.log.decode_chunk(&chunk).is_err() {
                     out.reply.push(self.hello());
                     return Ok(out);
                 }
                 let to = self.log.version().to_vec();
-                out.edits = self.catch_up(&to);
+                out.edits = self.catch_up_hinting(fresh, &to);
             }
         }
         Ok(out)
