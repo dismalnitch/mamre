@@ -92,7 +92,7 @@ mod walk;
 pub use accountant::Accountant;
 pub use anchors::Anchors;
 pub use comments::Comment;
-pub use follow::Follow;
+pub use follow::{Follow, Pin, Touch, Touched};
 pub use ids::Identities;
 pub use oplog::{AgentId, Aside, CommentState, Copied, Event, Lv, Op, OpLog};
 pub use outline::{Ambiguity, Next, Policies, Policy, Resolution, Section, Start};

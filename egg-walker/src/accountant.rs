@@ -23,6 +23,7 @@ use crate::anchors::Anchors;
 use crate::blocks::Blocks;
 use crate::ext::{Ghost, SnapshotExt};
 use crate::ids::Identities;
+use crate::follow::{Pin, Touched};
 use crate::oplog::{Copied, Lv, OpLog};
 use crate::outline::{Ambiguity, Next, Outline, Policies, Policy, Section};
 use crate::recent::Recent;
@@ -224,6 +225,85 @@ impl Accountant {
             crate::Follow::Moved(pos) => Some(pos),
             _ => None,
         }
+    }
+
+    /// What's pinned to text (comments and ranges) that moving the text at
+    /// `stretches` (positions now) would touch, and how: for the editor of
+    /// whoever's moving it to ask about before it does (#79, #85).
+    pub fn pins_touching(&self, stretches: &[std::ops::Range<usize>]) -> Vec<Touched> {
+        let mut stretches: Vec<_> = stretches.iter().filter(|s| !s.is_empty()).cloned().collect();
+        stretches.sort_unstable_by_key(|s| s.start);
+        let mut out = Vec::new();
+        for c in self.comments() {
+            if let Some(touch) = crate::follow::touch(&c.span, &stretches) {
+                out.push(Touched { pin: Pin::Comment(c.id), touch });
+            }
+        }
+        for r in self.ranges() {
+            if let Some(touch) = crate::follow::touch(&r.span, &stretches) {
+                out.push(Touched { pin: Pin::Range(r.id), touch });
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// [`merge`](Self::merge), and what's pinned to text that the moves it
+    /// brings touched, and how (#85): moves, and undos and redos of them,
+    /// from here or elsewhere. For the editor of whoever the pinned thing
+    /// is to ask about (#79). A paste moves nothing, so touches nothing.
+    pub fn merge_noting_pins<'a, T: Clone>(
+        &mut self,
+        log: &'a OpLog<T>,
+        to: &[Lv],
+    ) -> (Vec<Change<'a, T>>, Vec<Touched>) {
+        let all = log.union(&self.version, to);
+        let (_, mut new) = log.diff(&self.version, &all);
+        new.sort_unstable();
+        let mut sides = Vec::new();
+        for events in ranges_of(&new) {
+            for r in self.moves_among(log, events) {
+                sides.push(r.copy..r.copy + r.len);
+                sides.push(r.source..r.source + r.len);
+            }
+        }
+        let was = self.ids.shown(&sides);
+        // The pinned things' spans before, to classify against what left.
+        let spans: Vec<(Pin, std::ops::Range<usize>)> = if was.is_empty() {
+            Vec::new()
+        } else {
+            let mut spans: Vec<_> = self.comments().into_iter().map(|c| (Pin::Comment(c.id), c.span)).collect();
+            spans.extend(self.ranges().into_iter().map(|r| (Pin::Range(r.id), r.span)));
+            spans
+        };
+        let changes = self.merge(log, to);
+        if was.is_empty() {
+            return (changes, Vec::new());
+        }
+        // What showed before and doesn't now: the text the moves took away,
+        // at its positions before.
+        let still: Vec<std::ops::Range<Lv>> = self.ids.shown(&sides).into_iter().map(|(r, _)| r).collect();
+        let mut stretches: Vec<std::ops::Range<usize>> = Vec::new();
+        for (piece, pos) in was {
+            for gone in minus(piece.clone(), &still) {
+                let at = pos + (gone.start - piece.start);
+                stretches.push(at..at + gone.len());
+            }
+        }
+        stretches.sort_unstable_by_key(|s| s.start);
+        let mut joined: Vec<std::ops::Range<usize>> = Vec::new();
+        for s in stretches {
+            match joined.last_mut() {
+                Some(j) if s.start <= j.end => j.end = j.end.max(s.end),
+                _ => joined.push(s),
+            }
+        }
+        let mut touched: Vec<Touched> = spans
+            .into_iter()
+            .filter_map(|(pin, span)| crate::follow::touch(&span, &joined).map(|touch| Touched { pin, touch }))
+            .collect();
+        touched.sort_unstable();
+        (changes, touched)
     }
 
     /// Pins the ends of the ranges and comments `events` add, so they can
@@ -436,19 +516,36 @@ impl Accountant {
 
 /// The copies pastes and moves made among `events` (sorted), in runs.
 fn copied_among<T: Clone>(log: &OpLog<T>, events: &[Lv]) -> Vec<Copied> {
-    let mut runs = Vec::new();
-    let mut k = 0;
-    while k < events.len() {
-        let start = events[k];
-        let mut end = start + 1;
-        k += 1;
-        while k < events.len() && events[k] == end {
-            end += 1;
-            k += 1;
+    ranges_of(events).into_iter().flat_map(|r| log.copied(r)).collect()
+}
+
+/// `events` (sorted) as ranges of events one after another.
+fn ranges_of(events: &[Lv]) -> Vec<std::ops::Range<Lv>> {
+    let mut out: Vec<std::ops::Range<Lv>> = Vec::new();
+    for &lv in events {
+        match out.last_mut() {
+            Some(r) if r.end == lv => r.end += 1,
+            _ => out.push(lv..lv + 1),
         }
-        runs.extend(log.copied(start..end));
     }
-    runs
+    out
+}
+
+/// `piece` without `not` (sorted ranges, apart).
+fn minus(piece: std::ops::Range<Lv>, not: &[std::ops::Range<Lv>]) -> Vec<std::ops::Range<Lv>> {
+    let mut out = Vec::new();
+    let mut at = piece.start;
+    let i = not.partition_point(|n| n.end <= piece.start);
+    for n in not[i..].iter().take_while(|n| n.start < piece.end) {
+        if n.start > at {
+            out.push(at..n.start);
+        }
+        at = at.max(n.end);
+    }
+    if at < piece.end {
+        out.push(at..piece.end);
+    }
+    out
 }
 
 #[cfg(test)]

@@ -22,6 +22,7 @@
 //! character. It's rebuilt from the log after a load, as ranges are.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ops::Range;
 
 use crate::anchors::Anchors;
 use crate::ids::Identities;
@@ -40,6 +41,58 @@ pub enum Follow {
     Ambiguous(Vec<usize>),
     /// It's deleted, and no copy of it shows.
     Gone,
+}
+
+/// Something pinned to text in the log (#85).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Pin {
+    /// A comment, by the event that added it.
+    Comment(Lv),
+    /// A range the author defined, by the event that added it.
+    Range(Lv),
+}
+
+/// How a move touched something pinned to text (#85): what the editor
+/// asks about (#79). mamre's own answer, until the editor re-pins it, is to
+/// follow: one wholly inside goes with the text, the others stay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Touch {
+    /// All of it was in the moved text.
+    Inside,
+    /// Some of it was, and some wasn't: it overlaps the moved text, or
+    /// holds it.
+    Partly,
+    /// None of it was, but it ends where the moved text began or begins
+    /// where it ended.
+    Edge,
+}
+
+/// Something pinned to text, and how a move touched it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Touched {
+    pub pin: Pin,
+    pub touch: Touch,
+}
+
+/// How moving `stretches` (positions, sorted and apart) touches `span`.
+pub(crate) fn touch(span: &Range<usize>, stretches: &[Range<usize>]) -> Option<Touch> {
+    if span.is_empty() {
+        // Nothing of its own: at most at an edge.
+        let at = span.start;
+        return stretches
+            .iter()
+            .any(|s| s.start <= at && at <= s.end)
+            .then_some(Touch::Edge);
+    }
+    if stretches.iter().any(|s| s.start <= span.start && span.end <= s.end) {
+        Some(Touch::Inside)
+    } else if stretches.iter().any(|s| s.start < span.end && span.start < s.end) {
+        Some(Touch::Partly)
+    } else if stretches.iter().any(|s| s.end == span.start || span.end == s.start) {
+        Some(Touch::Edge)
+    } else {
+        None
+    }
 }
 
 /// Where a moved item is now: its one copy that shows, if a move carried

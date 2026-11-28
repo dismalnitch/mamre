@@ -175,6 +175,79 @@ fn one_made_while_it_moved_follows() {
     assert_eq!(other.books.comment(c), w.books.comment(c));
 }
 
+// ---- What a move touched (#85) ----
+
+use mamre_egg_walker::{Pin, Touch, Touched};
+
+fn touched(pin: Pin, touch: Touch) -> Touched {
+    Touched { pin, touch }
+}
+
+/// The mover's editor asks before it moves: "two " holds the comment, and
+/// the range on "three" begins where it ends.
+#[test]
+fn the_mover_is_told_what_it_would_touch() {
+    let (_, w, c, r) = three();
+    assert_eq!(
+        w.books.pins_touching(&[4..8]),
+        [touched(Pin::Comment(c), Touch::Inside), touched(Pin::Range(r), Touch::Edge)]
+    );
+    // "e t": part of the comment.
+    assert_eq!(w.books.pins_touching(&[2..5]), [touched(Pin::Comment(c), Touch::Partly)]);
+    // "w": inside the comment, which holds more than what moves.
+    assert_eq!(w.books.pins_touching(&[5..6]), [touched(Pin::Comment(c), Touch::Partly)]);
+    assert_eq!(w.books.pins_touching(&[0..2]), []);
+}
+
+/// The author's editor hears when the move arrives, and again for its undo
+/// and redo.
+#[test]
+fn a_merge_says_what_its_moves_touched() {
+    let (mut log, mut w, c, r) = three();
+    let mut other = Writer::new(&mut log, "other");
+    other.merge(&log, w.books.version());
+    w.move_items(&mut log, 4..8, 13);
+    let (changes, got) = other.books.merge_noting_pins(&log, w.books.version());
+    other.apply(changes);
+    assert_eq!(other.text(), "one threetwo ");
+    assert_eq!(
+        got,
+        [touched(Pin::Comment(c), Touch::Inside), touched(Pin::Range(r), Touch::Edge)]
+    );
+    // Undone here, it's a move back: "two " leaves the end, right after
+    // "three".
+    let back = [touched(Pin::Comment(c), Touch::Inside), touched(Pin::Range(r), Touch::Edge)];
+    let v = w.books.make_undo(&mut log, w.me).unwrap();
+    let (changes, got) = w.books.merge_noting_pins(&log, &v);
+    w.apply(changes);
+    assert_eq!(w.text(), "one two three");
+    assert_eq!(got, back);
+    let (changes, got) = other.books.merge_noting_pins(&log, w.books.version());
+    other.apply(changes);
+    assert_eq!(got, back, "and over there");
+    // And redone.
+    let v = w.books.make_redo(&mut log, w.me).unwrap();
+    let (changes, got) = w.books.merge_noting_pins(&log, &v);
+    w.apply(changes);
+    assert_eq!(w.text(), "one threetwo ");
+    assert_eq!(got, [touched(Pin::Comment(c), Touch::Inside), touched(Pin::Range(r), Touch::Edge)]);
+}
+
+/// Typing, deleting and pasting move nothing, so they touch nothing.
+#[test]
+fn edits_that_arent_moves_touch_nothing() {
+    let (mut log, mut w, _, _) = three();
+    for v in [
+        log.add_insert(w.me, w.books.version(), 5, ['x']),
+        log.add_delete(w.me, w.books.version(), 0..2),
+        log.add_paste(w.me, w.books.version(), 0, &[4, 5, 6]),
+    ] {
+        let (changes, got) = w.books.merge_noting_pins(&log, &v);
+        w.apply(changes);
+        assert_eq!(got, []);
+    }
+}
+
 // ---- Many writers ----
 
 use mamre_egg_walker::{Aside, Follow, Op};
