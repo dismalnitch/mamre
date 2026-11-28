@@ -443,6 +443,16 @@ fn cases(default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+/// [`acts`] with the moves taken out: plain text, section marks and the
+/// bad network, so a failure here can't be the moves' (#61).
+fn acts_without_moves() -> impl Strategy<Value = Vec<Act>> {
+    acts().prop_map(|acts| {
+        acts.into_iter()
+            .filter(|a| !matches!(a, Act::Move(..)))
+            .collect()
+    })
+}
+
 /// The char boundaries of `s`: every byte offset an edit can name.
 fn boundaries(s: &str) -> Vec<usize> {
     s.char_indices().map(|(i, _)| i).chain([s.len()]).collect()
@@ -597,6 +607,20 @@ proptest! {
     /// delivered, all three read the same.
     #[test]
     fn replicas_converge(acts in acts()) {
+        converge(acts)?;
+    }
+}
+
+proptest! {
+    // The default config (256 cases) so `PROPTEST_CASES` can raise it.
+    #![proptest_config(ProptestConfig::default())]
+
+    /// The same, with no moves. Every case kept failing on
+    /// `queue/divergence` has moves in it; this holds the rest to always
+    /// converging, so a failure here is news, not #61. Run it hard with
+    /// `PROPTEST_CASES`: on 27 November, 400,000 cases converged.
+    #[test]
+    fn replicas_converge_without_moves(acts in acts_without_moves()) {
         converge(acts)?;
     }
 }
