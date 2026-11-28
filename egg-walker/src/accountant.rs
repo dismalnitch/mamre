@@ -210,18 +210,40 @@ impl Accountant {
     /// The ranges the author defined that the document shows, by where they
     /// start (see `ranges.rs`).
     pub fn ranges(&self) -> Vec<crate::AuthorRange> {
-        self.ranges.all()
+        self.ranges.all(&|i| self.moved(i))
     }
 
     /// Range `id`, if the document shows it.
     pub fn range(&self, id: Lv) -> Option<crate::AuthorRange> {
-        self.ranges.get(id)
+        self.ranges.get(id, &|i| self.moved(i))
+    }
+
+    /// Where `item` is now, if a move carried it: its one copy that shows.
+    fn moved(&self, item: Lv) -> Option<usize> {
+        match self.moves.follow(&self.anchors, item) {
+            crate::Follow::Moved(pos) => Some(pos),
+            _ => None,
+        }
+    }
+
+    /// Pins the ends of the ranges and comments `events` add, so they can
+    /// follow moves (#85).
+    fn pin_ends<T: Clone>(&mut self, log: &OpLog<T>, events: &[Lv]) {
+        for &lv in events {
+            if let crate::Op::Aside(
+                crate::Aside::RangeAdd { start, end, .. } | crate::Aside::CommentAdd { start, end },
+            ) = log.event(lv).op
+            {
+                for item in [start, end] {
+                    self.moves.pin(&mut self.anchors, &self.ids, item);
+                }
+            }
+        }
     }
 
     /// The ranges covering position `pos`.
     pub fn ranges_at(&self, pos: usize) -> Vec<crate::AuthorRange> {
-        self.ranges
-            .all()
+        self.ranges()
             .into_iter()
             .filter(|r| r.span.contains(&pos))
             .collect()
@@ -229,8 +251,7 @@ impl Accountant {
 
     /// The ranges overlapping positions `span`.
     pub fn ranges_overlapping(&self, span: std::ops::Range<usize>) -> Vec<crate::AuthorRange> {
-        self.ranges
-            .all()
+        self.ranges()
             .into_iter()
             .filter(|r| r.span.start < span.end && span.start < r.span.end)
             .collect()
@@ -239,18 +260,17 @@ impl Accountant {
     /// The comments the document shows, by where they start (see
     /// `comments.rs`): open and resolved, not removed.
     pub fn comments(&self) -> Vec<crate::Comment> {
-        self.comments.all()
+        self.comments.all(&|i| self.moved(i))
     }
 
     /// Comment `id`, if the document shows it.
     pub fn comment(&self, id: Lv) -> Option<crate::Comment> {
-        self.comments.get(id)
+        self.comments.get(id, &|i| self.moved(i))
     }
 
     /// The comments covering position `pos`.
     pub fn comments_at(&self, pos: usize) -> Vec<crate::Comment> {
-        self.comments
-            .all()
+        self.comments()
             .into_iter()
             .filter(|c| c.span.contains(&pos))
             .collect()
@@ -283,6 +303,12 @@ impl Accountant {
         }
         if self.moves.stale {
             self.moves.rebuild(log, &self.version);
+            let all: Vec<Lv> = (0..log.len())
+                .filter(|&lv| {
+                    log.kind(lv) == crate::oplog::Kind::Aside && log.contains(&self.version, lv)
+                })
+                .collect();
+            self.pin_ends(log, &all);
         }
         if self.comments.stale {
             self.comments = crate::comments::Comments::new(self.ids.len());
@@ -313,6 +339,7 @@ impl Accountant {
         self.ranges.take_in(log, &new, &self.ids);
         self.comments.take_in(log, &new, &self.ids);
         self.moves.take_in(&copied, &mut self.anchors, &self.ids);
+        self.pin_ends(log, &new);
         self.version = to;
         self.recent.keep(&self.version, &self.ids.ids, &self.blocks);
         out

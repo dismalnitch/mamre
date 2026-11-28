@@ -42,6 +42,10 @@ pub enum Follow {
     Gone,
 }
 
+/// Where a moved item is now: its one copy that shows, if a move carried
+/// it (#68). `None` if it shows itself, or no single copy does.
+pub(crate) type Moved<'a> = &'a dyn Fn(Lv) -> Option<usize>;
+
 /// Moves' copies, in runs, and why each item is watched.
 #[derive(Clone, Default)]
 pub(crate) struct Moves {
@@ -54,6 +58,9 @@ pub(crate) struct Moves {
     longest: usize,
     /// Items watched for their own sake.
     direct: HashSet<Lv>,
+    /// Ends of ranges and comments: watched for as long as the books are,
+    /// apart from what's watched for its own sake (#85).
+    pinned: HashSet<Lv>,
     /// How many reasons each watched item has: being watched for its own
     /// sake, and each watched item it's a copy of.
     reasons: BTreeMap<Lv, usize>,
@@ -98,6 +105,15 @@ impl Moves {
     /// Watches `item`, the one at `pos` now, for its own sake.
     pub(crate) fn watch(&mut self, anchors: &mut Anchors, ids: &Identities, pos: usize, item: Lv) {
         if self.direct.insert(item) {
+            self.add_reason(anchors, ids, item, Some(pos));
+        }
+    }
+
+    /// Watches `item`, an end of a range or a comment, for as long as the
+    /// books are kept: wherever it is, or deleted.
+    pub(crate) fn pin(&mut self, anchors: &mut Anchors, ids: &Identities, item: Lv) {
+        if self.pinned.insert(item) {
+            let pos = ids.positions(&BTreeSet::from([item])).first().map(|&(_, p)| p);
             self.add_reason(anchors, ids, item, pos);
         }
     }
@@ -109,14 +125,18 @@ impl Moves {
         }
     }
 
-    /// One more reason to watch `item`, at `pos`, and so its copies.
-    fn add_reason(&mut self, anchors: &mut Anchors, ids: &Identities, item: Lv, pos: usize) {
+    /// One more reason to watch `item`, at `pos` (`None`: deleted), and so
+    /// its copies.
+    fn add_reason(&mut self, anchors: &mut Anchors, ids: &Identities, item: Lv, pos: Option<usize>) {
         let n = self.reasons.entry(item).or_insert(0);
         *n += 1;
         if *n > 1 {
             return;
         }
-        anchors.watch(pos, item);
+        match pos {
+            Some(pos) => anchors.watch(pos, item),
+            None => anchors.watch_deleted(item),
+        }
         // Its copies, theirs, and so on: newly watched, placed in one pass
         // (text that was never moved has none, and costs nothing).
         let mut new = BTreeSet::new();
@@ -174,7 +194,8 @@ impl Moves {
     }
 
     /// Rebuilds the copies from every move in the log up to `version`.
-    /// Nothing's watched for its own sake after a load.
+    /// Nothing's watched for its own sake after a load, and nothing's
+    /// pinned until the books pin ranges' and comments' ends again.
     pub(crate) fn rebuild<T: Clone>(&mut self, log: &OpLog<T>, version: &[Lv]) {
         *self = Moves::default();
         let holds = log.closure(version);

@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
 use crate::anchors::Anchors;
+use crate::follow::Moved;
 use crate::ids::Identities;
 use crate::oplog::{Aside, CommentState, Lv, Op, OpLog};
 use crate::walk::Change;
@@ -139,9 +140,19 @@ impl Comments {
         }
     }
 
-    fn view(&self, id: Lv, e: &Entry) -> Option<Comment> {
+    fn view(&self, id: Lv, e: &Entry, moved: Moved) -> Option<Comment> {
         if e.state == CommentState::Removed {
             return None;
+        }
+        // Both ends moved, and still in order: it goes with them (#85).
+        if let (Some(start), Some(end)) = (moved(e.start), moved(e.end))
+            && start <= end
+        {
+            return Some(Comment {
+                id,
+                state: e.state,
+                span: start..end + 1,
+            });
         }
         let start = self.starts.anchors.place_of(e.start)?;
         let end = match self.ends.anchors.position(e.end) {
@@ -155,18 +166,18 @@ impl Comments {
         })
     }
 
-    pub(crate) fn all(&self) -> Vec<Comment> {
+    pub(crate) fn all(&self, moved: Moved) -> Vec<Comment> {
         let mut out: Vec<Comment> = self
             .entries
             .iter()
-            .filter_map(|(&id, e)| self.view(id, e))
+            .filter_map(|(&id, e)| self.view(id, e, moved))
             .collect();
         out.sort_by_key(|c| (c.span.start, c.span.end, c.id));
         out
     }
 
-    pub(crate) fn get(&self, id: Lv) -> Option<Comment> {
-        self.view(id, self.entries.get(&id)?)
+    pub(crate) fn get(&self, id: Lv, moved: Moved) -> Option<Comment> {
+        self.view(id, self.entries.get(&id)?, moved)
     }
 
     pub(crate) fn state(&self, id: Lv) -> Option<CommentState> {

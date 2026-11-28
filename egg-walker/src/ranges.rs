@@ -12,7 +12,9 @@
 //! The [`Accountant`](crate::Accountant) keeps them, as it keeps the
 //! outline: their ends are watched by anchors of their own that fall back
 //! (see `anchors.rs`), so when an end's item is deleted the range ends at
-//! the nearest surviving item inside it, until #33's rule. An end deleted
+//! the nearest surviving item inside it, until #33's rule. A range whose
+//! ends were both moved (#68) goes with them, wherever their copies show
+//! (#85); one only partly moved stays where it was. An end deleted
 //! before this replica showed it has no place, and the range isn't shown
 //! until it comes back.
 //!
@@ -27,6 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
 use crate::anchors::Anchors;
+use crate::follow::Moved;
 use crate::ids::Identities;
 use crate::oplog::{Aside, Lv, Op, OpLog};
 use crate::walk::Change;
@@ -141,8 +144,18 @@ impl Ranges {
     }
 
     /// Where range `id` is now, if it's there and its ends have places.
-    fn view(&self, id: Lv, e: &Entry) -> Option<AuthorRange> {
+    fn view(&self, id: Lv, e: &Entry, moved: Moved) -> Option<AuthorRange> {
         let tag = e.tag.clone()?;
+        // Both ends moved, and still in order: it goes with them (#85).
+        if let (Some(start), Some(end)) = (moved(e.start), moved(e.end))
+            && start <= end
+        {
+            return Some(AuthorRange {
+                id,
+                tag,
+                span: start..end + 1,
+            });
+        }
         let start = self.anchors.place_of(e.start)?;
         let end = match self.anchors.position(e.end) {
             Some(p) => p + 1,
@@ -157,18 +170,18 @@ impl Ranges {
     }
 
     /// Every range shown, by where it starts.
-    pub(crate) fn all(&self) -> Vec<AuthorRange> {
+    pub(crate) fn all(&self, moved: Moved) -> Vec<AuthorRange> {
         let mut out: Vec<AuthorRange> = self
             .entries
             .iter()
-            .filter_map(|(&id, e)| self.view(id, e))
+            .filter_map(|(&id, e)| self.view(id, e, moved))
             .collect();
         out.sort_by_key(|r| (r.span.start, r.span.end, r.id));
         out
     }
 
-    pub(crate) fn get(&self, id: Lv) -> Option<AuthorRange> {
-        self.view(id, self.entries.get(&id)?)
+    pub(crate) fn get(&self, id: Lv, moved: Moved) -> Option<AuthorRange> {
+        self.view(id, self.entries.get(&id)?, moved)
     }
 
     /// Range `id`'s tag as set now (`Some(None)`: removed), if it's known.
