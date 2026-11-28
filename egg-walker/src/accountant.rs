@@ -23,7 +23,7 @@ use crate::anchors::Anchors;
 use crate::blocks::Blocks;
 use crate::ext::{Ghost, SnapshotExt};
 use crate::ids::Identities;
-use crate::oplog::{Aside, Lv, Op, OpLog};
+use crate::oplog::{Aside, Copied, Lv, Op, OpLog};
 use crate::outline::{Ambiguity, Next, Outline, Policies, Policy, Section};
 use crate::recent::Recent;
 use crate::walk::Change;
@@ -125,49 +125,45 @@ impl Accountant {
         self.moves.source(item)
     }
 
-    /// The copies moves made of `item`, in the order they were made.
-    pub fn copies(&self, item: Lv) -> &[Lv] {
+    /// The copies moves made of `item`.
+    pub fn copies(&self, item: Lv) -> Vec<Lv> {
         self.moves.copies_of(item)
     }
 
-    /// The moves `events` (not merged yet) make, undo or redo: each copy
-    /// and its source, from their came-from records and from the deletes
-    /// they undo. For saying a move happened (`mamre-text`'s
-    /// `Edit::Moved`): the merge never needs it.
-    pub fn moves_among<T: Clone>(
-        &self,
-        log: &OpLog<T>,
-        events: std::ops::Range<Lv>,
-    ) -> Vec<(Lv, Lv)> {
-        let mut pairs = Vec::new();
-        let mut lv = events.start;
-        while lv < events.end {
-            let run = log.run_of(lv);
-            let end = run.end().min(events.end);
+    /// The moves `events` (not merged yet) make, undo or redo, in runs:
+    /// from their came-from records, and from the deletes they undo. For
+    /// saying a move happened (`mamre-text`'s `Edit::Moved`): the merge
+    /// never needs it.
+    pub fn moves_among<T: Clone>(&self, log: &OpLog<T>, events: std::ops::Range<Lv>) -> Vec<Copied> {
+        let mut runs = Vec::new();
+        let mut undone = Vec::new();
+        for (first, len, run) in log.run_pieces(events) {
             match &run.op {
                 crate::oplog::RunOp::Aside(_) => {
-                    for x in lv..end {
-                        if let Op::Aside(Aside::CameFrom { copies, sources }) = log.event(x).op {
-                            pairs.extend(copies.into_iter().zip(sources));
+                    for x in first..first + len {
+                        if let Op::Aside(Aside::CameFrom { runs: r }) = log.event(x).op {
+                            runs.extend(r);
                         }
                     }
                 }
                 crate::oplog::RunOp::Undelete { .. } => {
-                    for x in lv..end {
+                    for x in first..first + len {
                         let Some(item) = self.ids.removed(log.undeleted(x)) else {
                             continue;
                         };
                         if let Some(source) = self.moved_from(item) {
-                            pairs.push((item, source));
+                            undone.push((item, source));
                         }
-                        pairs.extend(self.copies(item).iter().map(|&c| (c, item)));
+                        undone.extend(self.copies(item).into_iter().map(|c| (c, item)));
                     }
                 }
                 _ => {}
             }
-            lv = end;
         }
-        pairs
+        undone.sort_unstable();
+        undone.dedup();
+        runs.extend(Copied::runs(undone));
+        runs
     }
 
     /// The sections the document shows, in order: each marked item, where

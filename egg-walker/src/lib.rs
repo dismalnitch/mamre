@@ -94,7 +94,7 @@ pub use anchors::Anchors;
 pub use comments::Comment;
 pub use follow::Follow;
 pub use ids::Identities;
-pub use oplog::{AgentId, Aside, CommentState, Event, Lv, Op, OpLog};
+pub use oplog::{AgentId, Aside, CommentState, Copied, Event, Lv, Op, OpLog};
 pub use outline::{Ambiguity, Next, Policies, Policy, Resolution, Section, Start};
 pub use ranges::AuthorRange;
 pub use walk::{Change, Sequence};

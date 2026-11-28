@@ -106,14 +106,43 @@ pub enum Aside {
     /// Sets range `range`'s tag (`None`: removed). The latest set of a
     /// range wins, in Lamport time, then the order concurrent inserts use.
     RangeSet { range: Lv, tag: Option<String> },
-    /// Inserts `copies` are a move's copies of `sources` (#68): copy *k*
-    /// came from source *k*. A move is a delete and an insert in one step,
-    /// and this says which characters the insert carries on. The merge
-    /// never reads it. What's watched on a moved character follows it to
-    /// its copy (see [`Accountant::follow`](crate::Accountant::follow)),
-    /// and history goes back through it. The copies are one agent's inserts,
-    /// one after another; the sources, any earlier inserts.
-    CameFrom { copies: Vec<Lv>, sources: Vec<Lv> },
+    /// A move's copies, and the inserts each came from (#68), in runs. A
+    /// move is a delete and an insert in one step, and this says which
+    /// characters the insert carries on. The merge never reads it. What's
+    /// watched on a moved character follows it to its copy (see
+    /// [`Accountant::follow`](crate::Accountant::follow)), and history goes
+    /// back through it. The copies, run after run, are one agent's
+    /// inserts, one after another; the sources, any earlier inserts.
+    CameFrom { runs: Vec<Copied> },
+}
+
+/// A run of a move's copies (#68): inserts `copy..copy + len` came from
+/// inserts `source..source + len`, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Copied {
+    pub copy: Lv,
+    pub source: Lv,
+    pub len: usize,
+}
+
+impl Copied {
+    /// Each copy and its source.
+    pub fn pairs(self) -> impl Iterator<Item = (Lv, Lv)> {
+        (0..self.len).map(move |k| (self.copy + k, self.source + k))
+    }
+
+    /// `pairs` (each copy and its source) as runs: pairs that go on from
+    /// the one before join its run.
+    pub fn runs(pairs: impl IntoIterator<Item = (Lv, Lv)>) -> Vec<Copied> {
+        let mut out: Vec<Copied> = Vec::new();
+        for (copy, source) in pairs {
+            match out.last_mut() {
+                Some(r) if r.copy + r.len == copy && r.source + r.len == source => r.len += 1,
+                _ => out.push(Copied { copy, source, len: 1 }),
+            }
+        }
+        out
+    }
 }
 
 /// Where a comment stands.
@@ -167,9 +196,12 @@ impl Aside {
                 range: f(range),
                 tag,
             },
-            Aside::CameFrom { copies, sources } => Aside::CameFrom {
-                copies: copies.into_iter().map(&f).collect(),
-                sources: sources.into_iter().map(&f).collect(),
+            Aside::CameFrom { runs } => Aside::CameFrom {
+                runs: Copied::runs(
+                    runs.into_iter()
+                        .flat_map(Copied::pairs)
+                        .map(|(c, s)| (f(c), f(s))),
+                ),
             },
         }
     }
@@ -508,18 +540,27 @@ impl<T: Clone> OpLog<T> {
         self.add_aside(agent, parents, Aside::CommentAdd { start, end })
     }
 
-    /// Says that inserts `copies` are a move's copies of inserts `sources`,
-    /// in order (#68), in a document at `parents`, as `agent`: the record
+    /// Says that the inserts in `runs` are a move's copies of the inserts
+    /// they name (#68), in a document at `parents`, as `agent`: the record
     /// a move writes after its delete and insert, in the same step. Returns
     /// the version after.
-    pub fn add_came_from(
-        &mut self,
-        agent: AgentId,
-        parents: &[Lv],
-        copies: Vec<Lv>,
-        sources: Vec<Lv>,
-    ) -> Vec<Lv> {
-        self.add_aside(agent, parents, Aside::CameFrom { copies, sources })
+    pub fn add_came_from(&mut self, agent: AgentId, parents: &[Lv], runs: Vec<Copied>) -> Vec<Lv> {
+        self.add_aside(agent, parents, Aside::CameFrom { runs })
+    }
+
+    /// Events `range`, in pieces that each lie in one run: each piece's
+    /// first event, its length, and its run.
+    pub(crate) fn run_pieces(&self, range: Range<Lv>) -> impl Iterator<Item = (Lv, usize, &Run<T>)> {
+        let mut lv = range.start;
+        std::iter::from_fn(move || {
+            (lv < range.end).then(|| {
+                let run = self.run_of(lv);
+                let end = run.end().min(range.end);
+                let piece = (lv, end - lv, run);
+                lv = end;
+                piece
+            })
+        })
     }
 
     /// Sets comment `comment`'s state, in a document at `parents`.
@@ -884,23 +925,33 @@ impl<T: Clone> OpLog<T> {
                     .all(|&&i| i < lv && matches!(self.run_of(i).op, RunOp::Insert { .. })),
                 "a comment's ends are earlier inserts"
             ),
-            Op::Aside(Aside::CameFrom { copies, sources }) => {
-                let insert = |i: Lv| i < lv && matches!(self.run_of(i).op, RunOp::Insert { .. });
+            Op::Aside(Aside::CameFrom { runs }) => {
+                let inserts = |start: Lv, len: usize| {
+                    start + len <= lv
+                        && self
+                            .run_pieces(start..start + len)
+                            .all(|(_, _, run)| matches!(run.op, RunOp::Insert { .. }))
+                };
                 assert!(
-                    !copies.is_empty()
-                        && copies.len() == sources.len()
-                        && copies.iter().chain(sources).all(|&i| insert(i)),
+                    !runs.is_empty()
+                        && runs
+                            .iter()
+                            .all(|r| r.len > 0 && inserts(r.copy, r.len) && inserts(r.source, r.len)),
                     "a came-from pairs earlier inserts, one to one"
                 );
-                let first = self.run_of(copies[0]);
-                let (agent, seq) = (first.agent, first.seq + (copies[0] - first.start) as u64);
-                assert!(
-                    copies.iter().enumerate().all(|(k, &c)| {
-                        let run = self.run_of(c);
-                        run.agent == agent && run.seq + (c - run.start) as u64 == seq + k as u64
-                    }),
-                    "a came-from's copies are one agent's inserts, one after another"
-                );
+                // The copies' (agent, seq), piece by piece, go on one from
+                // the one before.
+                let mut next: Option<(AgentId, u64)> = None;
+                for r in runs {
+                    for (first, len, run) in self.run_pieces(r.copy..r.copy + r.len) {
+                        let seq = run.seq + (first - run.start) as u64;
+                        assert!(
+                            next.is_none_or(|n| n == (run.agent, seq)),
+                            "a came-from's copies are one agent's inserts, one after another"
+                        );
+                        next = Some((run.agent, seq + len as u64));
+                    }
+                }
             }
             Op::Aside(a) if a.comment().is_some() => {
                 let c = a.comment().unwrap();

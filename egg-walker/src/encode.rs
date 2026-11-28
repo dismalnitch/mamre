@@ -610,24 +610,26 @@ impl<T: Clone + Codec> Writer<'_, T> {
                 comment: self.named(*comment),
                 pos: *pos,
             },
-            Aside::CameFrom { copies, sources } => {
+            Aside::CameFrom { runs } => {
                 // The sources in runs of one agent's events, one after
                 // another.
                 let mut from: Vec<ext::NamedRun> = Vec::new();
-                for &s in sources {
-                    let named = self.named(s);
-                    if let Some(last) = from.last_mut()
-                        && last.start.agent == named.agent
-                        && last.start.seq + last.len as u64 == named.seq
-                    {
-                        last.len += 1;
-                    } else {
-                        from.push(ext::NamedRun { start: named, len: 1 });
+                for r in runs {
+                    for (first, len, _) in self.log.run_pieces(r.source..r.source + r.len) {
+                        let named = self.named(first);
+                        if let Some(last) = from.last_mut()
+                            && last.start.agent == named.agent
+                            && last.start.seq + last.len as u64 == named.seq
+                        {
+                            last.len += len;
+                        } else {
+                            from.push(ext::NamedRun { start: named, len });
+                        }
                     }
                 }
                 AsideJson::CameFrom {
-                    first: self.named(copies[0]),
-                    len: copies.len(),
+                    first: self.named(runs[0].copy),
+                    len: runs.iter().map(|r| r.len).sum(),
                     from,
                 }
             }
@@ -1049,7 +1051,9 @@ impl<'a, T: Clone> Planner<'a, T> {
                     .flat_map(|r| (0..r.len).map(move |k| (r, k)))
                     .map(|(r, k)| earlier(&nth(&r.start, k), &insert, NOT_INSERT))
                     .collect::<Result<Vec<_>, _>>()?;
-                Aside::CameFrom { copies, sources }
+                Aside::CameFrom {
+                    runs: crate::Copied::runs(copies.into_iter().zip(sources)),
+                }
             }
         })
     }

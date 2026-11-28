@@ -16,14 +16,15 @@
 //! originals still show, so nothing follows it.
 //!
 //! To know where a copy is, it's watched too, for as long as anything
-//! watched has it among its copies. The record of copies is rebuilt from
-//! the log after a load, as ranges are.
+//! watched has it among its copies. The record of copies is kept in runs,
+//! as the log keeps it: a moved chapter costs a few entries, not one a
+//! character. It's rebuilt from the log after a load, as ranges are.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::anchors::Anchors;
 use crate::ids::Identities;
-use crate::oplog::{Aside, Lv, Op, OpLog};
+use crate::oplog::{Aside, Copied, Lv, Op, OpLog};
 
 /// Where a watched item is, following moves.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,18 +41,21 @@ pub enum Follow {
     Gone,
 }
 
-/// Moves' copies, and why each item is watched.
+/// Moves' copies, in runs, and why each item is watched.
 #[derive(Clone, Default)]
 pub(crate) struct Moves {
-    /// Each moved item's copies, in the order they were made.
-    copies: HashMap<Lv, Vec<Lv>>,
-    /// Each copy's source.
-    sources: HashMap<Lv, Lv>,
+    /// Each run of copies, by its first copy.
+    by_copy: BTreeMap<Lv, Copied>,
+    /// Each run of copies, by its first source. Two moves made at once can
+    /// copy the same sources, in runs that overlap.
+    by_source: BTreeMap<Lv, Vec<Copied>>,
+    /// The longest run: how far back a run holding a source can start.
+    longest: usize,
     /// Items watched for their own sake.
     direct: HashSet<Lv>,
     /// How many reasons each watched item has: being watched for its own
     /// sake, and each watched item it's a copy of.
-    reasons: HashMap<Lv, usize>,
+    reasons: BTreeMap<Lv, usize>,
     /// Read from a file: rebuilt from the log before it's next used.
     pub(crate) stale: bool,
 }
@@ -64,14 +68,30 @@ impl Moves {
         }
     }
 
+    fn add_run(&mut self, run: Copied) {
+        self.by_copy.insert(run.copy, run);
+        self.by_source.entry(run.source).or_default().push(run);
+        self.longest = self.longest.max(run.len);
+    }
+
+    /// The runs holding `source` among their sources.
+    fn runs_from(&self, source: Lv) -> impl Iterator<Item = &Copied> {
+        let from = (source + 1).saturating_sub(self.longest);
+        self.by_source
+            .range(from..=source)
+            .flat_map(|(_, runs)| runs)
+            .filter(move |r| source < r.source + r.len)
+    }
+
     /// The source copy `item` came from, if a move made it.
     pub(crate) fn source(&self, item: Lv) -> Option<Lv> {
-        self.sources.get(&item).copied()
+        let (_, r) = self.by_copy.range(..=item).next_back()?;
+        (item < r.copy + r.len).then(|| r.source + (item - r.copy))
     }
 
     /// The copies moves made of `item`.
-    pub(crate) fn copies_of(&self, item: Lv) -> &[Lv] {
-        self.copies.get(&item).map_or(&[], Vec::as_slice)
+    pub(crate) fn copies_of(&self, item: Lv) -> Vec<Lv> {
+        self.runs_from(item).map(|r| r.copy + (item - r.source)).collect()
     }
 
     /// Watches `item`, the one at `pos` now, for its own sake.
@@ -99,13 +119,13 @@ impl Moves {
         // Its copies, theirs, and so on: newly watched, placed in one pass
         // (text that was never moved has none, and costs nothing).
         let mut new = BTreeSet::new();
-        let mut todo: Vec<Lv> = self.copies.get(&item).into_iter().flatten().copied().collect();
+        let mut todo = self.copies_of(item);
         while let Some(x) = todo.pop() {
             let n = self.reasons.entry(x).or_insert(0);
             *n += 1;
             if *n == 1 {
                 new.insert(x);
-                todo.extend(self.copies.get(&x).into_iter().flatten());
+                todo.extend(self.copies_of(x));
             }
         }
         place(anchors, ids, &new);
@@ -122,7 +142,7 @@ impl Moves {
             if *n == 0 {
                 self.reasons.remove(&x);
                 anchors.unwatch(x);
-                todo.extend(self.copies.get(&x).into_iter().flatten());
+                todo.extend(self.copies_of(x));
             }
         }
     }
@@ -138,14 +158,20 @@ impl Moves {
     ) {
         let mut new = BTreeSet::new();
         for &lv in events {
-            let Op::Aside(Aside::CameFrom { copies, sources }) = log.event(lv).op else {
+            let Op::Aside(Aside::CameFrom { runs }) = log.event(lv).op else {
                 continue;
             };
-            for (&c, &s) in copies.iter().zip(&sources) {
-                self.copies.entry(s).or_default().push(c);
-                self.sources.insert(c, s);
-                if self.reasons.contains_key(&s) {
-                    // Watched through its source: one reason, from it.
+            for run in runs {
+                self.add_run(run);
+                // The watched among its sources: each gives its copy a
+                // reason, from it.
+                let watched: Vec<Lv> = self
+                    .reasons
+                    .range(run.source..run.source + run.len)
+                    .map(|(&s, _)| s)
+                    .collect();
+                for s in watched {
+                    let c = run.copy + (s - run.source);
                     let n = self.reasons.entry(c).or_insert(0);
                     *n += 1;
                     if *n == 1 {
@@ -162,11 +188,15 @@ impl Moves {
     pub(crate) fn rebuild<T: Clone>(&mut self, log: &OpLog<T>, version: &[Lv]) {
         *self = Moves::default();
         let holds = log.closure(version);
-        for lv in (0..log.len()).filter(|&lv| holds[lv]) {
-            if let Op::Aside(Aside::CameFrom { copies, sources }) = log.event(lv).op {
-                for (c, s) in copies.into_iter().zip(sources) {
-                    self.copies.entry(s).or_default().push(c);
-                    self.sources.insert(c, s);
+        for (first, len, run) in log.run_pieces(0..log.len()) {
+            if !matches!(run.op, crate::oplog::RunOp::Aside(_)) {
+                continue;
+            }
+            for lv in (first..first + len).filter(|&lv| holds[lv]) {
+                if let Op::Aside(Aside::CameFrom { runs }) = log.event(lv).op {
+                    for run in runs {
+                        self.add_run(run);
+                    }
                 }
             }
         }
@@ -178,11 +208,11 @@ impl Moves {
             return Follow::Here(pos);
         }
         let mut found = Vec::new();
-        let mut todo: Vec<Lv> = self.copies.get(&item).into_iter().flatten().copied().collect();
+        let mut todo = self.copies_of(item);
         while let Some(x) = todo.pop() {
             match anchors.position(x) {
                 Some(pos) => found.push(pos),
-                None => todo.extend(self.copies.get(&x).into_iter().flatten()),
+                None => todo.extend(self.copies_of(x)),
             }
         }
         found.sort_unstable();

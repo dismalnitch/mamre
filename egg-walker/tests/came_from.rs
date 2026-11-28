@@ -2,7 +2,7 @@
 //! files, a malformed one is refused, and what's watched on moved
 //! characters follows them.
 
-use mamre_egg_walker::{Accountant, Aside, Follow, Lv, Op, OpLog};
+use mamre_egg_walker::{Accountant, Aside, Copied, Follow, Lv, Op, OpLog};
 
 /// "abcdef", then "bc" moved to the end as a delete, an insert and its
 /// record: the log, and the version after.
@@ -13,8 +13,35 @@ fn moved() -> (OpLog<char>, Vec<Lv>) {
     let v = log.add_delete(a, &v, 1..3);
     let first = log.len();
     let v = log.add_insert(a, &v, 4, "bc".chars());
-    let v = log.add_came_from(a, &v, vec![first, first + 1], vec![1, 2]);
+    let v = log.add_came_from(a, &v, run(first, 1, 2));
     (log, v)
+}
+
+/// Copies `copy..` of sources `source..`, `len` of them.
+fn run(copy: Lv, source: Lv, len: usize) -> Vec<Copied> {
+    vec![Copied { copy, source, len }]
+}
+
+/// Sources in two runs, one agent's then another's, come back as they went.
+#[test]
+fn sources_in_runs_round_trip() {
+    let mut log = OpLog::new();
+    let (a, b) = (log.agent("a"), log.agent("b"));
+    let v = log.add_insert(a, &[], 0, "ab".chars());
+    let v = log.add_insert(b, &v, 2, "cd".chars());
+    let v = log.add_insert(a, &v, 4, "ef".chars());
+    // "bcde" moved to the front: sources 1, 2..4 (b's), 4.
+    let v = log.add_delete(a, &v, 1..5);
+    let first = log.len();
+    let v = log.add_insert(a, &v, 0, "bcde".chars());
+    let runs = Copied::runs((first..first + 4).zip([1, 2, 3, 4]));
+    assert_eq!(runs.len(), 1, "lvs one after another join, whoever made them");
+    log.add_came_from(a, &v, runs.clone());
+    let mut bytes = Vec::new();
+    log.encode_chunk(0..log.len(), &mut bytes);
+    let mut back = OpLog::<char>::new();
+    assert_eq!(back.decode_chunk(&bytes), Ok(log.len()));
+    assert_eq!(back.event(log.len() - 1).op, Op::Aside(Aside::CameFrom { runs }));
 }
 
 fn text(books: &mut Accountant, log: &OpLog<char>, to: &[Lv], doc: &mut Vec<char>) -> String {
@@ -35,8 +62,11 @@ fn it_round_trips_in_a_chunk() {
     assert_eq!(
         back.event(last).op,
         Op::Aside(Aside::CameFrom {
-            copies: vec![8, 9],
-            sources: vec![1, 2]
+            runs: vec![Copied {
+                copy: 8,
+                source: 1,
+                len: 2
+            }]
         })
     );
 }
@@ -51,7 +81,7 @@ fn its_sources_can_be_another_agents() {
     let v = log.add_delete(b, &v, 1..3);
     let first = log.len();
     let v = log.add_insert(b, &v, 0, "bc".chars());
-    log.add_came_from(b, &v, vec![first, first + 1], vec![1, 2]);
+    log.add_came_from(b, &v, run(first, 1, 2));
     let mut bytes = Vec::new();
     log.encode_chunk(0..log.len(), &mut bytes);
     let mut back = OpLog::<char>::new();
@@ -114,7 +144,7 @@ fn a_watched_character_follows_its_copy() {
     let v = log.add_insert(a, &v, 4, "bc".chars());
     assert_eq!(text(&mut books, &log, &v, &mut doc), "adefbc");
     assert_eq!(books.follow(c), Follow::Gone, "not yet: no record");
-    let v = log.add_came_from(a, &v, vec![first, first + 1], vec![1, 2]);
+    let v = log.add_came_from(a, &v, run(first, 1, 2));
     text(&mut books, &log, &v, &mut doc);
     assert_eq!(books.follow(c), Follow::Moved(5));
     assert_eq!(books.moved_from(first + 1), Some(c));
@@ -136,7 +166,7 @@ fn two_copies_shown_are_ambiguous() {
         let v = log.add_delete(w, &base, 1..2);
         let first = log.len();
         let v = log.add_insert(w, &v, to, ['y']);
-        log.add_came_from(w, &v, vec![first], vec![1])
+        log.add_came_from(w, &v, run(first, 1, 1))
     };
     let va = move_y(a, 0);
     let vb = move_y(b, 2);
@@ -163,4 +193,30 @@ fn it_follows_after_a_load() {
     text(&mut books, &loaded.log, &version, &mut doc);
     assert_eq!(doc.iter().collect::<String>(), "adefbc");
     assert_eq!(books.moved_from(9), Some(2));
+}
+
+/// A big move costs a run, not a character (#76): the record of a
+/// chapter's worth of moved text is one entry, and lookups into its middle
+/// work.
+#[test]
+fn a_big_move_is_one_run() {
+    let n = 200_000;
+    let mut log = OpLog::new();
+    let a = log.agent("a");
+    let mut books = Accountant::new();
+    let mut doc = Vec::new();
+    let v = log.add_insert(a, &[], 0, std::iter::repeat_n('x', n + 1));
+    text(&mut books, &log, &v, &mut doc);
+    let watched = books.watch(n / 2);
+    let v = log.add_delete(a, &v, 0..n);
+    let first = log.len();
+    let v = log.add_insert(a, &v, 1, std::iter::repeat_n('x', n));
+    let runs = Copied::runs((first..first + n).zip(0..n));
+    assert_eq!(runs.len(), 1);
+    let v = log.add_came_from(a, &v, runs);
+    text(&mut books, &log, &v, &mut doc);
+    assert_eq!(books.follow(watched), Follow::Moved(1 + n / 2));
+    assert_eq!(books.moved_from(first + n - 1), Some(n - 1));
+    assert_eq!(books.copies(0), [first]);
+    assert_eq!(books.moved_from(first + n), None, "past the run");
 }

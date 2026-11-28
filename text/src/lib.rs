@@ -36,12 +36,12 @@
 //!
 //! - Peers aren't checked for honesty (#9): only talk to ones you trust.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 
 use mamre_egg_walker::sync::Message;
-use mamre_egg_walker::{Accountant, AgentId, Change, Follow, Lv, OpLog, Sequence, file};
+use mamre_egg_walker::{Accountant, AgentId, Change, Copied, Follow, Lv, OpLog, Sequence, file};
 use mamre_rope::Measure;
 pub use mamre_rope::{Plain, Rope, Unit, Units};
 
@@ -372,6 +372,56 @@ fn through(mut at: usize, edits: &[Edit]) -> usize {
     at
 }
 
+/// A run of copies' two sides: the copies, and their sources.
+fn sides(r: Copied) -> [Range<Lv>; 2] {
+    [r.copy..r.copy + r.len, r.source..r.source + r.len]
+}
+
+/// Which of `range`'s items `pieces` (sorted, apart) hold: offsets into
+/// it, sorted and apart.
+fn offsets(pieces: &[(Range<Lv>, usize)], range: &Range<Lv>) -> Vec<Range<usize>> {
+    pieces
+        .iter()
+        .filter_map(|(p, _)| {
+            let (a, b) = (p.start.max(range.start), p.end.min(range.end));
+            (a < b).then(|| a - range.start..b - range.start)
+        })
+        .collect()
+}
+
+/// `a` without `b`: both sorted and apart.
+fn minus(a: &[Range<usize>], b: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    for r in a {
+        let mut start = r.start;
+        for x in b.iter().filter(|x| x.start < r.end && x.end > r.start) {
+            if x.start > start {
+                out.push(start..x.start);
+            }
+            start = start.max(x.end);
+        }
+        if start < r.end {
+            out.push(start..r.end);
+        }
+    }
+    out
+}
+
+/// What `a` and `b` (sorted, apart) both hold.
+fn and(a: &[Range<usize>], b: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    for r in a {
+        for x in b {
+            let (s, e) = (r.start.max(x.start), r.end.min(x.end));
+            if s < e {
+                out.push(s..e);
+            }
+        }
+    }
+    out.sort_unstable_by_key(|r| r.start);
+    out
+}
+
 /// Puts the CRDT's `changes` into the rope and markers: the edits they
 /// make.
 fn apply<M: Measure>(
@@ -500,10 +550,11 @@ impl<M: Measure> Text<M> {
     /// merged yet: the moves among them, undone or redone, are hinted
     /// ([`Edit::Moved`]).
     fn catch_up_hinting(&mut self, fresh: Lv, to: &[Lv]) -> Vec<Edit> {
-        let pairs = self.books.moves_among(&self.log, fresh..self.log.len());
-        let before = self.shown_bytes(pairs.iter().flat_map(|&(c, s)| [c, s]));
+        let runs = self.books.moves_among(&self.log, fresh..self.log.len());
+        let sides: Vec<Range<Lv>> = runs.iter().flat_map(|&r| sides(r)).collect();
+        let before = self.bytes_shown(&sides);
         let mut edits = self.catch_up(to);
-        let hints = self.hints(&pairs, &before, &edits);
+        let hints = self.hints(&runs, &before, &edits);
         edits.extend(hints);
         edits
     }
@@ -513,67 +564,88 @@ impl<M: Measure> Text<M> {
         self.rope.char_to_offset(self.markers.to_char(pos))
     }
 
-    /// Where each of `items` that shows starts, in bytes.
-    fn shown_bytes(&self, items: impl IntoIterator<Item = Lv>) -> HashMap<Lv, usize> {
-        let items: BTreeSet<Lv> = items.into_iter().collect();
+    /// The pieces of `items` that show, each with the byte it starts at.
+    fn bytes_shown(&self, items: &[Range<Lv>]) -> Vec<(Range<Lv>, usize)> {
         if items.is_empty() {
-            return HashMap::new();
+            return Vec::new();
         }
         self.books
             .identities()
-            .positions(&items)
+            .shown(items)
             .into_iter()
-            .map(|(item, pos)| (item, self.byte_of(pos)))
+            .map(|(r, pos)| (r, self.byte_of(pos)))
             .collect()
     }
 
-    /// The moves `pairs` (each copy and its source) made, now `edits` are
-    /// made: a side that showed `before` and doesn't now, whose other side
-    /// shows now and didn't, went there. One hint for each run of what
-    /// arrived, in the text as `edits` leave it.
-    fn hints(&self, pairs: &[(Lv, Lv)], before: &HashMap<Lv, usize>, edits: &[Edit]) -> Vec<Edit> {
-        if pairs.is_empty() {
+    /// The bytes inserts `items` hold.
+    fn item_bytes(&self, items: Range<Lv>) -> usize {
+        items
+            .map(|x| match self.log.event(x).op {
+                mamre_egg_walker::Op::Insert {
+                    item: Piece::Char(c),
+                    ..
+                } => c.len_utf8(),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// The moves `runs` made, now `edits` are made: of each run, a side
+    /// that showed `before` (pieces, with their bytes) and doesn't now,
+    /// whose other side shows now and didn't, went there. One hint for
+    /// each stretch of what arrived, in the text as `edits` leave it.
+    fn hints(&self, runs: &[Copied], before: &[(Range<Lv>, usize)], edits: &[Edit]) -> Vec<Edit> {
+        if runs.is_empty() {
             return Vec::new();
         }
-        let ids = self.books.identities();
-        let all: BTreeSet<Lv> = pairs.iter().flat_map(|&(c, s)| [c, s]).collect();
-        let now: HashMap<Lv, usize> = ids.positions(&all).into_iter().collect();
-        // Each item that arrived (by where it is now), and the byte where
-        // the one it stands for was.
-        let mut arrived: Vec<(usize, usize)> = Vec::new();
-        for &(c, s) in pairs {
-            for (gone, came) in [(s, c), (c, s)] {
-                if let (Some(&was), None, Some(&pos), false) = (
-                    before.get(&gone),
-                    now.get(&gone),
-                    now.get(&came),
-                    before.contains_key(&came),
-                ) {
-                    arrived.push((pos, was));
+        let all: Vec<Range<Lv>> = runs.iter().flat_map(|&r| sides(r)).collect();
+        let now = self.books.identities().shown(&all);
+        let mut out: Vec<(usize, Range<usize>)> = Vec::new();
+        for &r in runs {
+            let [cp, src] = sides(r);
+            for (gone, came) in [(src.clone(), cp.clone()), (cp, src)] {
+                let arrived = and(
+                    &minus(&offsets(before, &gone), &offsets(&now, &gone)),
+                    &minus(&offsets(&now, &came), &offsets(before, &came)),
+                );
+                for k in arrived {
+                    let want = came.start + k.start..came.start + k.end;
+                    for (piece, pos) in &now {
+                        let (a, b) = (piece.start.max(want.start), piece.end.min(want.end));
+                        if a >= b {
+                            continue;
+                        }
+                        let first = pos + (a - piece.start);
+                        let to = self.byte_of(first)..self.byte_of(first + (b - a));
+                        // Where the side that went was: its piece's byte,
+                        // and what of the piece came before it.
+                        let x = gone.start + (a - came.start);
+                        let (p, byte) = before
+                            .iter()
+                            .find(|(p, _)| p.contains(&x))
+                            .expect("what went showed before");
+                        let was = byte + self.item_bytes(p.start..x);
+                        if !to.is_empty() {
+                            out.push((through(was, edits), to));
+                        }
+                    }
                 }
             }
         }
-        arrived.sort_unstable();
-        arrived.dedup_by_key(|&mut (pos, _)| pos);
-        let mut out = Vec::new();
-        let mut k = 0;
-        while k < arrived.len() {
-            let (first, was) = arrived[k];
-            let mut last = first;
-            while k + 1 < arrived.len() && arrived[k + 1].0 == last + 1 {
-                k += 1;
-                last += 1;
-            }
-            k += 1;
-            let to = self.byte_of(first)..self.byte_of(last + 1);
-            if !to.is_empty() {
-                out.push(Edit::Moved {
-                    from: through(was, edits),
-                    to,
-                });
+        // Pieces of one move, split into runs, join up.
+        out.sort_unstable_by_key(|(from, to)| (to.start, to.end, *from));
+        out.dedup();
+        let mut joined: Vec<(usize, Range<usize>)> = Vec::new();
+        for (from, to) in out {
+            match joined.last_mut() {
+                Some((f, t)) if t.end == to.start && *f == from => t.end = to.end,
+                _ => joined.push((from, to)),
             }
         }
-        out
+        joined
+            .into_iter()
+            .map(|(from, to)| Edit::Moved { from, to })
+            .collect()
     }
 
     /// Runs `f` as one step: one undo, unless it's inside a group the
@@ -855,7 +927,12 @@ impl<M: Measure> Text<M> {
             text.push_str(chunk);
         }
         let pieces = self.markers.pieces_in(items.clone(), text.chars());
-        let before = self.shown_bytes(sources.iter().copied());
+        let before = self.bytes_shown(
+            &Copied::runs(sources.iter().map(|&s| (s, s)))
+                .into_iter()
+                .map(|r| r.source..r.source + r.len)
+                .collect::<Vec<_>>(),
+        );
         let mut edits = Vec::new();
         for &(k, _) in &marks {
             let v = self
@@ -877,15 +954,10 @@ impl<M: Measure> Text<M> {
             .log
             .add_insert(self.me, self.books.version(), at, pieces);
         edits.extend(self.catch_up(&v));
-        let copies: Vec<Lv> = (first..first + items.len()).collect();
-        let pairs: Vec<(Lv, Lv)> = copies
-            .iter()
-            .copied()
-            .zip(sources.iter().copied())
-            .collect();
+        let runs = Copied::runs((first..first + items.len()).zip(sources));
         let v = self
             .log
-            .add_came_from(self.me, self.books.version(), copies, sources);
+            .add_came_from(self.me, self.books.version(), runs.clone());
         edits.extend(self.catch_up(&v));
         for &(k, level) in &marks {
             let v = self
@@ -893,7 +965,7 @@ impl<M: Measure> Text<M> {
                 .add_mark(self.me, self.books.version(), at + k, level);
             edits.extend(self.catch_up(&v));
         }
-        let hints = self.hints(&pairs, &before, &edits);
+        let hints = self.hints(&runs, &before, &edits);
         edits.extend(hints);
         edits
     }

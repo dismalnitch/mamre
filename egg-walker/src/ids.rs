@@ -131,6 +131,37 @@ impl Identities {
         out
     }
 
+    /// The pieces of `items` (runs of events, which may overlap) that the
+    /// document shows: each piece once, with where its first item is, in
+    /// event order. One pass over the runs.
+    pub fn shown(&self, items: &[std::ops::Range<Lv>]) -> Vec<(std::ops::Range<Lv>, usize)> {
+        let mut want: Vec<std::ops::Range<Lv>> =
+            items.iter().filter(|r| !r.is_empty()).cloned().collect();
+        want.sort_unstable_by_key(|r| r.start);
+        let mut union: Vec<std::ops::Range<Lv>> = Vec::new();
+        for r in want {
+            match union.last_mut() {
+                Some(u) if r.start <= u.end => u.end = u.end.max(r.end),
+                _ => union.push(r),
+            }
+        }
+        let mut out = Vec::new();
+        if union.is_empty() {
+            return out;
+        }
+        let mut pos = 0;
+        for run in self.ids.runs() {
+            let i = union.partition_point(|u| u.end <= run.start);
+            for u in union[i..].iter().take_while(|u| u.start < run.end) {
+                let (a, b) = (u.start.max(run.start), u.end.min(run.end));
+                out.push((a..b, pos + (a - run.start)));
+            }
+            pos += run.len();
+        }
+        out.sort_unstable_by_key(|(r, _)| r.start);
+        out
+    }
+
     /// The item delete `delete` removed, if it's remembered.
     pub fn removed(&self, delete: Lv) -> Option<Lv> {
         self.removed.get(&delete).copied()
