@@ -18,9 +18,9 @@
 //! undoes, and the item comes back as itself. So anything pinned to an item
 //! (ink, a comment) finds it again, here or on any other replica.
 //!
-//! A move is a delete and an insert in one undo step, with a
-//! [`CameFrom`](Aside::CameFrom) record naming what the insert carries on
-//! (#68): what's watched on the old items follows the new ones
+//! A move is a delete and a paste of what it deleted, in one undo step
+//! (#68): the paste's lineage names what each copy carries on, and what's
+//! watched on the old items follows the new ones
 //! ([`Accountant::follow`]). Range moves that keep identity
 //! ([`OpLog::add_move`]) are research, off the path to shipping.
 //!

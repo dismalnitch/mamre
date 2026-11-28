@@ -272,26 +272,6 @@ impl Markers {
         })
     }
 
-    /// The pieces at item positions `items`, given `chars`, the characters
-    /// among them, in order.
-    pub(crate) fn pieces_in(
-        &self,
-        items: Range<usize>,
-        chars: impl Iterator<Item = char>,
-    ) -> Vec<Piece> {
-        let mut chars = chars;
-        let mut next = self.before(items.start);
-        items
-            .map(|pos| match self.all.get(next) {
-                Some(m) if m.pos == pos => {
-                    next += 1;
-                    m.piece
-                }
-                _ => Piece::Char(chars.next().expect("a character at every other position")),
-            })
-            .collect()
-    }
-
     /// The isolates the markers make, in order of where they open, each
     /// before the ones nested in it; and the ones that lost. A marker
     /// without its other half, or a pair in the wrong order, makes none.

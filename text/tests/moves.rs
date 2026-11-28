@@ -1,6 +1,6 @@
-//! Moves as a delete and an insert (#68): the moved text is new
+//! Moves as a delete and a paste (#68): the moved text is new
 //! characters, and what's on the old ones (carets, sections, paragraph
-//! kinds) follows them by the came-from record, here and on every other
+//! kinds) follows them by the paste's lineage, here and on every other
 //! replica. Undo brings back the originals, and with them where everything
 //! was.
 
@@ -234,7 +234,7 @@ fn text_moved_twice_is_followed_twice() {
 }
 
 /// A caret made in the range at the same moment as the move: the move's
-/// record names characters, not carets, so it follows too.
+/// lineage names characters, not carets, so it follows too.
 #[test]
 fn a_caret_made_while_it_moved_follows() {
     let (mut a, mut b) = (Replica::new("a"), Replica::new("b"));

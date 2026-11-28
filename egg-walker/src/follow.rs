@@ -1,9 +1,9 @@
 //! Following moved text (#68): what's watched on a character goes with it
 //! when a move carries it somewhere else.
 //!
-//! A move is a delete and an insert in one step, and a
-//! [`CameFrom`](crate::Aside::CameFrom) record pairs each copy with the
-//! character it carries on. The merge never reads that record; this does.
+//! A move is a delete and a paste of what it deleted, in one step, and the
+//! paste's lineage (#36) pairs each copy with the character it carries on.
+//! The merge never reads lineage; this does.
 //! A watched character that's deleted follows its copies: if exactly one
 //! of them shows (or one of theirs, for text moved again), that's where it
 //! is now. Every replica works it out from the log alone, so none can
@@ -12,8 +12,9 @@
 //!
 //! Undoing the move brings the originals back as themselves (undo revives
 //! deleted items) and deletes the copies, so what's watched is found on
-//! the originals again, exactly. A paste is a copy without the delete: the
-//! originals still show, so nothing follows it.
+//! the originals again, exactly. A paste on its own moves nothing: the
+//! originals still show, so nothing follows it. Cut and pasted later, in
+//! two steps, it's a move like any other.
 //!
 //! To know where a copy is, it's watched too, for as long as anything
 //! watched has it among its copies. The record of copies is kept in runs,
@@ -24,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::anchors::Anchors;
 use crate::ids::Identities;
-use crate::oplog::{Aside, Copied, Lv, Op, OpLog};
+use crate::oplog::{Copied, Lv, OpLog};
 
 /// Where a watched item is, following moves.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,36 +148,25 @@ impl Moves {
         }
     }
 
-    /// Takes in the moves among `events` (asides, in order): their copies
-    /// are watched wherever their sources are.
-    pub(crate) fn take_in<T: Clone>(
-        &mut self,
-        log: &OpLog<T>,
-        events: &[Lv],
-        anchors: &mut Anchors,
-        ids: &Identities,
-    ) {
+    /// Takes in newly merged copies, `runs`: they're watched wherever
+    /// their sources are.
+    pub(crate) fn take_in(&mut self, runs: &[Copied], anchors: &mut Anchors, ids: &Identities) {
         let mut new = BTreeSet::new();
-        for &lv in events {
-            let Op::Aside(Aside::CameFrom { runs }) = log.event(lv).op else {
-                continue;
-            };
-            for run in runs {
-                self.add_run(run);
-                // The watched among its sources: each gives its copy a
-                // reason, from it.
-                let watched: Vec<Lv> = self
-                    .reasons
-                    .range(run.source..run.source + run.len)
-                    .map(|(&s, _)| s)
-                    .collect();
-                for s in watched {
-                    let c = run.copy + (s - run.source);
-                    let n = self.reasons.entry(c).or_insert(0);
-                    *n += 1;
-                    if *n == 1 {
-                        new.insert(c);
-                    }
+        for &run in runs {
+            self.add_run(run);
+            // The watched among its sources: each gives its copy a reason,
+            // from it.
+            let watched: Vec<Lv> = self
+                .reasons
+                .range(run.source..run.source + run.len)
+                .map(|(&s, _)| s)
+                .collect();
+            for s in watched {
+                let c = run.copy + (s - run.source);
+                let n = self.reasons.entry(c).or_insert(0);
+                *n += 1;
+                if *n == 1 {
+                    new.insert(c);
                 }
             }
         }
@@ -188,16 +178,9 @@ impl Moves {
     pub(crate) fn rebuild<T: Clone>(&mut self, log: &OpLog<T>, version: &[Lv]) {
         *self = Moves::default();
         let holds = log.closure(version);
-        for (first, len, run) in log.run_pieces(0..log.len()) {
-            if !matches!(run.op, crate::oplog::RunOp::Aside(_)) {
-                continue;
-            }
-            for lv in (first..first + len).filter(|&lv| holds[lv]) {
-                if let Op::Aside(Aside::CameFrom { runs }) = log.event(lv).op {
-                    for run in runs {
-                        self.add_run(run);
-                    }
-                }
+        for run in log.copied(0..log.len()) {
+            for run in Copied::runs(run.pairs().filter(|&(c, _)| holds[c])) {
+                self.add_run(run);
             }
         }
     }

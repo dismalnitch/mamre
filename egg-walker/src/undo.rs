@@ -247,10 +247,6 @@ impl Accountant {
                 // A body's edits aren't undone with the step yet: its
                 // undo needs undeletes of body deletes (a follow-up).
                 Op::Aside(Aside::BodyInsert { .. } | Aside::BodyDelete { .. }) => {}
-                // What a move's copies came from: undoing the move's
-                // delete and insert brings back the originals, which are
-                // then what's watched on them follows.
-                Op::Aside(Aside::CameFrom { .. }) => {}
             }
         }
         let start = log.next_seq[agent.index()];

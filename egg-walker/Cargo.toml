@@ -15,7 +15,7 @@ publish = false
 # builds never run them anyway.
 perf = []
 # Range moves with identity (#20): research, off the path to shipping since
-# #68 (a move is a delete, an insert and a came-from record). The engine
+# #68 (a move is a delete and a paste of what it deleted). The engine
 # still reads them, from older histories; their own tests (moves, copies,
 # undo_moves), which keep finding divergences (#61), run only with this.
 range-moves = []

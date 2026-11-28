@@ -906,8 +906,8 @@ impl<M: Measure> Text<M> {
     }
 
     /// Moves the items at `items` to item position `to` (before the move,
-    /// outside them): a delete and an insert of the same items, then a
-    /// came-from record, so what's watched on them follows (#68). Section
+    /// outside them): a delete, and a paste of what it deleted, whose
+    /// lineage is what's watched on them follows (#68). Section
     /// marks on them are taken off the originals and put on the copies.
     /// The caller makes it one step.
     fn move_items(&mut self, items: Range<usize>, to: usize) -> Vec<Edit> {
@@ -920,13 +920,6 @@ impl<M: Measure> Text<M> {
             .enumerate()
             .filter_map(|(k, &s)| Some((k, self.books.level(s))).filter(|&(_, l)| l > 0))
             .collect();
-        let bytes = self.rope.char_to_offset(self.markers.to_char(items.start))
-            ..self.rope.char_to_offset(self.markers.to_char(items.end));
-        let mut text = String::with_capacity(bytes.len());
-        for chunk in self.rope.slice(bytes).chunks() {
-            text.push_str(chunk);
-        }
-        let pieces = self.markers.pieces_in(items.clone(), text.chars());
         let before = self.bytes_shown(
             &Copied::runs(sources.iter().map(|&s| (s, s)))
                 .into_iter()
@@ -952,13 +945,9 @@ impl<M: Measure> Text<M> {
         let first = self.log.len();
         let v = self
             .log
-            .add_insert(self.me, self.books.version(), at, pieces);
+            .add_paste(self.me, self.books.version(), at, &sources);
         edits.extend(self.catch_up(&v));
-        let runs = Copied::runs((first..first + items.len()).zip(sources));
-        let v = self
-            .log
-            .add_came_from(self.me, self.books.version(), runs.clone());
-        edits.extend(self.catch_up(&v));
+        let runs = self.log.copied(first..first + items.len());
         for &(k, level) in &marks {
             let v = self
                 .log

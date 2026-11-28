@@ -23,7 +23,7 @@ use crate::anchors::Anchors;
 use crate::blocks::Blocks;
 use crate::ext::{Ghost, SnapshotExt};
 use crate::ids::Identities;
-use crate::oplog::{Aside, Copied, Lv, Op, OpLog};
+use crate::oplog::{Copied, Lv, OpLog};
 use crate::outline::{Ambiguity, Next, Outline, Policies, Policy, Section};
 use crate::recent::Recent;
 use crate::walk::Change;
@@ -131,33 +131,24 @@ impl Accountant {
     }
 
     /// The moves `events` (not merged yet) make, undo or redo, in runs:
-    /// from their came-from records, and from the deletes they undo. For
+    /// from their pastes' lineage, and from the deletes they undo. For
     /// saying a move happened (`mamre-text`'s `Edit::Moved`): the merge
     /// never needs it.
     pub fn moves_among<T: Clone>(&self, log: &OpLog<T>, events: std::ops::Range<Lv>) -> Vec<Copied> {
-        let mut runs = Vec::new();
+        let mut runs = log.copied(events.clone());
         let mut undone = Vec::new();
         for (first, len, run) in log.run_pieces(events) {
-            match &run.op {
-                crate::oplog::RunOp::Aside(_) => {
-                    for x in first..first + len {
-                        if let Op::Aside(Aside::CameFrom { runs: r }) = log.event(x).op {
-                            runs.extend(r);
-                        }
-                    }
+            if !matches!(run.op, crate::oplog::RunOp::Undelete { .. }) {
+                continue;
+            }
+            for x in first..first + len {
+                let Some(item) = self.ids.removed(log.undeleted(x)) else {
+                    continue;
+                };
+                if let Some(source) = self.moved_from(item) {
+                    undone.push((item, source));
                 }
-                crate::oplog::RunOp::Undelete { .. } => {
-                    for x in first..first + len {
-                        let Some(item) = self.ids.removed(log.undeleted(x)) else {
-                            continue;
-                        };
-                        if let Some(source) = self.moved_from(item) {
-                            undone.push((item, source));
-                        }
-                        undone.extend(self.copies(item).into_iter().map(|c| (c, item)));
-                    }
-                }
-                _ => {}
+                undone.extend(self.copies(item).into_iter().map(|c| (c, item)));
             }
         }
         undone.sort_unstable();
@@ -303,8 +294,9 @@ impl Accountant {
             self.comments.take_in(log, &all, &self.ids);
         }
         let (_, mut new) = log.diff(&self.version, &to);
-        new.retain(|&lv| log.kind(lv) == crate::oplog::Kind::Aside);
         new.sort_unstable();
+        let copied = copied_among(log, &new);
+        new.retain(|&lv| log.kind(lv) == crate::oplog::Kind::Aside);
         let out = log.changes_kept(
             &self.version,
             &to,
@@ -320,7 +312,7 @@ impl Accountant {
         }
         self.ranges.take_in(log, &new, &self.ids);
         self.comments.take_in(log, &new, &self.ids);
-        self.moves.take_in(log, &new, &mut self.anchors, &self.ids);
+        self.moves.take_in(&copied, &mut self.anchors, &self.ids);
         self.version = to;
         self.recent.keep(&self.version, &self.ids.ids, &self.blocks);
         out
@@ -413,6 +405,23 @@ impl Accountant {
             moves: crate::follow::Moves::stale(),
         })
     }
+}
+
+/// The copies pastes and moves made among `events` (sorted), in runs.
+fn copied_among<T: Clone>(log: &OpLog<T>, events: &[Lv]) -> Vec<Copied> {
+    let mut runs = Vec::new();
+    let mut k = 0;
+    while k < events.len() {
+        let start = events[k];
+        let mut end = start + 1;
+        k += 1;
+        while k < events.len() && events[k] == end {
+            end += 1;
+            k += 1;
+        }
+        runs.extend(log.copied(start..end));
+    }
+    runs
 }
 
 #[cfg(test)]
