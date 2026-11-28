@@ -407,6 +407,14 @@ impl<M: Measure> Text<M> {
         range: Range<usize>,
         direction: Direction,
     ) -> Result<(IsolateId, Vec<Edit>), TextError> {
+        self.stepped(|t| t.mark_isolate_step(range, direction))
+    }
+
+    fn mark_isolate_step(
+        &mut self,
+        range: Range<usize>,
+        direction: Direction,
+    ) -> Result<(IsolateId, Vec<Edit>), TextError> {
         self.check_range(&range)?;
         if range.is_empty() {
             return Err(TextError::RangeOutOfBounds {
@@ -448,6 +456,10 @@ impl<M: Measure> Text<M> {
     /// nested in. A lost one ([`lost_isolates`](Self::lost_isolates)) can
     /// be removed too.
     pub fn remove_isolate(&mut self, id: IsolateId) -> Result<Vec<Edit>, TextError> {
+        self.stepped(|t| t.remove_isolate_step(id))
+    }
+
+    fn remove_isolate_step(&mut self, id: IsolateId) -> Result<Vec<Edit>, TextError> {
         let (shown, lost) = (self.markers.shown(), self.markers.lost());
         let s = shown
             .iter()
@@ -464,6 +476,15 @@ impl<M: Measure> Text<M> {
     /// would put it outside. [`TextError::NoSuchIsolate`] if the isolate
     /// doesn't reach `at`.
     pub fn insert_in(
+        &mut self,
+        at: usize,
+        text: &str,
+        isolate: IsolateId,
+    ) -> Result<Vec<Edit>, TextError> {
+        self.stepped(|t| t.insert_in_step(at, text, isolate))
+    }
+
+    fn insert_in_step(
         &mut self,
         at: usize,
         text: &str,

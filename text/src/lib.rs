@@ -7,14 +7,16 @@
 //! [`move_text`](Text::move_text), and sections with
 //! [`mark_section`](Text::mark_section). Every edit is recorded in the
 //! history as it's made, and returns what it did to the text as
-//! [`Edit`]s.
+//! [`Edit`]s. [`undo`](Text::undo) and [`redo`](Text::redo) go a step
+//! at a time: each edit is one, or the editor groups several with
+//! [`begin_group`](Text::begin_group).
 //!
 //! Replicas talk in messages: plain bytes, carried however the editor
 //! likes (a socket, a relay, a file). [`hello`](Text::hello) says what a
 //! replica has; [`receive`](Text::receive) takes a message from another,
 //! brings the text up to date, and hands back what to send in answer and
-//! what changed, as [`Edit`]s, so the editor can update its layout,
-//! carets and undo stack. Messages can arrive late, twice, out of order or
+//! what changed, as [`Edit`]s, so the editor can update its layout and
+//! carets. Messages can arrive late, twice, out of order or
 //! not at all: saying hello again now and then is all it takes to catch
 //! up. Every replica that has seen the same edits shows the same text.
 //!
@@ -32,8 +34,6 @@
 //!
 //! # What's not here yet
 //!
-//! - Undo: the history has it (undo steps, #14; a move's undo, #30), but
-//!   `Text` doesn't offer it yet.
 //! - Peers aren't checked for honesty (#9): only talk to ones you trust.
 
 use std::collections::HashMap;
@@ -330,6 +330,40 @@ impl<M: Measure> Sequence<Piece> for Applying<'_, M> {
     }
 }
 
+/// Puts the CRDT's `changes` into the rope and markers: the edits they
+/// make.
+fn apply<M: Measure>(
+    rope: &mut Rope<M>,
+    markers: &mut isolates::Markers,
+    changes: &[Change<'_, Piece>],
+) -> Vec<Edit> {
+    let mut edits = Vec::new();
+    let mut changed = false;
+    for change in changes {
+        if let Change::Mark { item, pos, level } = *change {
+            let at = pos.map(|p| rope.char_to_offset(markers.to_char(p)));
+            edits.push(Edit::Section {
+                section: SectionId(item),
+                at,
+                level,
+            });
+            continue;
+        }
+        let mut doc = Applying {
+            rope,
+            markers,
+            edits: &mut edits,
+            isolates: false,
+        };
+        change.apply(&mut doc);
+        changed |= doc.isolates;
+    }
+    if changed {
+        edits.push(Edit::Isolates);
+    }
+    edits
+}
+
 impl Text {
     /// An empty text, edited by `writer`. Writers must be unique: two
     /// replicas (two devices, two windows) never share a name. A user on a
@@ -416,37 +450,78 @@ impl<M: Measure> Text<M> {
     /// after a local event the CRDT decides the effect of), noting edits.
     fn catch_up(&mut self, to: &[Lv]) -> Vec<Edit> {
         let changes = self.books.merge(&self.log, to);
-        let mut edits = Vec::new();
-        let mut changed = false;
-        for change in &changes {
-            if let Change::Mark { item, pos, level } = *change {
-                let at = pos.map(|p| self.rope.char_to_offset(self.markers.to_char(p)));
-                edits.push(Edit::Section {
-                    section: SectionId(item),
-                    at,
-                    level,
-                });
-                continue;
-            }
-            let mut doc = Applying {
-                rope: &mut self.rope,
-                markers: &mut self.markers,
-                edits: &mut edits,
-                isolates: false,
-            };
-            change.apply(&mut doc);
-            changed |= doc.isolates;
-        }
-        if changed {
-            edits.push(Edit::Isolates);
-        }
-        edits
+        apply(&mut self.rope, &mut self.markers, &changes)
+    }
+
+    /// Runs `f` as one step: one undo, unless it's inside a group the
+    /// editor began, which it's then part of.
+    fn stepped<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.log.begin_group(self.me);
+        let r = f(self);
+        self.log.end_group(self.me);
+        r
+    }
+
+    /// Starts a group: every edit from here to the matching
+    /// [`end_group`](Self::end_group) is one step, undone as one (a typed
+    /// word, say, or whatever the editor calls a step). Groups nest, and
+    /// only the outermost counts. Outside a group, each call that edits
+    /// is a step of its own.
+    pub fn begin_group(&mut self) {
+        self.log.begin_group(self.me);
+    }
+
+    /// Ends the group [`begin_group`](Self::begin_group) started.
+    ///
+    /// # Panics
+    ///
+    /// Without a `begin_group` to end.
+    pub fn end_group(&mut self) {
+        self.log.end_group(self.me);
+    }
+
+    /// Whether a group is open.
+    pub fn in_group(&self) -> bool {
+        self.log.in_group(self.me)
+    }
+
+    /// Undoes this writer's latest step that isn't undone: the edits that
+    /// do it, or `None` if there's nothing to undo. Only the step's own
+    /// effects are reversed: what other writers did in the same text at
+    /// the same time stays. Moves go back to where they came from (#30).
+    /// The undo is a step of its own, in the history and sent to others
+    /// like any edit.
+    ///
+    /// The undo and redo stacks are this replica's and aren't saved: after
+    /// [`open`](Text::open), there's nothing to undo yet.
+    ///
+    /// # Panics
+    ///
+    /// Inside a group.
+    pub fn undo(&mut self) -> Option<Vec<Edit>> {
+        let changes = self.books.undo_group(&mut self.log, self.me)?;
+        Some(apply(&mut self.rope, &mut self.markers, &changes))
+    }
+
+    /// Redoes the step [`undo`](Self::undo) last undid, if this writer has
+    /// made no step since: the edits that do it, or `None`.
+    ///
+    /// # Panics
+    ///
+    /// Inside a group.
+    pub fn redo(&mut self) -> Option<Vec<Edit>> {
+        let changes = self.books.redo_group(&mut self.log, self.me)?;
+        Some(apply(&mut self.rope, &mut self.markers, &changes))
     }
 
     /// Puts `text` in at byte `at`. Where an isolate starts or ends
     /// there, the text goes outside it: [`insert_in`](Self::insert_in)
     /// puts it inside.
     pub fn insert(&mut self, at: usize, text: &str) -> Result<Vec<Edit>, TextError> {
+        self.stepped(|t| t.insert_step(at, text))
+    }
+
+    fn insert_step(&mut self, at: usize, text: &str) -> Result<Vec<Edit>, TextError> {
         self.check_at(at)?;
         let c = self.rope.offset_to_char(at);
         let pos = self
@@ -480,6 +555,10 @@ impl<M: Measure> Text<M> {
     /// the isolate does; one that only starts or ends in the range keeps
     /// what's left of it.
     pub fn delete(&mut self, range: Range<usize>) -> Result<Vec<Edit>, TextError> {
+        self.stepped(|t| t.delete_step(range))
+    }
+
+    fn delete_step(&mut self, range: Range<usize>) -> Result<Vec<Edit>, TextError> {
         self.check_range(&range)?;
         if range.is_empty() {
             return Ok(Vec::new());
@@ -533,6 +612,10 @@ impl<M: Measure> Text<M> {
 
     /// Replaces the text in `range` with `text`.
     pub fn replace(&mut self, range: Range<usize>, text: &str) -> Result<Vec<Edit>, TextError> {
+        self.stepped(|t| t.replace_step(range, text))
+    }
+
+    fn replace_step(&mut self, range: Range<usize>, text: &str) -> Result<Vec<Edit>, TextError> {
         self.check_range(&range)?;
         let mut edits = self.delete(range.clone())?;
         edits.extend(self.insert(range.start, text)?);
@@ -549,6 +632,10 @@ impl<M: Measure> Text<M> {
     /// isolate behind keeps the direction it was set in: it's made an
     /// isolate of that direction where it lands, unless it lands in one.
     pub fn move_text(&mut self, range: Range<usize>, to: usize) -> Result<Vec<Edit>, TextError> {
+        self.stepped(|t| t.move_text_step(range, to))
+    }
+
+    fn move_text_step(&mut self, range: Range<usize>, to: usize) -> Result<Vec<Edit>, TextError> {
         self.check_range(&range)?;
         self.check_at(to)?;
         if range.is_empty() || (range.start..=range.end).contains(&to) {
@@ -624,6 +711,10 @@ impl<M: Measure> Text<M> {
     /// elsewhere is moved, not deleted and retyped. The edits say what it
     /// did.
     pub fn reconcile(&mut self, incoming: &str) -> Vec<Edit> {
+        self.stepped(|t| t.reconcile_step(incoming))
+    }
+
+    fn reconcile_step(&mut self, incoming: &str) -> Vec<Edit> {
         use reconcile::Piece;
         let old = self.to_string();
         let pieces = reconcile::plan(&old, incoming);
@@ -721,6 +812,14 @@ impl<M: Measure> Text<M> {
     /// Makes the character at byte `at` start a section at `level` (0: no
     /// section). Returns its id, the same through every edit and merge.
     pub fn mark_section(
+        &mut self,
+        at: usize,
+        level: u8,
+    ) -> Result<(SectionId, Vec<Edit>), TextError> {
+        self.stepped(|t| t.mark_section_step(at, level))
+    }
+
+    fn mark_section_step(
         &mut self,
         at: usize,
         level: u8,
@@ -909,6 +1008,7 @@ impl<M: Measure> Text<M> {
         let to = text.log.version().to_vec();
         text.catch_up(&to);
         text.saved = text.log.len();
+        text.books.start_undo(&text.log, me);
         Ok(text)
     }
 }

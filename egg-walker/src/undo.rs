@@ -19,7 +19,8 @@
 //!
 //! The undo and redo stacks are this replica's, kept in its
 //! [`Accountant`] for each local writer, and not saved: after a load, undo
-//! starts from nothing (steps themselves are in the log).
+//! starts from nothing (steps themselves are in the log), once
+//! [`Accountant::start_undo`] says so.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
@@ -42,6 +43,8 @@ pub(crate) struct History {
     /// Where the steps an undo or redo made end: a step from here on that
     /// they didn't make is a new edit, and clears `redo`.
     seen: u64,
+    /// Where undo starts: steps before it are never undone.
+    floor: u64,
 }
 
 impl Accountant {
@@ -60,7 +63,8 @@ impl Accountant {
         let step = {
             let h = self.history.entry(agent).or_default();
             log.steps(agent).into_iter().rev().find(|s| {
-                !h.undone.contains_key(&s.start)
+                s.start >= h.floor
+                    && !h.undone.contains_key(&s.start)
                     && !h.undos.contains(&s.start)
                     && !h.retired.contains(&s.start)
             })?
@@ -102,6 +106,17 @@ impl Accountant {
         h.seen = made.end;
         let log: &'a OpLog<T> = log;
         Some(self.merge(log, &version))
+    }
+
+    /// Starts `agent`'s undo here: none of its steps so far is undone.
+    /// For a log opened from a file: the stacks weren't saved, so which
+    /// of its steps were undos, or are undone, isn't known, and undoing
+    /// one might undo an undo.
+    pub fn start_undo<T: Clone>(&mut self, log: &OpLog<T>, agent: AgentId) {
+        let h = self.history.entry(agent).or_default();
+        h.floor = log.next_seq[agent.index()];
+        h.seen = h.floor;
+        h.redo.clear();
     }
 
     /// Clears `agent`'s redo stack if it made a step of its own since the
