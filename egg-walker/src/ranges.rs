@@ -12,7 +12,9 @@
 //! The [`Accountant`](crate::Accountant) keeps them, as it keeps the
 //! outline: their ends are watched by anchors of their own that fall back
 //! (see `anchors.rs`), so when an end's item is deleted the range ends at
-//! the nearest surviving item inside it, until #33's rule. An end deleted
+//! the nearest surviving item inside it, until #33's rule. A range whose
+//! ends were both moved (#68) goes with them, wherever their copies show
+//! (#85); one only partly moved stays where it was. An end deleted
 //! before this replica showed it has no place, and the range isn't shown
 //! until it comes back.
 //!
@@ -27,6 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
 use crate::anchors::Anchors;
+use crate::follow::Moved;
 use crate::ids::Identities;
 use crate::oplog::{Aside, Lv, Op, OpLog};
 use crate::walk::Change;
@@ -49,6 +52,8 @@ struct Entry {
     tag: Option<String>,
     /// The event that set `tag`: the add, or the latest set.
     set_by: Lv,
+    /// The event that pinned its ends: the add, or the latest re-pin (#85).
+    pinned_by: Lv,
 }
 
 #[derive(Clone)]
@@ -100,6 +105,7 @@ impl Ranges {
                             end,
                             tag: Some(tag),
                             set_by: lv,
+                            pinned_by: lv,
                         },
                     );
                     self.watch(start, ids);
@@ -112,6 +118,18 @@ impl Ranges {
                     {
                         entry.tag = tag;
                         entry.set_by = lv;
+                    }
+                }
+                Op::Aside(Aside::Repin { link, start, end }) => {
+                    let key = |e: Lv| (log.lamport(e), log.order_key(e));
+                    if let Some(entry) = self.entries.get_mut(&link)
+                        && key(lv) > key(entry.pinned_by)
+                    {
+                        entry.start = start;
+                        entry.end = end;
+                        entry.pinned_by = lv;
+                        self.watch(start, ids);
+                        self.watch(end, ids);
                     }
                 }
                 _ => {}
@@ -141,8 +159,18 @@ impl Ranges {
     }
 
     /// Where range `id` is now, if it's there and its ends have places.
-    fn view(&self, id: Lv, e: &Entry) -> Option<AuthorRange> {
+    fn view(&self, id: Lv, e: &Entry, moved: Moved) -> Option<AuthorRange> {
         let tag = e.tag.clone()?;
+        // Both ends moved, and still in order: it goes with them (#85).
+        if let (Some(start), Some(end)) = (moved(e.start), moved(e.end))
+            && start <= end
+        {
+            return Some(AuthorRange {
+                id,
+                tag,
+                span: start..end + 1,
+            });
+        }
         let start = self.anchors.place_of(e.start)?;
         let end = match self.anchors.position(e.end) {
             Some(p) => p + 1,
@@ -157,23 +185,33 @@ impl Ranges {
     }
 
     /// Every range shown, by where it starts.
-    pub(crate) fn all(&self) -> Vec<AuthorRange> {
+    pub(crate) fn all(&self, moved: Moved) -> Vec<AuthorRange> {
         let mut out: Vec<AuthorRange> = self
             .entries
             .iter()
-            .filter_map(|(&id, e)| self.view(id, e))
+            .filter_map(|(&id, e)| self.view(id, e, moved))
             .collect();
         out.sort_by_key(|r| (r.span.start, r.span.end, r.id));
         out
     }
 
-    pub(crate) fn get(&self, id: Lv) -> Option<AuthorRange> {
-        self.view(id, self.entries.get(&id)?)
+    pub(crate) fn get(&self, id: Lv, moved: Moved) -> Option<AuthorRange> {
+        self.view(id, self.entries.get(&id)?, moved)
     }
 
     /// Range `id`'s tag as set now (`Some(None)`: removed), if it's known.
     pub(crate) fn tag(&self, id: Lv) -> Option<Option<String>> {
         self.entries.get(&id).map(|e| e.tag.clone())
+    }
+
+    /// Range `id`'s ends now: the items it's pinned to.
+    pub(crate) fn ends(&self, id: Lv) -> Option<(Lv, Lv)> {
+        self.entries.get(&id).map(|e| (e.start, e.end))
+    }
+
+    /// The event that pinned range `id`'s ends now.
+    pub(crate) fn pinned_by(&self, id: Lv) -> Option<Lv> {
+        self.entries.get(&id).map(|e| e.pinned_by)
     }
 
     /// The event that set range `id`'s tag now.
@@ -187,12 +225,13 @@ impl Ranges {
 /// removed).
 #[doc(hidden)]
 pub fn reference<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<(Lv, Lv, Lv, Option<String>)> {
-    let mut out: BTreeMap<Lv, (Lv, Lv, Option<String>, Lv)> = BTreeMap::new();
+    // Each range: its ends, its tag, what set the tag, what pinned the ends.
+    let mut out: BTreeMap<Lv, (Lv, Lv, Option<String>, Lv, Lv)> = BTreeMap::new();
     let key = |e: Lv| (log.lamport(e), log.order_key(e));
     for lv in (0..log.len()).filter(|&lv| log.contains(version, lv)) {
         match log.event(lv).op {
             Op::Aside(Aside::RangeAdd { start, end, tag }) => {
-                out.insert(lv, (start, end, Some(tag), lv));
+                out.insert(lv, (start, end, Some(tag), lv, lv));
             }
             Op::Aside(Aside::RangeSet { range, tag }) => {
                 let e = out.get_mut(&range).expect("a set after its add");
@@ -201,10 +240,17 @@ pub fn reference<T: Clone>(log: &OpLog<T>, version: &[Lv]) -> Vec<(Lv, Lv, Lv, O
                     e.3 = lv;
                 }
             }
+            Op::Aside(Aside::Repin { link, start, end }) => {
+                if let Some(e) = out.get_mut(&link)
+                    && key(lv) > key(e.4)
+                {
+                    (e.0, e.1, e.4) = (start, end, lv);
+                }
+            }
             _ => {}
         }
     }
     out.into_iter()
-        .map(|(id, (s, e, tag, _))| (id, s, e, tag))
+        .map(|(id, (s, e, tag, _, _))| (id, s, e, tag))
         .collect()
 }

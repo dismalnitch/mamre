@@ -175,4 +175,7 @@ pub(crate) enum AsideJson {
     BodyInsert { comment: Named, pos: usize, item: char },
     /// The character at `pos` taken out of a comment's body.
     BodyDelete { comment: Named, pos: usize },
+    /// A comment or range (`link`, the event that added it) pinned to
+    /// `start` to `end` instead (inserts, both included): #85.
+    Repin { link: Named, start: Named, end: Named },
 }

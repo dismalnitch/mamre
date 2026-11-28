@@ -107,6 +107,11 @@ pub enum Aside {
     /// Sets range `range`'s tag (`None`: removed). The latest set of a
     /// range wins, in Lamport time, then the order concurrent inserts use.
     RangeSet { range: Lv, tag: Option<String> },
+    /// Pins comment or range `link` (the event that added it) to items
+    /// `start` to `end` instead (both included; insert events this one
+    /// includes): an editor's answer to where it goes after a move (#79,
+    /// #85). The latest re-pin of a link wins, as a range's sets do.
+    Repin { link: Lv, start: Lv, end: Lv },
 }
 
 /// A run of pasted inserts (#36), as a move makes them too (#68): inserts
@@ -189,6 +194,11 @@ impl Aside {
             Aside::RangeSet { range, tag } => Aside::RangeSet {
                 range: f(range),
                 tag,
+            },
+            Aside::Repin { link, start, end } => Aside::Repin {
+                link: f(link),
+                start: f(start),
+                end: f(end),
             },
         }
     }
@@ -518,6 +528,14 @@ impl<T: Clone> OpLog<T> {
             tag: tag.map(str::to_string),
         });
         vec![self.push(agent, seq, normalize(parents.to_vec()), op)]
+    }
+
+    /// Pins comment or range `link` to items `start` to `end` instead, both
+    /// included, in a document at `parents`, as `agent` (#85): what an
+    /// editor writes when it's asked where something pinned to moved text
+    /// goes, in the move's step. Returns the version after.
+    pub fn add_repin(&mut self, agent: AgentId, parents: &[Lv], link: Lv, start: Lv, end: Lv) -> Vec<Lv> {
+        self.add_aside(agent, parents, Aside::Repin { link, start, end })
     }
 
     /// Adds a comment (#33) on items `start` to `end`, both included, in a
@@ -903,6 +921,17 @@ impl<T: Clone> OpLog<T> {
                     .iter()
                     .all(|&&i| i < lv && matches!(self.run_of(i).op, RunOp::Insert { .. })),
                 "a comment's ends are earlier inserts"
+            ),
+            Op::Aside(Aside::Repin { link, start, end }) => assert!(
+                *link < lv
+                    && matches!(
+                        self.run_of(*link).op,
+                        RunOp::Aside(Aside::CommentAdd { .. } | Aside::RangeAdd { .. })
+                    )
+                    && [start, end]
+                        .iter()
+                        .all(|&&i| i < lv && matches!(self.run_of(i).op, RunOp::Insert { .. })),
+                "a re-pin pins an earlier comment or range to earlier inserts"
             ),
             Op::Aside(a) if a.comment().is_some() => {
                 let c = a.comment().unwrap();
