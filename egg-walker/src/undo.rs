@@ -57,6 +57,15 @@ impl Accountant {
         log: &'a mut OpLog<T>,
         agent: AgentId,
     ) -> Option<Vec<Change<'a, T>>> {
+        let version = self.make_undo(log, agent)?;
+        let log: &'a OpLog<T> = log;
+        Some(self.merge(log, &version))
+    }
+
+    /// Makes the step [`undo_group`](Self::undo_group) makes, in the log,
+    /// without merging it: the version to [`merge`](Self::merge) to next,
+    /// before anything else. For looking at its events first.
+    pub fn make_undo<T: Clone>(&mut self, log: &mut OpLog<T>, agent: AgentId) -> Option<Vec<Lv>> {
         assert!(!log.in_group(agent), "an undo inside a group");
         log.end_step(agent);
         self.note_new_edits(log, agent);
@@ -75,8 +84,7 @@ impl Accountant {
         h.undos.insert(made.start);
         h.redo.push(step.start);
         h.seen = made.end;
-        let log: &'a OpLog<T> = log;
-        Some(self.merge(log, &version))
+        Some(version)
     }
 
     /// Redoes the step `agent` last undid, if nothing new came since: the
@@ -87,6 +95,14 @@ impl Accountant {
         log: &'a mut OpLog<T>,
         agent: AgentId,
     ) -> Option<Vec<Change<'a, T>>> {
+        let version = self.make_redo(log, agent)?;
+        let log: &'a OpLog<T> = log;
+        Some(self.merge(log, &version))
+    }
+
+    /// Makes the step [`redo_group`](Self::redo_group) makes, without
+    /// merging it, as [`make_undo`](Self::make_undo).
+    pub fn make_redo<T: Clone>(&mut self, log: &mut OpLog<T>, agent: AgentId) -> Option<Vec<Lv>> {
         assert!(!log.in_group(agent), "a redo inside a group");
         log.end_step(agent);
         self.note_new_edits(log, agent);
@@ -104,8 +120,7 @@ impl Accountant {
         let h = self.history.entry(agent).or_default();
         h.retired.insert(step);
         h.seen = made.end;
-        let log: &'a OpLog<T> = log;
-        Some(self.merge(log, &version))
+        Some(version)
     }
 
     /// Starts `agent`'s undo here: none of its steps so far is undone.
@@ -238,9 +253,13 @@ impl Accountant {
         let mut v = self.version().to_vec();
         log.begin_group(agent);
         // Marks back where they were before the step: positions don't move.
+        // An item that's deleted now (a move's original, #68) gets its
+        // mark back once the undo below has revived it.
+        let mut revived_marks = Vec::new();
         for (item, level) in self.old_levels(log, &events, &marks) {
-            if let Some(&(_, pos)) = self.identities().positions(&[item].into()).first() {
-                v = log.add_mark(agent, &v, pos, level);
+            match self.identities().positions(&[item].into()).first() {
+                Some(&(_, pos)) => v = log.add_mark(agent, &v, pos, level),
+                None => revived_marks.push((item, level)),
             }
         }
         // Its items out, from the end, so the positions stay put.
@@ -263,6 +282,15 @@ impl Accountant {
         // Deletes and moves undone, by identity: one kind-2 run.
         if !to_undo.is_empty() {
             v = log.add_undo(agent, &v, to_undo);
+        }
+        if !revived_marks.is_empty() {
+            let mut after = self.clone();
+            after.merge(log, &v);
+            for (item, level) in revived_marks {
+                if let Some(&(_, pos)) = after.identities().positions(&[item].into()).first() {
+                    v = log.add_mark(agent, &v, pos, level);
+                }
+            }
         }
         // Sets and states put back to what they were before the step: the
         // books there.

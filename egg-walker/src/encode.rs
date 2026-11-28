@@ -29,6 +29,8 @@
 //!                         agent's (by seq), all earlier inserts. Pasted
 //!                         item k copies the k-th source event: that's
 //!                         its lineage, which the merge never reads.
+//!                         A move (#68) is a delete and a copy of what
+//!                         it deleted, in one step.
 //!             6 aside:    an extension (see `ext.rs`): the event as JSON,
 //!                         one event per run, the events it names by
 //!                         agent name and seq. Ranges (#32): {"range_add":

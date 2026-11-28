@@ -50,17 +50,27 @@ fn main() {
     let edits = t.reconcile(&edited);
     let took = start.elapsed();
     assert_eq!(t.to_string(), edited);
+    // A move is a delete and then an insert of as much text, hinted as
+    // one (#68).
+    let moved: usize = edits
+        .iter()
+        .map(|e| match e {
+            Edit::Moved { to, .. } => to.len(),
+            _ => 0,
+        })
+        .sum();
     let moves = edits
         .iter()
-        .filter(|e| matches!(e, Edit::Move { .. }))
+        .filter(|e| matches!(e, Edit::Moved { .. }))
         .count();
-    let typed: usize = edits
+    let inserted: usize = edits
         .iter()
         .map(|e| match e {
             Edit::Insert { text, .. } => text.len(),
             _ => 0,
         })
         .sum();
+    let typed = inserted - moved;
     println!(
         "book: {:.1} MB; reconciled in {took:.2?}: {} edits, {moves} moves, {typed} bytes typed",
         text.len() as f64 / 1e6,

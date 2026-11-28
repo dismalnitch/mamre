@@ -13,7 +13,8 @@
 //!
 //! A paste (#36) is inserts like any other, with new ids; each also
 //! remembers the insert it copies (its lineage, which history reads and
-//! the merge never does).
+//! the merge never does). A move (#68) is a delete and a paste of what it
+//! deleted, in one step.
 //!
 //! Events are stored as runs: one agent's consecutive events, each right
 //! after the last, typing forward or deleting forward, are one entry with
@@ -106,6 +107,36 @@ pub enum Aside {
     /// Sets range `range`'s tag (`None`: removed). The latest set of a
     /// range wins, in Lamport time, then the order concurrent inserts use.
     RangeSet { range: Lv, tag: Option<String> },
+}
+
+/// A run of pasted inserts (#36), as a move makes them too (#68): inserts
+/// `copy..copy + len` are copies of inserts `source..source + len`, in
+/// order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Copied {
+    pub copy: Lv,
+    pub source: Lv,
+    pub len: usize,
+}
+
+impl Copied {
+    /// Each copy and its source.
+    pub fn pairs(self) -> impl Iterator<Item = (Lv, Lv)> {
+        (0..self.len).map(move |k| (self.copy + k, self.source + k))
+    }
+
+    /// `pairs` (each copy and its source) as runs: pairs that go on from
+    /// the one before join its run.
+    pub fn runs(pairs: impl IntoIterator<Item = (Lv, Lv)>) -> Vec<Copied> {
+        let mut out: Vec<Copied> = Vec::new();
+        for (copy, source) in pairs {
+            match out.last_mut() {
+                Some(r) if r.copy + r.len == copy && r.source + r.len == source => r.len += 1,
+                _ => out.push(Copied { copy, source, len: 1 }),
+            }
+        }
+        out
+    }
 }
 
 /// Where a comment stands.
@@ -496,6 +527,21 @@ impl<T: Clone> OpLog<T> {
         self.add_aside(agent, parents, Aside::CommentAdd { start, end })
     }
 
+    /// Events `range`, in pieces that each lie in one run: each piece's
+    /// first event, its length, and its run.
+    pub(crate) fn run_pieces(&self, range: Range<Lv>) -> impl Iterator<Item = (Lv, usize, &Run<T>)> {
+        let mut lv = range.start;
+        std::iter::from_fn(move || {
+            (lv < range.end).then(|| {
+                let run = self.run_of(lv);
+                let end = run.end().min(range.end);
+                let piece = (lv, end - lv, run);
+                lv = end;
+                piece
+            })
+        })
+    }
+
     /// Sets comment `comment`'s state, in a document at `parents`.
     pub fn set_comment(
         &mut self,
@@ -592,6 +638,13 @@ impl<T: Clone> OpLog<T> {
     /// Moves the items in `range` to `to` (a position in the document as
     /// it is, outside `range`), in a document at `parents`, as `agent`,
     /// keeping their identities. Returns the version after.
+    ///
+    /// **Research, off the path to shipping (#68).** Range moves with
+    /// identity under concurrency are an open problem, and every known
+    /// divergence lives here (#61). A move to ship is a delete, an insert
+    /// a paste ([`add_paste`](Self::add_paste)) of what it deleted, in one step: what
+    /// `mamre-text` does. This stays so older histories read, and for the
+    /// research (their tests: `--features range-moves`).
     pub fn add_move(
         &mut self,
         agent: AgentId,
@@ -998,6 +1051,15 @@ impl<T> OpLog<T> {
     pub fn source(&self, lv: Lv) -> Option<Lv> {
         let (&first, &(source, len)) = self.lineage.range(..=lv).next_back()?;
         (lv < first + len).then(|| source + (lv - first))
+    }
+
+    /// The pastes' copies among events `range` (#36), in runs: a move's
+    /// too, since a move is a delete and a paste (#68).
+    pub fn copied(&self, range: Range<Lv>) -> Vec<Copied> {
+        self.sources_in(range)
+            .into_iter()
+            .map(|(copy, source, len)| Copied { copy, source, len })
+            .collect()
     }
 
     /// The pieces of lineage over events `range`, clipped to it: each

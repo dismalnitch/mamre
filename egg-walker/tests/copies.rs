@@ -8,6 +8,9 @@
 //!
 //! And the rules for what wins, and what's reported lost, one test each.
 
+// Range moves are research since #68: `--features range-moves` runs these.
+#![cfg(feature = "range-moves")]
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use mamre_egg_walker::copies::{self, Loss};
