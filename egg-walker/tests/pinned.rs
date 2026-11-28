@@ -183,20 +183,25 @@ fn touched(pin: Pin, touch: Touch) -> Touched {
     Touched { pin, touch }
 }
 
+/// What moving positions `start..end` would touch.
+fn touching(w: &Writer, start: usize, end: usize) -> Vec<Touched> {
+    w.books.pins_touching(std::slice::from_ref(&(start..end)))
+}
+
 /// The mover's editor asks before it moves: "two " holds the comment, and
 /// the range on "three" begins where it ends.
 #[test]
 fn the_mover_is_told_what_it_would_touch() {
     let (_, w, c, r) = three();
     assert_eq!(
-        w.books.pins_touching(&[4..8]),
+        touching(&w, 4, 8),
         [touched(Pin::Comment(c), Touch::Inside), touched(Pin::Range(r), Touch::Edge)]
     );
     // "e t": part of the comment.
-    assert_eq!(w.books.pins_touching(&[2..5]), [touched(Pin::Comment(c), Touch::Partly)]);
+    assert_eq!(touching(&w, 2, 5), [touched(Pin::Comment(c), Touch::Partly)]);
     // "w": inside the comment, which holds more than what moves.
-    assert_eq!(w.books.pins_touching(&[5..6]), [touched(Pin::Comment(c), Touch::Partly)]);
-    assert_eq!(w.books.pins_touching(&[0..2]), []);
+    assert_eq!(touching(&w, 5, 6), [touched(Pin::Comment(c), Touch::Partly)]);
+    assert_eq!(touching(&w, 0, 2), []);
 }
 
 /// The author's editor hears when the move arrives, and again for its undo
