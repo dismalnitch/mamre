@@ -543,15 +543,6 @@ fn apply(editor: &mut String, edits: &[Edit]) {
             Edit::Delete { range } => {
                 editor.drain(range.clone());
             }
-            Edit::Move { range, to } => {
-                let moved: String = editor.drain(range.clone()).collect();
-                let at = if *to > range.start {
-                    to - moved.len()
-                } else {
-                    *to
-                };
-                editor.insert_str(at, &moved);
-            }
             Edit::Section { .. } | Edit::Isolates | Edit::Lost { .. } => {}
         }
     }

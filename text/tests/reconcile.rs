@@ -32,7 +32,7 @@ fn edits_at_the_ends_keep_the_middle() {
 }
 
 #[test]
-fn a_moved_paragraph_is_a_move() {
+fn a_moved_paragraph_keeps_who_it_is() {
     let mut t = text("One.\nTwo, which moves.\nThree.\nFour.\n");
     let (two, _) = t
         .mark_section(t.to_string().find("Two").unwrap(), 1)
@@ -40,12 +40,10 @@ fn a_moved_paragraph_is_a_move() {
     let a = t.anchor(t.to_string().find("moves").unwrap()).unwrap();
     let edits = t.reconcile("One.\nThree.\nFour.\nTwo, which moves.\n");
     assert_eq!(t.to_string(), "One.\nThree.\nFour.\nTwo, which moves.\n");
+    // A move is a delete and an insert of the same text (#68), nothing
+    // retyped, and what's on what moved goes along.
     assert!(
-        edits.iter().any(|e| matches!(e, Edit::Move { .. })),
-        "{edits:?}"
-    );
-    assert!(
-        !edits.iter().any(|e| matches!(e, Edit::Insert { .. })),
+        matches!(&edits[..], [Edit::Delete { range }, Edit::Insert { text, .. }] if range.len() == text.len()),
         "{edits:?}"
     );
     assert_eq!(t.sections()[0].id, two);

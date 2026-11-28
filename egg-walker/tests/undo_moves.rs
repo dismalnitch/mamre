@@ -1,6 +1,9 @@
 //! Undoing a move (#30): the originals come back, the copies go, and a
 //! redo brings back the same copies.
 
+// Range moves are research since #68: `--features range-moves` runs these.
+#![cfg(feature = "range-moves")]
+
 use mamre_egg_walker::copies;
 use mamre_egg_walker::{Accountant, Change, Lv, OpLog};
 

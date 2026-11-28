@@ -40,16 +40,6 @@ fn apply(s: &mut String, edit: &Edit) {
         Edit::Delete { range } => {
             s.replace_range(range.clone(), "");
         }
-        Edit::Move { range, to } => {
-            let moved: String = s[range.clone()].to_owned();
-            s.replace_range(range.clone(), "");
-            let at = if *to > range.start {
-                to - range.len()
-            } else {
-                *to
-            };
-            s.insert_str(at, &moved);
-        }
         Edit::Section { .. } | Edit::Isolates | Edit::Lost { .. } => {}
     }
 }
@@ -110,10 +100,11 @@ fn sync_hearing(a: &mut Replica, b: &mut Replica) -> (Vec<Vec<String>>, Vec<Vec<
     (heard_a, heard_b)
 }
 
-/// Two moves that cross, made at the same time: the later is dropped,
-/// and both writers hear where its text is now.
+/// Two moves that cross, made at the same time. A move is a delete and an
+/// insert (#68), so nothing is dropped: what both moved ("CCC.") shows
+/// twice, the same everywhere, and no move is lost.
 #[test]
-fn a_dropped_move_says_where_its_text_is() {
+fn crossing_moves_keep_both() {
     let (mut a, mut b) = (Replica::new("a"), Replica::new("b"));
     let e = a.text.insert(0, "AAA.BBB.CCC.DDD.").unwrap();
     a.apply(e);
@@ -123,16 +114,9 @@ fn a_dropped_move_says_where_its_text_is() {
     let e = b.text.move_text(8..16, 0).unwrap();
     b.apply(e);
     let (heard_a, heard_b) = sync_hearing(&mut a, &mut b);
-    assert_eq!(a.text.to_string(), "DDD.AAA.BBB.CCC.");
+    assert_eq!(a.text.to_string(), "CCC.DDD.AAA.BBB.CCC.");
     assert_eq!(b.text.to_string(), a.text.to_string());
-    // b's move, of "CCC.DDD.", is the later: it's dropped. Its text
-    // is in two places now.
-    for heard in [&heard_a, &heard_b] {
-        assert_eq!(heard.len(), 1, "one loss: {heard:?}");
-        let mut texts = heard[0].clone();
-        texts.sort();
-        assert_eq!(texts, ["CCC.", "DDD."]);
-    }
+    assert!(heard_a.is_empty() && heard_b.is_empty(), "nothing lost");
 }
 
 /// A section mark that loses to a later one made at the same time is
@@ -209,8 +193,9 @@ fn two_writers_meet() {
 }
 
 /// Two blocks moved into each other while a third writer moves something
-/// else (mamre#40): one of the loop's moves is dropped, the third stands,
-/// and everyone ends up reading the same. (It used to overflow the stack.)
+/// else (mamre#40, when moves were range moves: it overflowed the stack).
+/// A move is a delete and an insert now (#68), so each writer's copy is
+/// made: everyone reads the same, and nothing is lost.
 #[test]
 fn moves_into_each_other_beside_a_third() {
     let mut rs = [Replica::new("a"), Replica::new("b"), Replica::new("c")];
@@ -229,14 +214,15 @@ fn moves_into_each_other_beside_a_third() {
     sync(b, c);
     sync(a, c);
     for r in [&a, &b, &c] {
-        assert_eq!(r.text.to_string(), "CC.BBAAAA.BB.");
+        assert_eq!(r.text.to_string(), "CC.BBBB.AAAA.");
     }
 }
 
-/// Typing in a paragraph while someone else moves it: the typing goes
-/// where the paragraph went.
+/// Typing in a paragraph while someone else moves it: a move is a delete
+/// and an insert (#68), so the typing isn't lost, and stays where the
+/// paragraph was, for the editor to point out.
 #[test]
-fn typing_follows_a_moved_paragraph() {
+fn typing_in_a_moved_paragraph_stays_where_it_was() {
     let (mut a, mut b) = (Replica::new("a"), Replica::new("b"));
     let e = a.text.insert(0, "One.\nTwo.\n").unwrap();
     a.apply(e);
@@ -248,7 +234,7 @@ fn typing_follows_a_moved_paragraph() {
     b.apply(e);
     assert_eq!(b.text.to_string(), "One.\nTwo!!.\n");
     sync(&mut a, &mut b);
-    assert_eq!(a.text.to_string(), "Two!!.\nOne.\n");
+    assert_eq!(a.text.to_string(), "Two.\nOne.\n!!");
     assert_eq!(b.text.to_string(), a.text.to_string());
 }
 
@@ -435,6 +421,14 @@ fn acts() -> impl Strategy<Value = Vec<Act>> {
     prop::collection::vec(act, 1..80)
 }
 
+/// `PROPTEST_CASES`, if it's set, or `default`.
+fn cases(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 /// The char boundaries of `s`: every byte offset an edit can name.
 fn boundaries(s: &str) -> Vec<usize> {
     s.char_indices().map(|(i, _)| i).chain([s.len()]).collect()
@@ -580,7 +574,8 @@ fn replicas_read_the_same_whatever_order_they_merge_in() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    // 256 cases, or PROPTEST_CASES for a run at volume (#68).
+    #![proptest_config(ProptestConfig::with_cases(cases(256)))]
 
     /// Three replicas editing at once over a network that drops,
     /// duplicates and reorders: each editor's copy, kept only from the

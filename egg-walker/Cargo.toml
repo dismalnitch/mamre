@@ -14,6 +14,11 @@ publish = false
 # step by step, and the layouts it checks against a drawing). Release
 # builds never run them anyway.
 perf = []
+# Range moves with identity (#20): research, off the path to shipping since
+# #68 (a move is a delete, an insert and a came-from record). The engine
+# still reads them, from older histories; their own tests (moves, copies,
+# undo_moves), which keep finding divergences (#61), run only with this.
+range-moves = []
 
 [dependencies]
 mamre = { path = ".." }

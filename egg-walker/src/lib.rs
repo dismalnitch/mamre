@@ -18,6 +18,12 @@
 //! undoes, and the item comes back as itself. So anything pinned to an item
 //! (ink, a comment) finds it again, here or on any other replica.
 //!
+//! A move is a delete and an insert in one undo step, with a
+//! [`CameFrom`](Aside::CameFrom) record naming what the insert carries on
+//! (#68): what's watched on the old items follows the new ones
+//! ([`Accountant::follow`]). Range moves that keep identity
+//! ([`OpLog::add_move`]) are research, off the path to shipping.
+//!
 //! - [`OpLog`]: every event a replica knows, and syncing them between logs.
 //! - [`OpLog::changes`]: the walk, from one version to another.
 //! - [`Identities`]: kept beside a replica's document, which insert each item
@@ -62,6 +68,7 @@ mod blocks;
 pub mod copies;
 mod encode;
 mod ext;
+mod follow;
 pub mod file;
 mod ids;
 mod key;
@@ -85,6 +92,7 @@ mod walk;
 pub use accountant::Accountant;
 pub use anchors::Anchors;
 pub use comments::Comment;
+pub use follow::Follow;
 pub use ids::Identities;
 pub use oplog::{AgentId, Aside, CommentState, Event, Lv, Op, OpLog};
 pub use outline::{Ambiguity, Next, Policies, Policy, Resolution, Section, Start};

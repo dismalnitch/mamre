@@ -3,7 +3,8 @@
 //! The core log (text inserts and deletes, moves, marks, undos, with their
 //! parents and agents) is our own bytes, in `encode.rs`: it's nearly all of
 //! a file, and it's settled. What sits beside the text (ranges, comments,
-//! undo steps, ghosts' places, the history index) is rare, so its size
+//! undo steps, ghosts' places, moves' came-from records, the history
+//! index) is rare, so its size
 //! hardly matters, and it's what's still changing, so being able to add a
 //! field matters more. It's written with serde:
 //!
@@ -175,4 +176,16 @@ pub(crate) enum AsideJson {
     BodyInsert { comment: Named, pos: usize, item: char },
     /// The character at `pos` taken out of a comment's body.
     BodyDelete { comment: Named, pos: usize },
+    /// A move's copies (#68): `first` and the `len - 1` inserts its agent
+    /// made after it, copies of the `from` runs in order. Each run is
+    /// `start` and the `len - 1` events its agent made after it.
+    CameFrom { first: Named, len: usize, from: Vec<NamedRun> },
+}
+
+/// Events in a run of one agent's: the first, and how many.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NamedRun {
+    pub(crate) start: Named,
+    pub(crate) len: usize,
 }

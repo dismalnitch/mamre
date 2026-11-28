@@ -26,12 +26,6 @@ impl Replica {
             match edit {
                 Edit::Insert { at, text } => self.editor.insert_str(at, &text),
                 Edit::Delete { range } => self.editor.replace_range(range, ""),
-                Edit::Move { range, to } => {
-                    let moved = self.editor[range.clone()].to_owned();
-                    self.editor.replace_range(range.clone(), "");
-                    let at = if to > range.start { to - range.len() } else { to };
-                    self.editor.insert_str(at, &moved);
-                }
                 Edit::Section { .. } | Edit::Isolates | Edit::Lost { .. } => {}
             }
         }
@@ -244,14 +238,15 @@ fn a_moved_text_goes_back_while_another_types_in_it() {
     let (mut a, mut b) = (Replica::new("a"), Replica::new("b"));
     a.type_(0, "one two three");
     sync(&mut a, &mut b);
-    // a moves "two " to the end; b types inside it, where it was.
+    // a moves "two " to the end; b types inside it, where it was. A move
+    // is a delete and an insert (#68): b's typing stays at the old spot.
     let e = a.text.move_text(4..8, 13).unwrap();
     a.apply(e);
     b.type_(6, "o");
     sync(&mut a, &mut b);
-    assert_eq!(a.editor, "one threetwoo ");
+    assert_eq!(a.editor, "one othreetwo ");
     assert!(a.undo());
-    assert_eq!(a.editor, "one twoo three", "it goes back, b's typing with it");
+    assert_eq!(a.editor, "one twoo three", "it goes back round b's typing");
     sync(&mut a, &mut b);
     assert_eq!(b.editor, a.editor);
 }
@@ -366,7 +361,10 @@ fn boundaries(s: &str) -> Vec<usize> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    // 128 cases, or PROPTEST_CASES for a run at volume.
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(128)
+    ))]
 
     /// Three replicas editing, grouping and undoing at once over a network
     /// that drops, duplicates and reorders: each editor's copy, kept only

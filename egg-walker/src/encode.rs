@@ -38,7 +38,14 @@
 //!                         {"comment_set": {"comment", "state"}}, and a
 //!                         body's edits, a character each:
 //!                         {"body_insert": {"comment", "pos", "item"}},
-//!                         {"body_delete": {"comment", "pos"}}
+//!                         {"body_delete": {"comment", "pos"}}. A move's
+//!                         copies (#68): {"came_from": {"first", "len",
+//!                         "from": [{"start", "len"}…]}}, the copies
+//!                         `first` and the len - 1 events its agent made
+//!                         after it, each copying the next of the `from`
+//!                         runs' events (each `start` and the len - 1
+//!                         events its agent made after it), all earlier
+//!                         inserts, as many sources as copies
 //!             (other kinds are reserved for other kinds of event)
 //! extension = what the chunk carries beside its runs, as JSON (see
 //!             `ext.rs`); only when there's something in it. So far:
@@ -603,6 +610,27 @@ impl<T: Clone + Codec> Writer<'_, T> {
                 comment: self.named(*comment),
                 pos: *pos,
             },
+            Aside::CameFrom { copies, sources } => {
+                // The sources in runs of one agent's events, one after
+                // another.
+                let mut from: Vec<ext::NamedRun> = Vec::new();
+                for &s in sources {
+                    let named = self.named(s);
+                    if let Some(last) = from.last_mut()
+                        && last.start.agent == named.agent
+                        && last.start.seq + last.len as u64 == named.seq
+                    {
+                        last.len += 1;
+                    } else {
+                        from.push(ext::NamedRun { start: named, len: 1 });
+                    }
+                }
+                AsideJson::CameFrom {
+                    first: self.named(copies[0]),
+                    len: copies.len(),
+                    from,
+                }
+            }
         }
     }
 
@@ -1001,6 +1029,28 @@ impl<'a, T: Clone> Planner<'a, T> {
                 comment: earlier(&c, &comment, not_comment)?,
                 pos,
             },
+            AsideJson::CameFrom { first, len, from } => {
+                const NOT_INSERT: &str = "a came-from naming something that isn't an earlier insert";
+                // Event `k` after `named`, by the same agent.
+                let nth = |named: &Named, k: usize| Named {
+                    agent: named.agent.clone(),
+                    seq: named.seq + k as u64,
+                };
+                if len == 0 || from.iter().map(|r| r.len).sum::<usize>() != len {
+                    return Err(DecodeError::Invalid(
+                        "a came-from whose copies and sources don't pair up",
+                    ));
+                }
+                let copies = (0..len)
+                    .map(|k| earlier(&nth(&first, k), &insert, NOT_INSERT))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let sources = from
+                    .iter()
+                    .flat_map(|r| (0..r.len).map(move |k| (r, k)))
+                    .map(|(r, k)| earlier(&nth(&r.start, k), &insert, NOT_INSERT))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Aside::CameFrom { copies, sources }
+            }
         })
     }
 

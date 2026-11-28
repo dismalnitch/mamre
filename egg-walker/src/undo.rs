@@ -232,15 +232,23 @@ impl Accountant {
                 // A body's edits aren't undone with the step yet: its
                 // undo needs undeletes of body deletes (a follow-up).
                 Op::Aside(Aside::BodyInsert { .. } | Aside::BodyDelete { .. }) => {}
+                // What a move's copies came from: undoing the move's
+                // delete and insert brings back the originals, which are
+                // then what's watched on them follows.
+                Op::Aside(Aside::CameFrom { .. }) => {}
             }
         }
         let start = log.next_seq[agent.index()];
         let mut v = self.version().to_vec();
         log.begin_group(agent);
         // Marks back where they were before the step: positions don't move.
+        // An item that's deleted now (a move's original, #68) gets its
+        // mark back once the undo below has revived it.
+        let mut revived_marks = Vec::new();
         for (item, level) in self.old_levels(log, &events, &marks) {
-            if let Some(&(_, pos)) = self.identities().positions(&[item].into()).first() {
-                v = log.add_mark(agent, &v, pos, level);
+            match self.identities().positions(&[item].into()).first() {
+                Some(&(_, pos)) => v = log.add_mark(agent, &v, pos, level),
+                None => revived_marks.push((item, level)),
             }
         }
         // Its items out, from the end, so the positions stay put.
@@ -263,6 +271,15 @@ impl Accountant {
         // Deletes and moves undone, by identity: one kind-2 run.
         if !to_undo.is_empty() {
             v = log.add_undo(agent, &v, to_undo);
+        }
+        if !revived_marks.is_empty() {
+            let mut after = self.clone();
+            after.merge(log, &v);
+            for (item, level) in revived_marks {
+                if let Some(&(_, pos)) = after.identities().positions(&[item].into()).first() {
+                    v = log.add_mark(agent, &v, pos, level);
+                }
+            }
         }
         // Sets and states put back to what they were before the step: the
         // books there.

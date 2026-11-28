@@ -41,7 +41,7 @@ use std::fmt;
 use std::ops::Range;
 
 use mamre_egg_walker::sync::Message;
-use mamre_egg_walker::{Accountant, AgentId, Change, Lv, OpLog, Sequence, file};
+use mamre_egg_walker::{Accountant, AgentId, Change, Follow, Lv, OpLog, Sequence, file};
 use mamre_rope::Measure;
 pub use mamre_rope::{Plain, Rope, Unit, Units};
 
@@ -86,9 +86,6 @@ pub enum Edit {
     Insert { at: usize, text: String },
     /// The bytes in `range` went.
     Delete { range: Range<usize> },
-    /// The bytes in `range` moved to `to`, an offset before the move,
-    /// outside the range. The same characters: anchors in them go along.
-    Move { range: Range<usize>, to: usize },
     /// The character `section` names now starts a section at `level` (0:
     /// none). It's at `at`, if it shows. The text doesn't change.
     Section {
@@ -100,8 +97,9 @@ pub enum Edit {
     /// another writer did. The text doesn't change. Ask
     /// [`Text::isolates`] what they are now.
     Isolates,
-    /// A move or section mark that was discarded: it lost to something
-    /// done at the same time (or did nothing from the start). Where its
+    /// A section mark that was discarded: it lost to one made at the same
+    /// time (or did nothing from the start). A range move from a history
+    /// made before moves were a delete and an insert (#68) can be lost too. Where its
     /// text is now, as the text is at this point in the edits: none if
     /// it's all been deleted. The text doesn't change.
     Lost { ranges: Vec<Range<usize>> },
@@ -305,16 +303,21 @@ impl<M: Measure> Sequence<Piece> for Applying<'_, M> {
         } else {
             to
         };
-        self.put(at, &moved);
+        let text = self.put(at, &moved);
         // Markers alone moving, or text moving only past markers, leaves
-        // the text as it was.
+        // the text as it was. Otherwise it's a delete and an insert, as a
+        // move made now is (#68): this is a range move from a history made
+        // before them.
         if bytes.is_empty() || (bytes.start..=bytes.end).contains(&to_byte) {
             self.isolates = true;
         } else {
-            self.edits.push(Edit::Move {
-                range: bytes,
-                to: to_byte,
-            });
+            let at = if to_byte > bytes.start {
+                to_byte - bytes.len()
+            } else {
+                to_byte
+            };
+            self.edits.push(Edit::Delete { range: bytes });
+            self.edits.push(Edit::Insert { at, text });
         }
     }
 
@@ -330,11 +333,23 @@ impl<M: Measure> Sequence<Piece> for Applying<'_, M> {
     }
 }
 
+/// The character `item` carries on: the first a chain of moves copied it
+/// from (#68), or itself. A section's id is its heading's root, so it's the
+/// same through every move.
+fn root(books: &Accountant, item: Lv) -> Lv {
+    let mut x = item;
+    while let Some(source) = books.moved_from(x) {
+        x = source;
+    }
+    x
+}
+
 /// Puts the CRDT's `changes` into the rope and markers: the edits they
 /// make.
 fn apply<M: Measure>(
     rope: &mut Rope<M>,
     markers: &mut isolates::Markers,
+    books: &Accountant,
     changes: &[Change<'_, Piece>],
 ) -> Vec<Edit> {
     let mut edits = Vec::new();
@@ -343,7 +358,7 @@ fn apply<M: Measure>(
         if let Change::Mark { item, pos, level } = *change {
             let at = pos.map(|p| rope.char_to_offset(markers.to_char(p)));
             edits.push(Edit::Section {
-                section: SectionId(item),
+                section: SectionId(root(books, item)),
                 at,
                 level,
             });
@@ -450,7 +465,7 @@ impl<M: Measure> Text<M> {
     /// after a local event the CRDT decides the effect of), noting edits.
     fn catch_up(&mut self, to: &[Lv]) -> Vec<Edit> {
         let changes = self.books.merge(&self.log, to);
-        apply(&mut self.rope, &mut self.markers, &changes)
+        apply(&mut self.rope, &mut self.markers, &self.books, &changes)
     }
 
     /// Runs `f` as one step: one undo, unless it's inside a group the
@@ -500,7 +515,7 @@ impl<M: Measure> Text<M> {
     /// Inside a group.
     pub fn undo(&mut self) -> Option<Vec<Edit>> {
         let changes = self.books.undo_group(&mut self.log, self.me)?;
-        Some(apply(&mut self.rope, &mut self.markers, &changes))
+        Some(apply(&mut self.rope, &mut self.markers, &self.books, &changes))
     }
 
     /// Redoes the step [`undo`](Self::undo) last undid, if this writer has
@@ -511,7 +526,7 @@ impl<M: Measure> Text<M> {
     /// Inside a group.
     pub fn redo(&mut self) -> Option<Vec<Edit>> {
         let changes = self.books.redo_group(&mut self.log, self.me)?;
-        Some(apply(&mut self.rope, &mut self.markers, &changes))
+        Some(apply(&mut self.rope, &mut self.markers, &self.books, &changes))
     }
 
     /// Puts `text` in at byte `at`. Where an isolate starts or ends
@@ -622,11 +637,18 @@ impl<M: Measure> Text<M> {
         Ok(edits)
     }
 
-    /// Moves the text in `range` to byte `to` (an offset before the move):
-    /// the same characters, somewhere else, so anchors and sections in
-    /// them go along, and someone typing in them at the same time types
-    /// where they went. A move to inside itself, or to where it is, does
-    /// nothing. The edits say what it did.
+    /// Moves the text in `range` to byte `to` (an offset before the move).
+    /// A move is a delete and then an insert of the same text, one undo
+    /// step, and that's what the edits say (#68). What's on the text goes
+    /// with it: anchors in it, its sections (with their ids) and paragraph
+    /// kinds, here and on every replica, by a record of where the new text
+    /// came from. Undo brings back the original characters, and with them
+    /// everything where it was.
+    ///
+    /// At the same time as someone else: their typing inside the range
+    /// isn't lost, but stays where the text was (an editor might say so),
+    /// and text two writers both moved shows twice. A move to inside
+    /// itself, or to where it is, does nothing.
     ///
     /// An isolate goes along if all of it moves. Text that leaves its
     /// isolate behind keeps the direction it was set in: it's made an
@@ -672,10 +694,7 @@ impl<M: Measure> Text<M> {
             // Moved earlier, what's gone ahead has pushed this one along.
             let shift = if earlier { moved } else { 0 };
             let items = items.start + shift..items.end + shift;
-            let v = self
-                .log
-                .add_move(self.me, self.books.version(), items.clone(), at);
-            edits.extend(self.catch_up(&v));
+            edits.extend(self.move_items(items.clone(), at));
             moved += items.len();
             if !earlier {
                 at -= items.len();
@@ -704,11 +723,69 @@ impl<M: Measure> Text<M> {
         Ok(edits)
     }
 
+    /// Moves the items at `items` to item position `to` (before the move,
+    /// outside them): a delete and an insert of the same items, then a
+    /// came-from record, so what's watched on them follows (#68). Section
+    /// marks on them are taken off the originals and put on the copies.
+    /// The caller makes it one step.
+    fn move_items(&mut self, items: Range<usize>, to: usize) -> Vec<Edit> {
+        let sources: Vec<Lv> = items
+            .clone()
+            .map(|p| self.books.identities().item(p))
+            .collect();
+        let marks: Vec<(usize, u8)> = sources
+            .iter()
+            .enumerate()
+            .filter_map(|(k, &s)| Some((k, self.books.level(s))).filter(|&(_, l)| l > 0))
+            .collect();
+        let bytes = self.rope.char_to_offset(self.markers.to_char(items.start))
+            ..self.rope.char_to_offset(self.markers.to_char(items.end));
+        let mut text = String::with_capacity(bytes.len());
+        for chunk in self.rope.slice(bytes).chunks() {
+            text.push_str(chunk);
+        }
+        let pieces = self.markers.pieces_in(items.clone(), text.chars());
+        let mut edits = Vec::new();
+        for &(k, _) in &marks {
+            let v = self
+                .log
+                .add_mark(self.me, self.books.version(), items.start + k, 0);
+            edits.extend(self.catch_up(&v));
+        }
+        let v = self
+            .log
+            .add_delete(self.me, self.books.version(), items.clone());
+        edits.extend(self.catch_up(&v));
+        let at = if to > items.start {
+            to - items.len()
+        } else {
+            to
+        };
+        let first = self.log.len();
+        let v = self
+            .log
+            .add_insert(self.me, self.books.version(), at, pieces);
+        edits.extend(self.catch_up(&v));
+        let copies = (first..first + items.len()).collect();
+        let v = self
+            .log
+            .add_came_from(self.me, self.books.version(), copies, sources);
+        edits.extend(self.catch_up(&v));
+        for &(k, level) in &marks {
+            let v = self
+                .log
+                .add_mark(self.me, self.books.version(), at + k, level);
+            edits.extend(self.catch_up(&v));
+        }
+        edits
+    }
+
     /// Makes the text `incoming`, edited outside mamre (#35): its content
     /// is matched against the text (see `reconcile.rs`), what matches keeps
     /// its characters, so their anchors, sections and history, and the
     /// rest is ordinary edits, made here and recorded. A paragraph moved
-    /// elsewhere is moved, not deleted and retyped. The edits say what it
+    /// elsewhere is moved (a delete and an insert, with what's on it going
+    /// along: see [`move_text`](Self::move_text)), not retyped. The edits say what it
     /// did.
     pub fn reconcile(&mut self, incoming: &str) -> Vec<Edit> {
         self.stepped(|t| t.reconcile_step(incoming))
@@ -834,19 +911,35 @@ impl<M: Measure> Text<M> {
         let pos = self.markers.last_at(self.rope.offset_to_char(at));
         let item = self.books.identities().item(pos);
         let v = self.log.add_mark(self.me, self.books.version(), pos, level);
-        Ok((SectionId(item), self.catch_up(&v)))
+        Ok((SectionId(root(&self.books, item)), self.catch_up(&v)))
     }
 
     /// The sections the text shows, in order.
     pub fn sections(&self) -> Vec<Section> {
-        self.books
-            .sections()
+        self.section_items()
             .into_iter()
-            .map(|s| Section {
-                id: SectionId(s.item),
+            .map(|(id, s)| Section {
+                id,
                 at: self.rope.char_to_offset(self.markers.to_char(s.pos)),
                 level: s.level,
                 start: s.start,
+            })
+            .collect()
+    }
+
+    /// The outline's sections, each with its id: its heading's root (see
+    /// [`root`]), so a moved section keeps it. Where two show with one
+    /// root (two writers moved it at once), the first keeps it and the
+    /// rest go by their headings.
+    fn section_items(&self) -> Vec<(SectionId, mamre_egg_walker::Section)> {
+        let mut seen = std::collections::HashSet::new();
+        self.books
+            .sections()
+            .into_iter()
+            .map(|s| {
+                let r = root(&self.books, s.item);
+                let id = if seen.insert(r) { r } else { s.item };
+                (SectionId(id), s)
             })
             .collect()
     }
@@ -857,7 +950,12 @@ impl<M: Measure> Text<M> {
     /// outline's policy folds it (by default a section whose heading is
     /// deleted stays, headless, at its place).
     pub fn section_range(&self, id: SectionId) -> Option<Range<usize>> {
-        let r = self.books.section_range(id.0)?;
+        let item = self
+            .section_items()
+            .into_iter()
+            .find(|(s, _)| *s == id)
+            .map_or(id.0, |(_, s)| s.item);
+        let r = self.books.section_range(item)?;
         let byte = |pos: usize| self.rope.char_to_offset(self.markers.to_char(pos));
         Some(byte(r.start)..byte(r.end))
     }
@@ -903,7 +1001,13 @@ impl<M: Measure> Text<M> {
     /// or the end if it was there and its one neighbour is gone. `None` if
     /// both its characters are deleted (an undo can bring them back).
     pub fn position(&self, anchor: &Anchor) -> Option<usize> {
-        let at = |item: Option<Lv>| item.and_then(|i| self.books.anchors().position(i));
+        // Where each side is, following moves (#68).
+        let at = |item: Option<Lv>| {
+            item.and_then(|i| match self.books.follow(i) {
+                Follow::Here(p) | Follow::Moved(p) => Some(p),
+                Follow::Ambiguous(_) | Follow::Gone => None,
+            })
+        };
         let pos = if let Some(p) = at(anchor.after) {
             self.markers.to_char(p)
         } else if let Some(p) = at(anchor.before) {

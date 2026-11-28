@@ -4,6 +4,9 @@
 //! and a reference disagree, kept. (One writer, and the reference itself,
 //! are checked in `copies.rs`.)
 
+// Range moves are research since #68: `--features range-moves` runs these.
+#![cfg(feature = "range-moves")]
+
 // The reference for moves as copies (#20).
 use mamre_egg_walker::{Lv, OpLog, copies as reference};
 use proptest::prelude::*;

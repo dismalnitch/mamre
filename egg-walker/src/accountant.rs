@@ -44,6 +44,8 @@ pub struct Accountant {
     pub(crate) ranges: crate::ranges::Ranges,
     /// Comments (#33).
     pub(crate) comments: crate::comments::Comments,
+    /// Moves' copies (#68), and why each anchor is watched.
+    moves: crate::follow::Moves,
 }
 
 impl Default for Accountant {
@@ -71,6 +73,7 @@ impl Accountant {
             history: Default::default(),
             ranges: Default::default(),
             comments: crate::comments::Comments::new(0),
+            moves: Default::default(),
         }
     }
 
@@ -102,13 +105,24 @@ impl Accountant {
     /// merge or undo. Returns who it is.
     pub fn watch(&mut self, pos: usize) -> Lv {
         let item = self.ids.item(pos);
-        self.anchors.watch(pos, item);
+        self.moves.watch(&mut self.anchors, &self.ids, pos, item);
         item
     }
 
     /// Stops watching `item`.
     pub fn unwatch(&mut self, item: Lv) {
-        self.anchors.unwatch(item);
+        self.moves.unwatch(&mut self.anchors, item);
+    }
+
+    /// Where watched `item` is now, following moves (#68): where it shows,
+    /// or, if a move took it, where its copy shows. See `follow.rs`.
+    pub fn follow(&self, item: Lv) -> crate::Follow {
+        self.moves.follow(&self.anchors, item)
+    }
+
+    /// The item a move copied `item` from, if a move made it (#68).
+    pub fn moved_from(&self, item: Lv) -> Option<Lv> {
+        self.moves.source(item)
     }
 
     /// The sections the document shows, in order: each marked item, where
@@ -235,6 +249,9 @@ impl Accountant {
                 .collect();
             self.ranges.take_in(log, &all, &self.ids);
         }
+        if self.moves.stale {
+            self.moves.rebuild(log, &self.version);
+        }
         if self.comments.stale {
             self.comments = crate::comments::Comments::new(self.ids.len());
             let all: Vec<Lv> = (0..log.len())
@@ -262,6 +279,7 @@ impl Accountant {
         }
         self.ranges.take_in(log, &new, &self.ids);
         self.comments.take_in(log, &new, &self.ids);
+        self.moves.take_in(log, &new, &mut self.anchors, &self.ids);
         self.version = to;
         self.recent.keep(&self.version, &self.ids.ids, &self.blocks);
         out
@@ -351,6 +369,7 @@ impl Accountant {
             history: Default::default(),
             ranges: crate::ranges::Ranges::stale(),
             comments: crate::comments::Comments::stale(),
+            moves: crate::follow::Moves::stale(),
         })
     }
 }

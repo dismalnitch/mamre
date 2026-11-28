@@ -32,8 +32,15 @@ for msg in got.reply { /* send to ana */ }
 
 `Edit` is what the editor's layout needs, in order, each in the text as
 it was just before: `Insert { at, text }`, `Delete { range }`,
-`Move { range, to }` (`to` is before the move, outside the range),
-`Section { section, at, level }`, `Isolates` (they changed; the text didn't), and `Lost { ranges }` (a move or section mark discarded for one made at the same time, and where its text is now).
+`Section { section, at, level }`, `Isolates` (they changed; the text didn't), and `Lost { ranges }` (a section mark discarded for one made at the same time, and where its text is now).
+
+A move is a `Delete` and then an `Insert` of the same text (#68), local or
+from another replica. What's on the text goes with it: anchors, sections
+(keeping their ids) and paragraph kinds, by a record of where the new text
+came from, so the editor can mark, diff or link moved text. Typing inside
+the range at the same moment stays where the text was, and text two
+writers moved at once shows twice. Range moves that keep identity are
+research in `mamre-egg-walker` (`--features range-moves`).
 
 ## Wiring it into an editor
 

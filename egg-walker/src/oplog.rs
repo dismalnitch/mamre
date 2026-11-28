@@ -106,6 +106,14 @@ pub enum Aside {
     /// Sets range `range`'s tag (`None`: removed). The latest set of a
     /// range wins, in Lamport time, then the order concurrent inserts use.
     RangeSet { range: Lv, tag: Option<String> },
+    /// Inserts `copies` are a move's copies of `sources` (#68): copy *k*
+    /// came from source *k*. A move is a delete and an insert in one step,
+    /// and this says which characters the insert carries on. The merge
+    /// never reads it. What's watched on a moved character follows it to
+    /// its copy (see [`Accountant::follow`](crate::Accountant::follow)),
+    /// and history goes back through it. The copies are one agent's inserts,
+    /// one after another; the sources, any earlier inserts.
+    CameFrom { copies: Vec<Lv>, sources: Vec<Lv> },
 }
 
 /// Where a comment stands.
@@ -158,6 +166,10 @@ impl Aside {
             Aside::RangeSet { range, tag } => Aside::RangeSet {
                 range: f(range),
                 tag,
+            },
+            Aside::CameFrom { copies, sources } => Aside::CameFrom {
+                copies: copies.into_iter().map(&f).collect(),
+                sources: sources.into_iter().map(&f).collect(),
             },
         }
     }
@@ -496,6 +508,20 @@ impl<T: Clone> OpLog<T> {
         self.add_aside(agent, parents, Aside::CommentAdd { start, end })
     }
 
+    /// Says that inserts `copies` are a move's copies of inserts `sources`,
+    /// in order (#68), in a document at `parents`, as `agent`: the record
+    /// a move writes after its delete and insert, in the same step. Returns
+    /// the version after.
+    pub fn add_came_from(
+        &mut self,
+        agent: AgentId,
+        parents: &[Lv],
+        copies: Vec<Lv>,
+        sources: Vec<Lv>,
+    ) -> Vec<Lv> {
+        self.add_aside(agent, parents, Aside::CameFrom { copies, sources })
+    }
+
     /// Sets comment `comment`'s state, in a document at `parents`.
     pub fn set_comment(
         &mut self,
@@ -592,6 +618,13 @@ impl<T: Clone> OpLog<T> {
     /// Moves the items in `range` to `to` (a position in the document as
     /// it is, outside `range`), in a document at `parents`, as `agent`,
     /// keeping their identities. Returns the version after.
+    ///
+    /// **Research, off the path to shipping (#68).** Range moves with
+    /// identity under concurrency are an open problem, and every known
+    /// divergence lives here (#61). A move to ship is a delete, an insert
+    /// and [`add_came_from`](Self::add_came_from), in one step: what
+    /// `mamre-text` does. This stays so older histories read, and for the
+    /// research (their tests: `--features range-moves`).
     pub fn add_move(
         &mut self,
         agent: AgentId,
@@ -851,6 +884,24 @@ impl<T: Clone> OpLog<T> {
                     .all(|&&i| i < lv && matches!(self.run_of(i).op, RunOp::Insert { .. })),
                 "a comment's ends are earlier inserts"
             ),
+            Op::Aside(Aside::CameFrom { copies, sources }) => {
+                let insert = |i: Lv| i < lv && matches!(self.run_of(i).op, RunOp::Insert { .. });
+                assert!(
+                    !copies.is_empty()
+                        && copies.len() == sources.len()
+                        && copies.iter().chain(sources).all(|&i| insert(i)),
+                    "a came-from pairs earlier inserts, one to one"
+                );
+                let first = self.run_of(copies[0]);
+                let (agent, seq) = (first.agent, first.seq + (copies[0] - first.start) as u64);
+                assert!(
+                    copies.iter().enumerate().all(|(k, &c)| {
+                        let run = self.run_of(c);
+                        run.agent == agent && run.seq + (c - run.start) as u64 == seq + k as u64
+                    }),
+                    "a came-from's copies are one agent's inserts, one after another"
+                );
+            }
             Op::Aside(a) if a.comment().is_some() => {
                 let c = a.comment().unwrap();
                 assert!(
